@@ -1,8 +1,8 @@
-# stellar-txwatch-core
+# tx-watch-core
 
 > Real-time Soroban smart contract monitoring and webhook alert engine for the Stellar network.
 
-Part of the [TxWatch](https://github.com/Tx-wat) ecosystem.
+Part of the [TxWatch](https://github.com/TAX-WATs) ecosystem.
 
 ---
 
@@ -70,8 +70,8 @@ subscriptions, no infrastructure beyond a single Rust binary.
 
 ```bash
 # 1. Clone
-git clone https://github.com/Veritas-Vaults-Network/stellar-txwatch-core
-cd stellar-txwatch-core
+git clone https://github.com/TAX-WATs/tx-watch-core
+cd tx-watch-core
 
 # 2. Copy and edit the example config
 cp config/example.toml config/my-config.toml
@@ -314,8 +314,8 @@ scrape_configs:
 
 | Repo | Description |
 |---|---|
-| [stellar-txwatch-web](https://github.com/Veritas-Vaults-Network/stellar-txwatch-web) | Web dashboard for alert history and contract management |
-| [stellar-txwatch-contracts](https://github.com/Veritas-Vaults-Network/stellar-txwatch-contracts) | Example Soroban contracts to monitor with TxWatch |
+| [tx-watch-web](https://github.com/TAX-WATs/tx-watch-web) | Web dashboard for alert history and contract management |
+| [tx-watch-contracts](https://github.com/TAX-WATs/tx-watch-contracts) | Example Soroban contracts to monitor with TxWatch |
 
 ---
 
