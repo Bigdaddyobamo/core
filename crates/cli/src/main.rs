@@ -2,11 +2,11 @@ use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use tokio::sync::watch;
 use tracing::{info, warn};
 use txwatch_config::AppConfig;
-use txwatch_notifier::{build_client, send_webhook, test_payload_with_network};
+use txwatch_notifier::{build_client, send_webhook_simple, test_payload_with_network};
 
 // ── CLI definition ────────────────────────────────────────────────────────────
 
@@ -137,10 +137,10 @@ async fn main() -> Result<()> {
             let network_name = first_contract.network.as_str();
             let horizon_base_url = first_contract.network.horizon_base_url();
             let payload = test_payload_with_network(&label, &url, network_name, horizon_base_url);
-            let client  = build_client().context("failed to build HTTP client")?;
+            let client = build_client().context("failed to build HTTP client")?;
 
             info!(url = %url, "sending test webhook");
-            send_webhook(&client, &url, &payload, None)
+            send_webhook_simple(&client, &url, &payload, None)
                 .await
                 .with_context(|| format!("test webhook to '{}' failed", url))?;
             println!("Test webhook delivered successfully to {}", url);
@@ -160,10 +160,10 @@ async fn main() -> Result<()> {
             });
 
             info!(
-                version        = VERSION,
-                contracts      = cfg.contracts.len(),
-                interval_secs  = cfg.poll_interval_seconds,
-                dry_run        = dry_run,
+                version = VERSION,
+                contracts = cfg.contracts.len(),
+                interval_secs = cfg.poll_interval_seconds,
+                dry_run = dry_run,
                 "starting TxWatch"
             );
             txwatch_poller::run_with_shutdown(cfg, dry_run, shutdown_rx).await?;
@@ -175,17 +175,20 @@ async fn main() -> Result<()> {
 async fn check_webhook_reachable(client: &Client, url: &str) -> Result<bool> {
     let response = client.head(url).send().await;
     match response {
-        Ok(resp) if resp.status().is_success() => return Ok(true),
-        Ok(resp) if resp.status() == StatusCode::METHOD_NOT_ALLOWED || resp.status() == StatusCode::NOT_IMPLEMENTED => {
+        Ok(resp) if resp.status().is_success() => Ok(true),
+        Ok(resp)
+            if resp.status() == StatusCode::METHOD_NOT_ALLOWED
+                || resp.status() == StatusCode::NOT_IMPLEMENTED =>
+        {
             let resp = client.request(reqwest::Method::OPTIONS, url).send().await?;
-            return Ok(resp.status().is_success());
+            Ok(resp.status().is_success())
         }
-        Ok(_) => return Ok(false),
+        Ok(_) => Ok(false),
         Err(err) => {
             if err.is_builder() {
                 return Err(err.into());
             }
-            return Ok(false);
+            Ok(false)
         }
     }
 }

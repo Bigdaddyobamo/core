@@ -9,6 +9,7 @@
 /// real Stellar network.
 mod helpers;
 
+use reqwest::Client;
 use std::time::Duration;
 
 use wiremock::matchers::{method, path, path_regex};
@@ -117,9 +118,13 @@ async fn poll_includes_fee_charged_and_fires_high_fee_rule() {
         .mount(&receiver)
         .await;
 
-    let mut contract = helpers::contract(&format!("{}/hook", receiver.uri()), vec![
-        AlertRule::HighFee { threshold_stroops: 10_000, threshold_xlm: None },
-    ]);
+    let mut contract = helpers::contract(
+        &format!("{}/hook", receiver.uri()),
+        vec![AlertRule::HighFee {
+            threshold_stroops: 10_000,
+            threshold_xlm: None,
+        }],
+    );
     contract.horizon_base_url_override = Some(horizon.uri());
 
     let cfg = AppConfig {
@@ -149,14 +154,22 @@ async fn cursor_file_is_loaded_and_used_for_initial_cursor() {
         .mount(&horizon)
         .await;
 
-    let mut contract = helpers::contract(&format!("{}/hook", receiver.uri()), vec![AlertRule::AnyTransaction]);
+    let mut contract = helpers::contract(
+        &format!("{}/hook", receiver.uri()),
+        vec![AlertRule::AnyTransaction],
+    );
     contract.horizon_base_url_override = Some(horizon.uri());
 
     // Create a temporary cursor file with the contract_id -> "100" mapping.
     let tmp = std::env::temp_dir().join("txwatch_test_cursor.json");
     let mapping = serde_json::json!({ contract.contract_id.clone(): "100" });
-    let mut f = OpenOptions::new().create(true).write(true).truncate(true).open(&tmp).unwrap();
-    write!(f, "{}", mapping.to_string()).unwrap();
+    let mut f = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&tmp)
+        .unwrap();
+    write!(f, "{}", mapping).unwrap();
 
     let cfg = AppConfig {
         poll_interval_seconds: 1,
@@ -247,7 +260,7 @@ async fn any_transaction_fires_webhook() {
         assert_eq!(payloads.len(), 1);
 
         for payload in &payloads {
-            txwatch_notifier::send_webhook(&client, &contract.webhook_url, payload, None)
+            txwatch_notifier::send_webhook_simple(&client, &contract.webhook_url, payload, None)
                 .await
                 .unwrap();
         }
@@ -338,7 +351,7 @@ async fn transaction_failed_rule_fires_only_on_failure() {
             tx,
         );
         for p in &payloads {
-            txwatch_notifier::send_webhook(&client, &contract.webhook_url, p, None)
+            txwatch_notifier::send_webhook_simple(&client, &contract.webhook_url, p, None)
                 .await
                 .unwrap();
         }
@@ -392,7 +405,7 @@ async fn large_transfer_fires_above_threshold() {
     assert_eq!(payloads.len(), 1);
     assert_eq!(payloads[0].amount_xlm, Some(10_000));
 
-    txwatch_notifier::send_webhook(&client, &contract.webhook_url, &payloads[0], None)
+    txwatch_notifier::send_webhook_simple(&client, &contract.webhook_url, &payloads[0], None)
         .await
         .unwrap();
 }
@@ -460,7 +473,7 @@ async fn function_called_rule_fires_on_exact_match() {
             tx,
         );
         for p in &payloads {
-            txwatch_notifier::send_webhook(&client, &contract.webhook_url, p, None)
+            txwatch_notifier::send_webhook_simple(&client, &contract.webhook_url, p, None)
                 .await
                 .unwrap();
         }
@@ -511,9 +524,7 @@ async fn high_fee_rule_fires_on_fee_charged() {
     // Horizon: operations for that transaction (empty, no Soroban)
     Mock::given(method("GET"))
         .and(path("/transactions/fee_tx/operations"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(helpers::empty_page()),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
         .mount(&horizon)
         .await;
 
@@ -525,10 +536,13 @@ async fn high_fee_rule_fires_on_fee_charged() {
         .mount(&receiver)
         .await;
 
-    let client   = Client::new();
+    let client = Client::new();
     let contract = helpers::contract(
         &format!("{}/hook", receiver.uri()),
-        vec![AlertRule::HighFee { threshold_stroops: 10_000, threshold_xlm: None }],
+        vec![AlertRule::HighFee {
+            threshold_stroops: 10_000,
+            threshold_xlm: None,
+        }],
     );
 
     let tx = EnrichedTransaction::from_horizon(
@@ -543,6 +557,7 @@ async fn high_fee_rule_fires_on_fee_charged() {
         },
         vec![],
         None,
+        Some(50_000),
     )
     .unwrap();
 
@@ -559,7 +574,7 @@ async fn high_fee_rule_fires_on_fee_charged() {
     assert!(payloads[0].rule_triggered.contains("HighFee"));
     assert_eq!(payloads[0].fee_charged_stroops, Some(50_000));
 
-    txwatch_notifier::send_webhook(&client, &contract.webhook_url, &payloads[0], None)
+    txwatch_notifier::send_webhook_simple(&client, &contract.webhook_url, &payloads[0], None)
         .await
         .unwrap();
 }
@@ -569,16 +584,17 @@ async fn high_fee_rule_fires_on_fee_charged() {
 async fn run_polls_once_and_skips_webhook_in_dry_run() {
     use std::time::Duration;
 
-    let horizon  = MockServer::start().await;
+    let horizon = MockServer::start().await;
     let receiver = MockServer::start().await;
 
     // First transactions request returns one tx.
     Mock::given(method("GET"))
         .and(path_regex("/accounts/.*/transactions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(helpers::tx_page("dryrun001", "500", true)),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::tx_page(
+            "dryrun001",
+            "500",
+            true,
+        )))
         .up_to_n_times(1)
         .mount(&horizon)
         .await;
@@ -586,18 +602,14 @@ async fn run_polls_once_and_skips_webhook_in_dry_run() {
     // All subsequent transaction requests return an empty page.
     Mock::given(method("GET"))
         .and(path_regex("/accounts/.*/transactions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(helpers::empty_page()),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
         .mount(&horizon)
         .await;
 
     // Operations for the tx: no Soroban details needed.
     Mock::given(method("GET"))
         .and(path("/transactions/dryrun001/operations"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(helpers::empty_page()),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
         .mount(&horizon)
         .await;
 
@@ -619,10 +631,17 @@ async fn run_polls_once_and_skips_webhook_in_dry_run() {
         poll_interval_seconds: 1,
         contracts: vec![contract],
         cursor_file: None,
+        http_pool_max_idle_per_host: None,
+        http_tcp_keepalive_secs: None,
+        http_connection_verbose: None,
     };
 
     // Drive the loop for one full poll cycle (slightly more than the interval).
-    let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run_with(cfg, true)).await;
+    let _ = tokio::time::timeout(
+        Duration::from_millis(1500),
+        txwatch_poller::run_with(cfg, true),
+    )
+    .await;
 
     // MockServer drop verifies that 0 webhooks were received.
 }
@@ -650,7 +669,9 @@ async fn large_transfer_poll_fires_webhook_and_advances_cursor() {
 
     Mock::given(method("GET"))
         .and(path("/transactions/large_tx/operations"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::payment_ops_page("5000.0000000")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(helpers::payment_ops_page("5000.0000000")),
+        )
         .mount(&horizon)
         .await;
 
@@ -663,13 +684,16 @@ async fn large_transfer_poll_fires_webhook_and_advances_cursor() {
 
     let mut contract = helpers::contract(
         &format!("{}/hook", receiver.uri()),
-        vec![AlertRule::LargeTransfer { threshold_xlm: 1000 }],
+        vec![AlertRule::LargeTransfer {
+            threshold_xlm: 1000,
+        }],
     );
     contract.horizon_base_url_override = Some(horizon.uri());
 
     let cfg = AppConfig {
         poll_interval_seconds: 1,
         contracts: vec![contract],
+        cursor_file: None,
         http_pool_max_idle_per_host: None,
         http_tcp_keepalive_secs: None,
         http_connection_verbose: None,
@@ -678,16 +702,26 @@ async fn large_transfer_poll_fires_webhook_and_advances_cursor() {
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
 
     let webhook_requests = receiver.received_requests().await.unwrap();
-    assert_eq!(webhook_requests.len(), 1, "expected exactly one webhook POST");
+    assert_eq!(
+        webhook_requests.len(),
+        1,
+        "expected exactly one webhook POST"
+    );
 
-    let body: serde_json::Value = serde_json::from_slice(&webhook_requests[0].body).expect("webhook body is JSON");
+    let body: serde_json::Value =
+        serde_json::from_slice(&webhook_requests[0].body).expect("webhook body is JSON");
     assert_eq!(body["rule_type"].as_str(), Some("LargeTransfer"));
-    assert_eq!(body["rule_triggered"].as_str(), Some("LargeTransfer(>=1000XLM)"));
+    assert_eq!(
+        body["rule_triggered"].as_str(),
+        Some("LargeTransfer(>=1000XLM)")
+    );
     assert_eq!(body["amount_xlm"].as_u64(), Some(5000));
 
     let requests = horizon.received_requests().await.unwrap();
-    assert!(requests.iter().any(|r| r.url.contains("cursor=1")),
-        "expected the second Horizon transaction request to advance the cursor to '1'");
+    assert!(
+        requests.iter().any(|r| r.url.as_str().contains("cursor=1")),
+        "expected the second Horizon transaction request to advance the cursor to '1'"
+    );
 }
 
 /// horizon_link in webhook payloads always points to the canonical Horizon URL
