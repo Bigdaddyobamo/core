@@ -4,8 +4,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_path_to_error::Deserializer as PathDeserializer;
-use std::{fmt, fs, path::Path};
+use std::{env, fmt, fs, path::Path};
 use url::Url;
 
 const MAX_LARGE_TRANSFER_THRESHOLD_XLM: u64 = 1_000_000_000;
@@ -69,9 +68,15 @@ impl fmt::Display for Network {
 pub enum AlertRule {
     AnyTransaction,
     TransactionFailed,
-    LargeTransfer       { threshold_xlm: u64 },
-    FunctionCalled      { function_name: String },
-    AdminFunctionCalled { function_names: Vec<String> },
+    LargeTransfer {
+        threshold_xlm: u64,
+    },
+    FunctionCalled {
+        function_name: String,
+    },
+    AdminFunctionCalled {
+        function_names: Vec<String>,
+    },
     /// Fires when the transaction's fee exceeds the threshold.
     /// Specify either `threshold_stroops` (raw stroops) or `threshold_xlm` (whole XLM,
     /// converted to stroops during validation); the two are mutually exclusive.
@@ -127,32 +132,33 @@ impl AlertRule {
                 }
             }
             AlertRule::AnyTransaction | AlertRule::TransactionFailed => {}
-            AlertRule::HighFee { threshold_stroops, threshold_xlm } => {
-                match (*threshold_xlm, *threshold_stroops) {
-                    (Some(_), s) if s > 0 => bail!(
-                        "contract '{}': HighFee: specify either threshold_stroops or \
+            AlertRule::HighFee {
+                threshold_stroops,
+                threshold_xlm,
+            } => match (*threshold_xlm, *threshold_stroops) {
+                (Some(_), s) if s > 0 => bail!(
+                    "contract '{}': HighFee: specify either threshold_stroops or \
                          threshold_xlm, not both",
-                        contract_label
-                    ),
-                    (None, 0) => bail!(
-                        "contract '{}': HighFee threshold_stroops must be > 0",
-                        contract_label
-                    ),
-                    (Some(0), _) => bail!(
-                        "contract '{}': HighFee threshold_xlm must be > 0",
-                        contract_label
-                    ),
-                    (Some(xlm), 0) => {
-                        *threshold_stroops = xlm.checked_mul(10_000_000).with_context(|| {
-                            format!(
-                                "contract '{}': HighFee threshold_xlm overflow",
-                                contract_label
-                            )
-                        })?;
-                    }
-                    _ => {}
+                    contract_label
+                ),
+                (None, 0) => bail!(
+                    "contract '{}': HighFee threshold_stroops must be > 0",
+                    contract_label
+                ),
+                (Some(0), _) => bail!(
+                    "contract '{}': HighFee threshold_xlm must be > 0",
+                    contract_label
+                ),
+                (Some(xlm), 0) => {
+                    *threshold_stroops = xlm.checked_mul(10_000_000).with_context(|| {
+                        format!(
+                            "contract '{}': HighFee threshold_xlm overflow",
+                            contract_label
+                        )
+                    })?;
                 }
-            }
+                _ => {}
+            },
         }
         Ok(())
     }
@@ -169,7 +175,10 @@ impl AlertRule {
             AlertRule::AdminFunctionCalled { function_names } => {
                 format!("AdminFunctionCalled([{}])", function_names.join(", "))
             }
-            AlertRule::HighFee { threshold_stroops, threshold_xlm } => {
+            AlertRule::HighFee {
+                threshold_stroops,
+                threshold_xlm,
+            } => {
                 if let Some(xlm) = threshold_xlm {
                     format!("HighFee(>={} XLM)", xlm)
                 } else {
@@ -177,7 +186,8 @@ impl AlertRule {
                 }
             }
         }
-    }}
+    }
+}
 
 // ── WatchedContract ───────────────────────────────────────────────────────────
 
@@ -292,21 +302,21 @@ fn default_http_tcp_keepalive_secs() -> Option<u64> {
     None
 }
 
-fn deserialize_toml_with_field_context<'de, T>(raw: &'de str, path: &Path) -> Result<T>
+fn deserialize_toml_with_field_context<T>(raw: &str, path: &Path) -> Result<T>
 where
     T: DeserializeOwned,
 {
-    let mut deserializer = toml::Deserializer::new(raw);
-    let mut path_deserializer = PathDeserializer::new(&mut deserializer);
-    T::deserialize(&mut path_deserializer).map_err(|error| {
-        let path = error.path().to_string();
+    // serde_path_to_error::deserialize owns the Track that Deserializer::new
+    // otherwise requires, so the field path survives into the error message.
+    let deserializer = toml::Deserializer::new(raw);
+    serde_path_to_error::deserialize(deserializer).map_err(|error| {
+        let field_path = error.path().to_string();
         let inner = error.into_inner();
-        let message = if path.is_empty() {
-            inner.to_string()
+        if field_path.is_empty() {
+            anyhow!("{} (in {})", inner, path.display())
         } else {
-            format!("{} (field: {})", inner, path)
-        };
-        anyhow!(message)
+            anyhow!("{} (field: {} in {})", inner, field_path, path.display())
+        }
     })
 }
 
@@ -505,7 +515,11 @@ mod tests {
             function_names: vec!["set_admin".into(), " ".into()],
         }];
         let err = c.validate().unwrap_err();
-        assert!(err.to_string().contains("blank"), "expected 'blank' in error, got: {}", err);
+        assert!(
+            err.to_string().contains("blank"),
+            "expected 'blank' in error, got: {}",
+            err
+        );
     }
 
     /// Issue #18: single valid entry in function_names should pass validation.
@@ -534,7 +548,9 @@ mod tests {
 
     #[test]
     fn network_urls() {
-        assert!(Network::Mainnet.horizon_base_url().contains("horizon.stellar.org"));
+        assert!(Network::Mainnet
+            .horizon_base_url()
+            .contains("horizon.stellar.org"));
         assert!(Network::Testnet.horizon_base_url().contains("testnet"));
         assert!(Network::Futurenet.horizon_base_url().contains("futurenet"));
     }
@@ -588,10 +604,19 @@ mod tests {
     #[test]
     fn high_fee_threshold_xlm_normalises_to_stroops() {
         let mut c = valid_contract();
-        c.rules = vec![AlertRule::HighFee { threshold_stroops: 0, threshold_xlm: Some(1) }];
+        c.rules = vec![AlertRule::HighFee {
+            threshold_stroops: 0,
+            threshold_xlm: Some(1),
+        }];
         c.validate().unwrap();
-        if let AlertRule::HighFee { threshold_stroops, .. } = &c.rules[0] {
-            assert_eq!(*threshold_stroops, 10_000_000, "1 XLM should become 10_000_000 stroops");
+        if let AlertRule::HighFee {
+            threshold_stroops, ..
+        } = &c.rules[0]
+        {
+            assert_eq!(
+                *threshold_stroops, 10_000_000,
+                "1 XLM should become 10_000_000 stroops"
+            );
         } else {
             panic!("expected HighFee");
         }
@@ -600,14 +625,20 @@ mod tests {
     #[test]
     fn high_fee_threshold_xlm_zero_is_rejected() {
         let mut c = valid_contract();
-        c.rules = vec![AlertRule::HighFee { threshold_stroops: 0, threshold_xlm: Some(0) }];
+        c.rules = vec![AlertRule::HighFee {
+            threshold_stroops: 0,
+            threshold_xlm: Some(0),
+        }];
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn high_fee_both_thresholds_is_rejected() {
         let mut c = valid_contract();
-        c.rules = vec![AlertRule::HighFee { threshold_stroops: 100, threshold_xlm: Some(1) }];
+        c.rules = vec![AlertRule::HighFee {
+            threshold_stroops: 100,
+            threshold_xlm: Some(1),
+        }];
         let err = c.validate().unwrap_err();
         assert!(err.to_string().contains("not both"));
     }
@@ -615,7 +646,10 @@ mod tests {
     #[test]
     fn high_fee_neither_threshold_is_rejected() {
         let mut c = valid_contract();
-        c.rules = vec![AlertRule::HighFee { threshold_stroops: 0, threshold_xlm: None }];
+        c.rules = vec![AlertRule::HighFee {
+            threshold_stroops: 0,
+            threshold_xlm: None,
+        }];
         assert!(c.validate().is_err());
     }
 
@@ -624,13 +658,19 @@ mod tests {
         for val in 0u64..5 {
             let mut cfg = AppConfig {
                 poll_interval_seconds: val,
+                contracts: vec![valid_contract()],
                 http_pool_max_idle_per_host: None,
                 http_tcp_keepalive_secs: None,
                 http_connection_verbose: None,
+                cursor_file: None,
             };
             let err = cfg.validate().unwrap_err();
-                err.to_string().contains("poll_interval_seconds must be >= 5"),
-                "val={} should be rejected: {}", val, err
+            assert!(
+                err.to_string()
+                    .contains("poll_interval_seconds must be >= 5"),
+                "val={} should be rejected: {}",
+                val,
+                err
             );
         }
     }
@@ -679,8 +719,14 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert!(result.is_err());
-        let error_msg = result.unwrap_err().to_string();
+        // `{:#}` renders the whole anyhow chain; the field path lives on the
+        // source error, not on the outer context.
+        let error_msg = format!("{:#}", result.unwrap_err());
         assert!(error_msg.contains("failed to parse config file"));
-        assert!(error_msg.contains("field: poll_interval_seconds"));
+        assert!(
+            error_msg.contains("field: poll_interval_seconds"),
+            "error should name the offending field, got: {}",
+            error_msg
+        );
     }
 }

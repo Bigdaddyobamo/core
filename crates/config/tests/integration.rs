@@ -20,11 +20,14 @@ fn crate_fixture_path(name: &str) -> PathBuf {
 #[test]
 fn example_toml_parses_and_validates_successfully() {
     let path = project_root().join("config").join("example.toml");
-    let cfg = AppConfig::from_file(&path)
-        .expect("example.toml should parse and validate successfully");
+    let cfg =
+        AppConfig::from_file(&path).expect("example.toml should parse and validate successfully");
 
     assert_eq!(cfg.poll_interval_seconds, 10);
-    assert!(!cfg.contracts.is_empty(), "example config should define contracts");
+    assert!(
+        !cfg.contracts.is_empty(),
+        "example config should define contracts"
+    );
 }
 
 #[test]
