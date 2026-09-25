@@ -30,7 +30,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         OnceLock,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use http_body_util::Full;
@@ -40,7 +40,7 @@ use hyper::{
     Request, Response, StatusCode,
 };
 use hyper_util::rt::TokioIo;
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::watch};
 
 // ── Metrics ───────────────────────────────────────────────────────────────────
 
@@ -234,30 +234,81 @@ fn is_ready() -> bool {
 
 // ── HTTP endpoint ─────────────────────────────────────────────────────────────
 
-/// Serve the Prometheus `/metrics` endpoint on `addr`.
-/// Spawns a background task and returns immediately.
-pub async fn serve_metrics(addr: SocketAddr) -> Result<()> {
+/// First pause after a failed `accept`, doubled on each consecutive failure.
+const ACCEPT_BACKOFF_START: Duration = Duration::from_millis(100);
+/// Longest pause between `accept` retries.
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(5);
+/// Minimum gap between two "accept failed" warnings.
+const ACCEPT_WARN_EVERY: Duration = Duration::from_secs(10);
+
+fn next_backoff(current: Duration) -> Duration {
+    (current * 2).min(ACCEPT_BACKOFF_MAX)
+}
+
+/// Serve `/metrics`, `/healthz` and `/readyz` on `addr` until `shutdown`
+/// becomes `true`. Spawns a background task and returns the bound address
+/// (useful when `addr` uses port 0).
+///
+/// A failing `accept` (e.g. `EMFILE`) is retried after a growing pause instead
+/// of spinning, and logged at warn level at most once every 10 seconds.
+pub async fn serve_metrics(
+    addr: SocketAddr,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<SocketAddr> {
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("failed to bind metrics endpoint on {}", addr))?;
+    let local_addr = listener.local_addr().context("metrics listener address")?;
 
-    tracing::info!(addr = %addr, "Prometheus /metrics endpoint listening");
+    tracing::info!(addr = %local_addr, "Prometheus /metrics endpoint listening");
 
     tokio::spawn(async move {
+        let mut backoff = ACCEPT_BACKOFF_START;
+        let mut last_warn: Option<Instant> = None;
+        // Once the sender is dropped no shutdown can arrive; stop watching.
+        let mut watching = true;
         loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                continue;
-            };
-            let io = TokioIo::new(stream);
-            tokio::spawn(async move {
-                let _ = hyper::server::conn::http1::Builder::new()
-                    .serve_connection(io, hyper::service::service_fn(handle_metrics))
-                    .await;
-            });
+            if *shutdown.borrow() {
+                break;
+            }
+            tokio::select! {
+                accepted = listener.accept() => match accepted {
+                    Ok((stream, _)) => {
+                        backoff = ACCEPT_BACKOFF_START;
+                        let io = TokioIo::new(stream);
+                        tokio::spawn(async move {
+                            let _ = hyper::server::conn::http1::Builder::new()
+                                .serve_connection(io, hyper::service::service_fn(handle_metrics))
+                                .await;
+                        });
+                    }
+                    Err(e) => {
+                        if last_warn.is_none_or(|t| t.elapsed() >= ACCEPT_WARN_EVERY) {
+                            tracing::warn!(
+                                error = %e,
+                                retry_in_ms = backoff.as_millis() as u64,
+                                "metrics endpoint failed to accept a connection"
+                            );
+                            last_warn = Some(Instant::now());
+                        }
+                        tokio::select! {
+                            () = tokio::time::sleep(backoff) => {}
+                            _ = shutdown.changed(), if watching => {}
+                        }
+                        backoff = next_backoff(backoff);
+                    }
+                },
+                changed = shutdown.changed(), if watching => {
+                    if changed.is_err() {
+                        watching = false;
+                    }
+                }
+            }
         }
+        tracing::info!("metrics endpoint stopped");
     });
 
-    Ok(())
+    Ok(local_addr)
 }
 
 async fn handle_metrics<B>(
@@ -360,6 +411,42 @@ mod tests {
             get(Method::GET, "/readyz").await.0,
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+}
+
+#[cfg(test)]
+mod server_tests {
+    use super::*;
+
+    #[test]
+    fn accept_backoff_grows_and_caps() {
+        assert_eq!(
+            next_backoff(ACCEPT_BACKOFF_START),
+            Duration::from_millis(200)
+        );
+        assert_eq!(next_backoff(Duration::from_secs(4)), ACCEPT_BACKOFF_MAX);
+        assert_eq!(next_backoff(ACCEPT_BACKOFF_MAX), ACCEPT_BACKOFF_MAX);
+    }
+
+    #[tokio::test]
+    async fn server_stops_accepting_after_shutdown() {
+        let (tx, rx) = watch::channel(false);
+        let addr = serve_metrics("127.0.0.1:0".parse().unwrap(), rx)
+            .await
+            .unwrap();
+        assert!(tokio::net::TcpStream::connect(addr).await.is_ok());
+
+        tx.send(true).unwrap();
+        // The accept task exits and drops the listener.
+        let mut refused = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if tokio::net::TcpStream::connect(addr).await.is_err() {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "listener should close after shutdown");
     }
 }
 
