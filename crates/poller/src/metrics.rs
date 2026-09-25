@@ -1,9 +1,14 @@
 //! Prometheus metrics for TxWatch (enabled with the `metrics` feature flag).
 //!
-//! Exposes three counters:
-//! - `txwatch_transactions_total`       — total transactions processed
-//! - `txwatch_alerts_total`             — total alert payloads sent (rules matched)
-//! - `txwatch_webhook_failures_total`   — total permanent webhook delivery failures
+//! Exposes, labelled by `contract` (label) and `network` where noted:
+//! - `txwatch_transactions_total{contract,network}`      — transactions processed
+//! - `txwatch_alerts_total{contract,network}`            — alert payloads sent (rules matched)
+//! - `txwatch_webhook_failures_total{contract,network}`  — permanent webhook delivery failures
+//! - `txwatch_horizon_request_duration_seconds{network}` — Horizon request latency
+//! - `txwatch_webhook_delivery_duration_seconds`         — webhook delivery latency (incl. retries)
+//! - `txwatch_last_successful_poll_timestamp_seconds{contract,network}` — data freshness
+//! - `txwatch_consecutive_poll_failures{contract,network}` — current failure streak
+//! - `txwatch_build_info{version,git_sha}`               — always 1
 //!
 //! An optional HTTP server can be started by calling [`serve_metrics`]:
 //!
@@ -15,7 +20,10 @@
 //! Any other path returns `404`, and any other method `405`.
 
 use anyhow::{Context, Result};
-use prometheus::{register_int_counter, IntCounter};
+use prometheus::{
+    register_histogram, register_histogram_vec, register_int_counter_vec, register_int_gauge_vec,
+    Histogram, HistogramVec, IntCounterVec, IntGaugeVec,
+};
 use std::{
     net::SocketAddr,
     sync::{
@@ -34,54 +42,163 @@ use hyper::{
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
-// ── Counters ──────────────────────────────────────────────────────────────────
+// ── Metrics ───────────────────────────────────────────────────────────────────
 
-fn transactions_total() -> &'static IntCounter {
-    static C: OnceLock<IntCounter> = OnceLock::new();
+const CONTRACT_LABELS: &[&str] = &["contract", "network"];
+
+fn transactions_total() -> &'static IntCounterVec {
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
     C.get_or_init(|| {
-        register_int_counter!(
+        register_int_counter_vec!(
             "txwatch_transactions_total",
-            "Total Stellar transactions processed across all watched contracts"
+            "Total Stellar transactions processed, per watched contract",
+            CONTRACT_LABELS
         )
         .expect("register txwatch_transactions_total")
     })
 }
 
-fn alerts_total() -> &'static IntCounter {
-    static C: OnceLock<IntCounter> = OnceLock::new();
+fn alerts_total() -> &'static IntCounterVec {
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
     C.get_or_init(|| {
-        register_int_counter!(
+        register_int_counter_vec!(
             "txwatch_alerts_total",
-            "Total alert payloads sent (rules matched)"
+            "Total alert payloads sent (rules matched), per watched contract",
+            CONTRACT_LABELS
         )
         .expect("register txwatch_alerts_total")
     })
 }
 
-fn webhook_failures_total() -> &'static IntCounter {
-    static C: OnceLock<IntCounter> = OnceLock::new();
+fn webhook_failures_total() -> &'static IntCounterVec {
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
     C.get_or_init(|| {
-        register_int_counter!(
+        register_int_counter_vec!(
             "txwatch_webhook_failures_total",
-            "Total permanent webhook delivery failures (after all retries)"
+            "Total permanent webhook delivery failures (after all retries), per watched contract",
+            CONTRACT_LABELS
         )
         .expect("register txwatch_webhook_failures_total")
     })
 }
 
-/// Increment the `txwatch_transactions_total` counter by `n`.
-pub fn inc_transactions(n: u64) {
-    transactions_total().inc_by(n);
+fn horizon_request_duration() -> &'static HistogramVec {
+    static H: OnceLock<HistogramVec> = OnceLock::new();
+    H.get_or_init(|| {
+        register_histogram_vec!(
+            "txwatch_horizon_request_duration_seconds",
+            "Duration of Horizon HTTP requests",
+            &["network"]
+        )
+        .expect("register txwatch_horizon_request_duration_seconds")
+    })
 }
 
-/// Increment the `txwatch_alerts_total` counter by `n`.
-pub fn inc_alerts(n: u64) {
-    alerts_total().inc_by(n);
+fn webhook_delivery_duration() -> &'static Histogram {
+    static H: OnceLock<Histogram> = OnceLock::new();
+    H.get_or_init(|| {
+        register_histogram!(
+            "txwatch_webhook_delivery_duration_seconds",
+            "Duration of webhook deliveries, including retries"
+        )
+        .expect("register txwatch_webhook_delivery_duration_seconds")
+    })
 }
 
-/// Increment the `txwatch_webhook_failures_total` counter by 1.
-pub fn inc_webhook_failures() {
-    webhook_failures_total().inc();
+fn last_successful_poll() -> &'static IntGaugeVec {
+    static G: OnceLock<IntGaugeVec> = OnceLock::new();
+    G.get_or_init(|| {
+        register_int_gauge_vec!(
+            "txwatch_last_successful_poll_timestamp_seconds",
+            "Unix time of the last successful poll, per watched contract",
+            CONTRACT_LABELS
+        )
+        .expect("register txwatch_last_successful_poll_timestamp_seconds")
+    })
+}
+
+fn consecutive_poll_failures() -> &'static IntGaugeVec {
+    static G: OnceLock<IntGaugeVec> = OnceLock::new();
+    G.get_or_init(|| {
+        register_int_gauge_vec!(
+            "txwatch_consecutive_poll_failures",
+            "Consecutive failed polls, per watched contract (0 after a success)",
+            CONTRACT_LABELS
+        )
+        .expect("register txwatch_consecutive_poll_failures")
+    })
+}
+
+/// Registers `txwatch_build_info{version,git_sha} 1`. `git_sha` comes from the
+/// `TXWATCH_GIT_SHA` environment variable at build time, if set.
+pub fn register_build_info() {
+    static G: OnceLock<IntGaugeVec> = OnceLock::new();
+    G.get_or_init(|| {
+        let gauge = register_int_gauge_vec!(
+            "txwatch_build_info",
+            "Build information; the value is always 1",
+            &["version", "git_sha"]
+        )
+        .expect("register txwatch_build_info");
+        gauge
+            .with_label_values(&[
+                env!("CARGO_PKG_VERSION"),
+                option_env!("TXWATCH_GIT_SHA").unwrap_or("unknown"),
+            ])
+            .set(1);
+        gauge
+    });
+}
+
+/// Increment `txwatch_transactions_total` for a contract by `n`.
+pub fn inc_transactions(contract: &str, network: &str, n: u64) {
+    transactions_total()
+        .with_label_values(&[contract, network])
+        .inc_by(n);
+}
+
+/// Increment `txwatch_alerts_total` for a contract by `n`.
+pub fn inc_alerts(contract: &str, network: &str, n: u64) {
+    alerts_total()
+        .with_label_values(&[contract, network])
+        .inc_by(n);
+}
+
+/// Increment `txwatch_webhook_failures_total` for a contract by 1.
+pub fn inc_webhook_failures(contract: &str, network: &str) {
+    webhook_failures_total()
+        .with_label_values(&[contract, network])
+        .inc();
+}
+
+/// Record how long a Horizon request on `network` took.
+pub fn observe_horizon_request(network: &str, seconds: f64) {
+    horizon_request_duration()
+        .with_label_values(&[network])
+        .observe(seconds);
+}
+
+/// Record how long one webhook delivery (including retries) took.
+pub fn observe_webhook_delivery(seconds: f64) {
+    webhook_delivery_duration().observe(seconds);
+}
+
+/// Record a successful poll of a contract: freshness timestamp and reset
+/// failure streak.
+pub fn record_poll_success(contract: &str, network: &str) {
+    last_successful_poll()
+        .with_label_values(&[contract, network])
+        .set(now_secs() as i64);
+    consecutive_poll_failures()
+        .with_label_values(&[contract, network])
+        .set(0);
+}
+
+/// Record a failed poll of a contract.
+pub fn record_poll_failure(contract: &str, network: &str) {
+    consecutive_poll_failures()
+        .with_label_values(&[contract, network])
+        .inc();
 }
 
 // ── Readiness ─────────────────────────────────────────────────────────────────
@@ -103,7 +220,7 @@ pub fn set_poll_interval(secs: u64) {
     POLL_INTERVAL_SECS.store(secs, Ordering::Relaxed);
 }
 
-/// Record that a contract poll just succeeded.
+/// Record that a contract poll just succeeded (for readiness).
 pub fn mark_poll_success() {
     LAST_POLL_SUCCESS.store(now_secs(), Ordering::Relaxed);
 }
@@ -201,7 +318,7 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_path_serves_prometheus_text() {
-        inc_transactions(1);
+        inc_transactions("Test", "testnet", 1);
         let (status, body) = get(Method::GET, "/metrics").await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("txwatch_transactions_total"));
@@ -243,5 +360,56 @@ mod tests {
             get(Method::GET, "/readyz").await.0,
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::*;
+
+    fn exposition() -> String {
+        use prometheus::Encoder;
+        let mut buf = Vec::new();
+        prometheus::TextEncoder::new()
+            .encode(&prometheus::gather(), &mut buf)
+            .unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    #[test]
+    fn per_contract_metrics_carry_labels() {
+        register_build_info();
+        inc_transactions("LabelTest", "testnet", 3);
+        inc_alerts("LabelTest", "testnet", 1);
+        inc_webhook_failures("LabelTest", "testnet");
+        observe_horizon_request("testnet", 0.25);
+        observe_webhook_delivery(0.5);
+        record_poll_failure("LabelTest", "testnet");
+        record_poll_failure("LabelTest", "testnet");
+
+        let text = exposition();
+        assert!(text
+            .contains(r#"txwatch_transactions_total{contract="LabelTest",network="testnet"} 3"#));
+        assert!(text.contains(r#"txwatch_alerts_total{contract="LabelTest",network="testnet"} 1"#));
+        assert!(text.contains(
+            r#"txwatch_webhook_failures_total{contract="LabelTest",network="testnet"} 1"#
+        ));
+        assert!(text.contains(
+            r#"txwatch_consecutive_poll_failures{contract="LabelTest",network="testnet"} 2"#
+        ));
+        assert!(text.contains("txwatch_horizon_request_duration_seconds_bucket"));
+        assert!(text.contains("txwatch_webhook_delivery_duration_seconds_count"));
+        assert!(text.contains(&format!(
+            r#"txwatch_build_info{{git_sha="{}",version="{}"}} 1"#,
+            option_env!("TXWATCH_GIT_SHA").unwrap_or("unknown"),
+            env!("CARGO_PKG_VERSION")
+        )));
+
+        record_poll_success("LabelTest", "testnet");
+        let text = exposition();
+        assert!(text.contains(
+            r#"txwatch_consecutive_poll_failures{contract="LabelTest",network="testnet"} 0"#
+        ));
+        assert!(text.contains(r#"txwatch_last_successful_poll_timestamp_seconds{contract="LabelTest",network="testnet"}"#));
     }
 }
