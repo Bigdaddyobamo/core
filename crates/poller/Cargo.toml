@@ -3,6 +3,7 @@ name    = "txwatch-poller"
 version = "0.1.0"
 edition = "2021"
 license.workspace = true
+rust-version.workspace = true
 
 [features]
 # Enable Prometheus metrics counters and optional /metrics HTTP endpoint.

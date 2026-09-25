@@ -89,20 +89,22 @@ jobs:
       - name: Run all tests
         run: cargo test --all
 
-  # ── Security audit ──────────────────────────────────────────────────────────
-  audit:
-    name: Security Audit
+  # ── MSRV ────────────────────────────────────────────────────────────────────
+  msrv:
+    name: MSRV (1.88)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install MSRV toolchain
+        uses: dtolnay/rust-toolchain@1.88
 
-      - name: Run cargo-audit to check for known CVEs
-        run: cargo install cargo-audit && cargo audit
+      - name: Check workspace builds on the MSRV
+        run: cargo check --workspace --all-targets --locked
 
   # ── Dependency checks ───────────────────────────────────────────────────────
+  # cargo-deny covers security advisories (RustSec) as well as licenses, bans
+  # and sources, so a separate cargo-audit job is not needed.
   deny:
     name: Dependency checks (cargo-deny)
     runs-on: ubuntu-latest
@@ -118,7 +120,7 @@ jobs:
   build:
     name: Build (release)
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, test, audit, deny]
+    needs: [fmt, clippy, test, msrv, deny]
     steps:
       - uses: actions/checkout@v4
 
