@@ -1,0 +1,34 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AppConfig",
+  "type": "object",
+  "required": ["poll_interval_seconds", "contracts"],
+  "properties": {
+    "poll_interval_seconds": { "type": "integer", "minimum": 5, "maximum": 3600 },
+    "cursor_file": { "type": ["string", "null"] },
+    "http_pool_max_idle_per_host": { "type": ["integer", "null"] },
+    "http_tcp_keepalive_secs": { "type": ["integer", "null"] },
+    "http_connection_verbose": { "type": ["boolean", "null"] },
+    "contracts": { "type": "array", "items": { "$ref": "#/definitions/WatchedContract" }, "minItems": 1, "maxItems": 100 }
+  },
+  "definitions": {
+    "WatchedContract": {
+      "type": "object", "required": ["label", "contract_id", "network", "rules", "webhook_url"], "additionalProperties": false,
+      "properties": {
+        "label": { "type": "string" }, "contract_id": { "type": "string", "pattern": "^C[A-Z2-7]{55}$" },
+        "network": { "enum": ["mainnet", "testnet", "futurenet"] }, "webhook_url": { "type": "string", "format": "uri" },
+        "webhook_secret": { "type": ["string", "null"] }, "rules": { "type": "array", "items": { "$ref": "#/definitions/AlertRule" }, "minItems": 1 }
+      }
+    },
+    "AlertRule": {
+      "oneOf": [
+        { "type": "object", "required": ["type"], "properties": { "type": { "const": "AnyTransaction" } } },
+        { "type": "object", "required": ["type"], "properties": { "type": { "const": "TransactionFailed" } } },
+        { "type": "object", "required": ["type", "threshold_xlm"], "properties": { "type": { "const": "LargeTransfer" }, "threshold_xlm": { "type": "integer", "minimum": 1 } } },
+        { "type": "object", "required": ["type", "function_name"], "properties": { "type": { "const": "FunctionCalled" }, "function_name": { "type": "string" } } },
+        { "type": "object", "required": ["type", "function_names"], "properties": { "type": { "const": "AdminFunctionCalled" }, "function_names": { "type": "array", "items": { "type": "string" } } } },
+        { "type": "object", "required": ["type"], "properties": { "type": { "const": "HighFee" }, "threshold_stroops": { "type": "integer" }, "threshold_xlm": { "type": ["integer", "null"] } } }
+      ]
+    }
+  }
+}

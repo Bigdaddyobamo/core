@@ -10,6 +10,7 @@ toml    = { workspace = true }
 anyhow  = { workspace = true }
 serde_path_to_error = "0.1"
 url     = "2"
+schemars = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

@@ -4,6 +4,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use schemars::JsonSchema;
 use std::{env, fmt, fs, path::Path};
 use url::Url;
 
@@ -11,7 +12,7 @@ const MAX_LARGE_TRANSFER_THRESHOLD_XLM: u64 = 1_000_000_000;
 
 // ── Network ───────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Network {
     Mainnet,
@@ -63,7 +64,7 @@ impl fmt::Display for Network {
 
 // ── AlertRule ─────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(tag = "type")]
 pub enum AlertRule {
     AnyTransaction,
@@ -191,7 +192,7 @@ impl AlertRule {
 
 // ── WatchedContract ───────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WatchedContract {
     pub label: String,
@@ -204,6 +205,7 @@ pub struct WatchedContract {
     pub webhook_secret: Option<String>,
     /// Override the Horizon base URL; never read from TOML — set programmatically in tests.
     #[serde(skip, default)]
+    #[schemars(skip)]
     pub horizon_base_url_override: Option<String>,
 }
 
@@ -266,7 +268,7 @@ impl WatchedContract {
 /// potentially exhausting memory or file descriptors.
 pub const MAX_CONTRACTS: usize = 100;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     pub poll_interval_seconds: u64,

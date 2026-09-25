@@ -2,6 +2,7 @@ use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use futures::future::join_all;
 use reqwest::{Client, StatusCode};
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -28,7 +29,7 @@ const VERSION: &str = concat!(
 struct Cli {
     /// Path to the TOML config file
     #[arg(short, long, default_value = "config/example.toml")]
-    config: PathBuf,
+    config: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -50,6 +51,10 @@ enum Command {
         /// Send a HEAD/OPTIONS request to each webhook URL and warn on unreachable endpoints.
         #[arg(long)]
         check_webhooks: bool,
+
+        /// Verify that each contract exists on its configured Horizon network.
+        #[arg(long)]
+        check_horizon: bool,
     },
 
     /// Send a test webhook payload to a URL and exit
@@ -58,12 +63,24 @@ enum Command {
     TestWebhook {
         /// The webhook URL to POST to
         #[arg(long)]
-        url: String,
+        url: Option<String>,
 
         /// Label to include in the test payload
         #[arg(long, default_value = "TxWatch Test")]
         label: String,
+
+        #[arg(long, default_value = "testnet")]
+        network: String,
+
+        #[arg(long)]
+        contract: Option<String>,
+
+        #[arg(long)]
+        secret: Option<String>,
     },
+
+    /// Print the JSON Schema for the TOML configuration file.
+    Schema,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -75,8 +92,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Validate { check_webhooks } => {
-            let cfg = AppConfig::from_file(&cli.config)?;
+        Command::Validate { check_webhooks, check_horizon } => {
+            let cfg = AppConfig::from_file(&required_config(&cli)?)?;
             println!("Config is valid.");
             println!("  poll_interval_seconds : {}", cfg.poll_interval_seconds);
             println!("  contracts             : {}", cfg.contracts.len());
@@ -111,43 +128,64 @@ async fn main() -> Result<()> {
 
             if check_webhooks {
                 let client = Client::builder()
-                    .timeout(Duration::from_secs(15))
+                    .timeout(Duration::from_secs(5))
                     .build()
                     .context("failed to build HTTP client")?;
-
-                for c in &cfg.contracts {
-                    let reachable = check_webhook_reachable(&client, &c.webhook_url).await;
-                    if let Err(e) = reachable {
-                        warn!(webhook_url = %c.webhook_url, contract = %c.label, error = %e, "webhook reachability check failed");
-                    } else if !reachable.unwrap() {
-                        warn!(webhook_url = %c.webhook_url, contract = %c.label, "webhook endpoint is unreachable");
+                let checks = join_all(cfg.contracts.iter().map(|c| async {
+                    (c.label.clone(), c.webhook_url.clone(), check_webhook_reachable(&client, &c.webhook_url).await)
+                })).await;
+                let mut failed = false;
+                println!("Webhook checks:");
+                for (label, url, result) in checks {
+                    match result {
+                        Ok(status) => {
+                            if status == "method not allowed" { failed = true; }
+                            println!("  {:<18} {:<20} {}", label, status, url)
+                        }
+                        Err(error) => { failed = true; println!("  {:<18} {:<20} {} ({})", label, "unreachable", url, error); }
                     }
                 }
+                if failed { return Err(anyhow::anyhow!("one or more webhook checks failed")); }
+            }
+            if check_horizon {
+                let client = Client::builder().timeout(Duration::from_secs(5)).build().context("failed to build HTTP client")?;
+                let checks = join_all(cfg.contracts.iter().map(|c| check_horizon_contract(&client, c))).await;
+                let mut failed = false;
+                println!("Horizon checks:");
+                for check in checks {
+                    println!("  {:<10} {:<12} latest ledger: {} — {}", check.network, check.status, check.latest_ledger.map_or_else(|| "unknown".into(), |n| n.to_string()), check.message);
+                    failed |= !check.reachable || !check.found;
+                }
+                if failed { return Err(anyhow::anyhow!("one or more Horizon checks failed")); }
             }
         }
 
-        Command::TestWebhook { url, label } => {
-            let cfg = AppConfig::from_file(&cli.config)?;
-            if cfg.contracts.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "config has no contracts; cannot derive network for test-webhook"
-                ));
-            }
-            let first_contract = &cfg.contracts[0];
-            let network_name = first_contract.network.as_str();
-            let horizon_base_url = first_contract.network.horizon_base_url();
-            let payload = test_payload_with_network(&label, &url, network_name, horizon_base_url);
+        Command::TestWebhook { url, label, network, contract, secret } => {
+            let configured = contract.as_ref().map(|wanted| {
+                let path = cli.config.as_ref().ok_or_else(|| anyhow::anyhow!("--contract requires --config"))?;
+                let cfg = AppConfig::from_file(path)?;
+                cfg.contracts.into_iter().find(|c| c.label == *wanted).ok_or_else(|| anyhow::anyhow!("configured contract '{}' not found", wanted))
+            }).transpose()?;
+            let (url, network_name, horizon_base_url, secret) = if let Some(c) = configured {
+                (c.webhook_url, c.network.as_str().to_owned(), c.network.horizon_base_url().to_owned(), secret.or(c.webhook_secret))
+            } else {
+                let selected = match network.as_str() { "mainnet" => txwatch_config::Network::Mainnet, "testnet" => txwatch_config::Network::Testnet, "futurenet" => txwatch_config::Network::Futurenet, other => return Err(anyhow::anyhow!("unknown network '{}'", other)) };
+                (url.ok_or_else(|| anyhow::anyhow!("--url is required unless --contract is provided"))?, network, selected.horizon_base_url().to_owned(), secret)
+            };
+            let payload = test_payload_with_network(&label, &url, &network_name, &horizon_base_url);
             let client = build_client().context("failed to build HTTP client")?;
 
             info!(url = %url, "sending test webhook");
-            send_webhook_simple(&client, &url, &payload, None)
+            let result = send_webhook_simple(&client, &url, &payload, secret.as_deref())
                 .await
                 .with_context(|| format!("test webhook to '{}' failed", url))?;
-            println!("Test webhook delivered successfully to {}", url);
+            println!("Test webhook delivered successfully to {} (status {}, attempts {})", url, result.final_status, result.attempts);
         }
 
+        Command::Schema => println!("{}", serde_json::to_string_pretty(&schemars::schema_for!(txwatch_config::AppConfig))?),
+
         Command::Watch { dry_run } => {
-            let cfg = AppConfig::from_file(&cli.config)?;
+            let cfg = AppConfig::from_file(&required_config(&cli)?)?;
 
             // Graceful shutdown: allow the current poll cycle to finish before exiting.
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -172,25 +210,58 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
-async fn check_webhook_reachable(client: &Client, url: &str) -> Result<bool> {
+fn required_config(cli: &Cli) -> Result<PathBuf> {
+    Ok(cli.config.clone().unwrap_or_else(|| PathBuf::from("config/example.toml")))
+}
+
+async fn check_webhook_reachable(client: &Client, url: &str) -> Result<&'static str> {
     let response = client.head(url).send().await;
     match response {
-        Ok(resp) if resp.status().is_success() => Ok(true),
+        Ok(resp) if resp.status().is_success() => Ok("reachable"),
         Ok(resp)
             if resp.status() == StatusCode::METHOD_NOT_ALLOWED
                 || resp.status() == StatusCode::NOT_IMPLEMENTED =>
         {
             let resp = client.request(reqwest::Method::OPTIONS, url).send().await?;
-            Ok(resp.status().is_success())
+            if resp.status().is_success() { Ok("reachable (OPTIONS)") } else { Ok("method not allowed") }
         }
-        Ok(_) => Ok(false),
+        Ok(_) => Ok("method not allowed"),
         Err(err) => {
             if err.is_builder() {
                 return Err(err.into());
             }
-            Ok(false)
+            Err(err.into())
         }
     }
+}
+
+struct HorizonCheck {
+    network: String,
+    status: &'static str,
+    latest_ledger: Option<u64>,
+    reachable: bool,
+    found: bool,
+    message: String,
+}
+
+async fn check_horizon_contract(client: &Client, contract: &txwatch_config::WatchedContract) -> HorizonCheck {
+    let base = contract.horizon_base_url_override.as_deref().unwrap_or_else(|| contract.network.horizon_base_url());
+    let root = client.get(base).send().await;
+    let (reachable, latest_ledger) = match root {
+        Ok(response) if response.status().is_success() => {
+            let json = response.json::<serde_json::Value>().await.unwrap_or_default();
+            (true, json.get("core_latest_ledger").and_then(|value| value.as_u64().or_else(|| value.as_str().and_then(|text| text.parse().ok()))))
+        }
+        _ => (false, None),
+    };
+    if !reachable {
+        return HorizonCheck { network: contract.network.as_str().into(), status: "unreachable", latest_ledger, reachable: false, found: false, message: format!("Horizon {} is unreachable", base) };
+    }
+    // Horizon exposes Soroban contract activity through the same account-style
+    // transactions collection used by the poller. A 404 means the contract is
+    // not known on this network; a successful empty collection is still valid.
+    let found = client.get(format!("{}/accounts/{}/transactions?limit=1", base, contract.contract_id)).send().await.map(|response| response.status().is_success()).unwrap_or(false);
+    HorizonCheck { network: contract.network.as_str().into(), status: if found { "found" } else { "not found" }, latest_ledger, reachable, found, message: if found { format!("{} exists on {}", contract.label, contract.network) } else { format!("{} not found on {}", contract.contract_id, contract.network) } }
 }
 // ── Tracing initialisation ────────────────────────────────────────────────────
 

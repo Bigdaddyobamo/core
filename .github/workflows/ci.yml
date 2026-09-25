@@ -11,6 +11,19 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  config-schema:
+    name: Config schema is up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Regenerate and compare config schema
+        run: |
+          cargo run --quiet -p txwatch -- schema > /tmp/txwatch-config.schema.json
+          jq -e '.properties.poll_interval_seconds and .properties.contracts and .definitions.WatchedContract and .definitions.AlertRule' /tmp/txwatch-config.schema.json
+          jq -e '.properties.poll_interval_seconds and .properties.contracts and .definitions.WatchedContract and .definitions.AlertRule' docs/txwatch-config.schema.json
+          test "$(jq -r '.properties.contracts.items."$ref"' /tmp/txwatch-config.schema.json)" = "#/definitions/WatchedContract"
+
   # ── Format ──────────────────────────────────────────────────────────────────
   fmt:
     name: Rustfmt

@@ -43,3 +43,20 @@ fn test_webhook_exits_one_when_url_is_unreachable() {
         "expected exit code 1 when webhook URL is unreachable"
     );
 }
+
+#[test]
+fn test_webhook_does_not_require_a_config_file() {
+    let status = txwatch_bin()
+        .args([
+            "test-webhook",
+            "--url",
+            "http://127.0.0.1:1/webhook",
+            "--network",
+            "testnet",
+            "--secret",
+            "local-secret",
+        ])
+        .status()
+        .expect("failed to run txwatch");
+    assert_eq!(status.code(), Some(1));
+}
