@@ -1,0 +1,14 @@
+# Review routing. Each line assigns owners to a path; the last match wins.
+
+*                      @Tx-wats/maintainers
+
+/crates/config/        @Tx-wats/maintainers
+/crates/rules/         @Tx-wats/maintainers
+/crates/notifier/      @Tx-wats/maintainers
+/crates/poller/        @Tx-wats/maintainers
+/crates/cli/           @Tx-wats/maintainers
+
+/.github/              @Tx-wats/maintainers
+/deny.toml             @Tx-wats/maintainers
+/Cargo.toml            @Tx-wats/maintainers
+/Cargo.lock            @Tx-wats/maintainers
