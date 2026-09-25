@@ -89,6 +89,26 @@ jobs:
       - name: Run all tests
         run: cargo test --all
 
+      # Feature-gated code (e.g. the poller's `metrics` module) only compiles
+      # and runs its tests with the feature on.
+      - name: Run all tests with all features
+        run: cargo test --all --all-features
+
+  # ── Feature combinations ────────────────────────────────────────────────────
+  features:
+    name: Feature powerset (cargo-hack)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@cargo-hack
+
+      - name: Check every feature combination
+        run: cargo hack check --workspace --feature-powerset --no-dev-deps
+
   # ── MSRV ────────────────────────────────────────────────────────────────────
   msrv:
     name: MSRV (1.88)
