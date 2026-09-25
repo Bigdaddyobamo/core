@@ -14,9 +14,16 @@ The schema is also available from the CLI with `txwatch schema`. CI verifies tha
 
 ## Top-level fields
 
-| Field                   | Type | Required | Description                           |
-|-------------------------|------|----------|---------------------------------------|
-| `poll_interval_seconds` | u64  | yes      | How often to poll Horizon (seconds). Must be >= 5 and ≤ 3600. |
+| Field                         | Type            | Required | Default | Description |
+|-------------------------------|-----------------|----------|---------|-------------|
+| `poll_interval_seconds`       | u64             | yes      | —       | How often to poll Horizon (seconds). Must be ≥ 5 and ≤ 3600. |
+| `contracts`                   | array of tables | yes      | —       | The `[[contracts]]` entries (see below). At least one is required; labels must be unique. |
+| `cursor_file`                 | string (path)   | no       | unset   | JSON file used to persist the per-contract cursor map. Loaded on startup and rewritten after each poll cycle. When unset, cursors start at Horizon's `now` and are not persisted. A missing or unparsable file falls back to `now`. |
+| `http_pool_max_idle_per_host` | usize           | no       | `10`    | Maximum idle connections kept per host in the HTTP pool. Lower values use less memory; higher values help with many contracts. |
+| `http_tcp_keepalive_secs`     | u64             | no       | `30`    | TCP keepalive interval (seconds) for pooled HTTP connections. |
+| `http_connection_verbose`     | bool            | no       | `false` | Reserved for HTTP connection-pool debug output. Accepted by the parser but currently has no effect. |
+
+Unknown top-level keys are rejected.
 
 > **Horizon rate limits:** Polling too frequently across many contracts can exhaust Horizon's per-IP request quota,
 > resulting in `429 Too Many Requests` responses. Sustained polling across six or more contracts at intervals below
@@ -25,19 +32,22 @@ The schema is also available from the CLI with `txwatch schema`. CI verifies tha
 > higher is advised. TxWatch logs a startup warning when `poll_interval_seconds < 10` and more than 5 contracts
 > are configured.
 
-> **Contract limit:** A maximum of **100** `[[contracts]]` entries are allowed per configuration file. Exceeding this limit is rejected at startup to prevent exhausting memory or file descriptors from too many concurrent Horizon polling tasks.
+> **Contract limit:** `txwatch-config` declares `MAX_CONTRACTS = 100` as the supported upper bound for `[[contracts]]` entries. It is not yet enforced during validation, so keep configurations at or below 100 contracts to avoid exhausting memory or file descriptors with too many concurrent Horizon polling tasks.
 
 ## `[[contracts]]`
 
 Each entry defines one watched Soroban contract. At least one entry is required.
 
-| Field         | Type   | Required | Description                                                  |
-|---------------|--------|----------|--------------------------------------------------------------|
-| `label`       | string | yes      | Human-readable name shown in logs and alert payloads.        |
-| `contract_id` | string | yes      | Stellar C-address (56 chars, starts with `C`).               |
-| `network`     | string | yes      | `mainnet`, `testnet`, or `futurenet`.                        |
-| `webhook_url` | string | yes      | `http://` or `https://` endpoint that receives alert JSON.   |
-| `webhook_secret` | string | no    | If set, an HMAC-SHA256 signature of the request body is sent as `X-TxWatch-Signature: sha256=<hmac>`. Never sends the raw secret over the wire. |
+| Field            | Type            | Required | Description |
+|------------------|-----------------|----------|-------------|
+| `label`          | string          | yes      | Human-readable name shown in logs and alert payloads. Must not be blank; must be unique across contracts. |
+| `contract_id`    | string          | yes      | Stellar C-address (56 chars, starts with `C`). |
+| `network`        | string          | yes      | `mainnet`, `testnet`, or `futurenet`. |
+| `rules`          | array of tables | yes      | The `[[contracts.rules]]` entries (see below). At least one is required. |
+| `webhook_url`    | string          | yes      | `http://` or `https://` URL with a host that receives the alert JSON. |
+| `webhook_secret` | string          | no       | When set, every webhook POST carries `X-TxWatch-Signature: sha256=<hex HMAC-SHA256 of the body>` **and** the raw secret in `X-TxWatch-Secret`. Supports `${ENV_VAR}` interpolation (e.g. `webhook_secret = "${MY_SECRET}"`); an unset variable is a startup error. |
+
+Unknown keys inside a `[[contracts]]` entry are rejected.
 
 ### Network field values
 
@@ -104,24 +114,46 @@ type           = "AdminFunctionCalled"
 function_names = ["set_admin", "upgrade", "initialize"]
 ```
 
+### `HighFee`
+Fires when the transaction's charged fee is at least the threshold. Set exactly one of
+`threshold_stroops` (raw stroops, must be > 0) or `threshold_xlm` (whole XLM, must be > 0;
+converted to stroops during validation). Setting both is rejected.
+
+```toml
+[[contracts.rules]]
+type              = "HighFee"
+threshold_stroops = 1000000
+```
+
 ## Webhook payload
 
 ```json
 {
-  "label":            "My Escrow Contract",
-  "contract_id":      "CAAA...",
-  "network":          "testnet",
-  "rule_triggered":   "LargeTransfer(>=10000XLM)",
-  "transaction_hash": "abc123...",
-  "function_name":    "transfer",
-  "function_names":   ["transfer"],
-  "amount_xlm":       15000,
-  "timestamp":        1705316096,
-  "horizon_link":     "https://horizon-testnet.stellar.org/transactions/abc123...",
-  "explorer_link":    "https://stellar.expert/explorer/testnet/tx/abc123..."
+  "label":               "My Escrow Contract",
+  "contract_id":         "CAAA...",
+  "network":             "testnet",
+  "rule_type":           "LargeTransfer",
+  "rule_triggered":      "LargeTransfer(>=10000XLM)",
+  "transaction_hash":    "abc123...",
+  "function_name":       "transfer",
+  "function_names":      ["transfer"],
+  "amount_xlm":          15000,
+  "fee_charged_stroops": 50000,
+  "timestamp":           1705316096,
+  "timestamp_iso":       "2024-01-15T12:00:00Z",
+  "horizon_link":        "https://horizon-testnet.stellar.org/transactions/abc123...",
+  "explorer_link":       "https://stellar.expert/explorer/testnet/tx/abc123..."
 }
 ```
 
+This example and the one in the README are checked against `AlertPayload` by
+`crates/rules/tests/docs_payload.rs`, so they cannot drift from the code.
+
+- `rule_type` — stable machine-readable rule variant (e.g. `"LargeTransfer"`); use it for routing.
+- `rule_triggered` — human-readable rule description including parameters.
+- `amount_xlm` — whole-XLM transfer amount, or `null` when the transaction has none.
+- `fee_charged_stroops` — fee charged for the transaction in stroops, or `null` if unknown.
+- `timestamp` / `timestamp_iso` — ledger close time as Unix seconds and as an ISO 8601 string.
 - `function_name` — the first invoked Soroban function name (present for backward compatibility).
 - `function_names` — all Soroban function names invoked in the transaction (one per `invoke_host_function` operation). Most transactions have zero or one entry.
 
