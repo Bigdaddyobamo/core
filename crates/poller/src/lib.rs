@@ -23,8 +23,7 @@ use txwatch_rules::{evaluate, EnrichedTransaction, HorizonTransaction};
 #[cfg(feature = "metrics")]
 pub mod metrics;
 
-/// Bind address for the optional `/metrics` HTTP endpoint.
-/// Set via `AppConfig::metrics_addr` when the `metrics` feature is enabled.
+/// Starts the optional `/metrics`, `/healthz` and `/readyz` HTTP endpoint.
 #[cfg(feature = "metrics")]
 pub use metrics::serve_metrics;
 
@@ -150,6 +149,8 @@ pub async fn run_with_shutdown(
     };
 
     let interval = Duration::from_secs(cfg.poll_interval_seconds);
+    #[cfg(feature = "metrics")]
+    metrics::set_poll_interval(cfg.poll_interval_seconds);
     let summary_every = Duration::from_secs(60);
     let counters = Arc::new(Counters::default());
     let n_contracts = cfg.contracts.len();
@@ -239,6 +240,7 @@ pub async fn run_with_shutdown(
                     {
                         metrics::inc_transactions(txs);
                         metrics::inc_alerts(alerts);
+                        metrics::mark_poll_success();
                     }
                 }
                 Err(e) => error!(error = %e, "contract polling task failed"),
