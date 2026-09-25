@@ -102,6 +102,20 @@ jobs:
       - name: Check workspace builds on the MSRV
         run: cargo check --workspace --all-targets --locked
 
+  # ── Publish dry-run ─────────────────────────────────────────────────────────
+  publish-dry-run:
+    name: cargo publish --dry-run (libraries)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Package and verify each library crate
+        run: >
+          cargo publish --dry-run --locked --workspace
+          --exclude txwatch
+
   # ── Dependency checks ───────────────────────────────────────────────────────
   # cargo-deny covers security advisories (RustSec) as well as licenses, bans
   # and sources, so a separate cargo-audit job is not needed.
