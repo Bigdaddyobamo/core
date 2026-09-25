@@ -2,6 +2,16 @@
 
 Config is a TOML file passed via `--config` (default: `config/example.toml`).
 
+## Editor validation
+
+The committed [`txwatch-config.schema.json`](txwatch-config.schema.json) describes the supported configuration shape. In Taplo or Even Better TOML, add this directive at the top of a TOML file to enable completion and inline validation:
+
+```toml
+#:schema ../docs/txwatch-config.schema.json
+```
+
+The schema is also available from the CLI with `txwatch schema`. CI verifies that the committed schema remains synchronized with the derived Rust model.
+
 ## Top-level fields
 
 | Field                   | Type | Required | Description                           |
@@ -120,6 +130,12 @@ function_names = ["set_admin", "upgrade", "initialize"]
 | Variable   | Default | Description                                      |
 |------------|---------|--------------------------------------------------|
 | `RUST_LOG` | `info`  | Log level: `error`, `warn`, `info`, `debug`, `trace` |
+
+## Pre-flight checks
+
+`txwatch validate --check-webhooks` checks all endpoints concurrently. It tries `HEAD` first; when a receiver returns `405 Method Not Allowed` or `501 Not Implemented`, TxWatch retries with `OPTIONS`. A per-URL table reports `reachable`, `reachable (OPTIONS)`, `method not allowed`, or `unreachable`, and any unreachable endpoint makes validation exit non-zero. Some serverless receivers reject both probe methods; use a real test webhook for those endpoints.
+
+`txwatch validate --check-horizon` checks Horizon reachability, prints the latest ledger reported by each network, and verifies every configured contract exists on that network. A missing contract is reported as `not found on <network>` and exits non-zero.
 
 Note: setting `RUST_LOG=debug` will show per-contract idle poll cycles — the
 poller emits `"no new transactions"` debug logs with the contract `label` and
