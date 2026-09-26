@@ -45,6 +45,12 @@ enum LogFormat {
     Json,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum OutputFormat {
+    Text,
+    Json,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Start the polling engine (watches all contracts in the config)
@@ -65,6 +71,11 @@ enum Command {
         /// Verify that each contract exists on its configured Horizon network.
         #[arg(long)]
         check_horizon: bool,
+
+        /// Output format. `json` prints the parsed config (secrets redacted) or the
+        /// validation error as a single JSON object on stdout.
+        #[arg(long, value_enum, default_value = "text", conflicts_with_all = ["check_webhooks", "check_horizon"])]
+        format: OutputFormat,
     },
 
     /// Send a test webhook payload to a URL and exit
@@ -101,7 +112,18 @@ async fn main() -> Result<()> {
     init_tracing(cli.log_format);
 
     match cli.command {
-        Command::Validate { check_webhooks, check_horizon } => {
+        Command::Validate { format: OutputFormat::Json, .. } => {
+            match AppConfig::from_file(&required_config(&cli)?) {
+                Ok(cfg) => println!("{}", serde_json::to_string_pretty(&config_summary_json(&cfg))?),
+                Err(e) => {
+                    let error = serde_json::json!({ "valid": false, "error": format!("{:#}", e) });
+                    println!("{}", serde_json::to_string_pretty(&error)?);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Command::Validate { check_webhooks, check_horizon, .. } => {
             let cfg = AppConfig::from_file(&required_config(&cli)?)?;
             println!("Config is valid.");
             println!("  poll_interval_seconds : {}", cfg.poll_interval_seconds);
@@ -230,6 +252,34 @@ async fn main() -> Result<()> {
 }
 fn required_config(cli: &Cli) -> Result<PathBuf> {
     Ok(cli.config.clone().unwrap_or_else(|| PathBuf::from("config/example.toml")))
+}
+
+/// Machine-readable `validate` summary. Webhook secrets are never printed;
+/// only whether one is set.
+fn config_summary_json(cfg: &AppConfig) -> serde_json::Value {
+    let contracts: Vec<_> = cfg
+        .contracts
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "label": c.label,
+                "contract_id": c.contract_id,
+                "network": c.network.as_str(),
+                "poll_interval_seconds": c.effective_poll_interval(cfg.poll_interval_seconds),
+                "webhook_url": c.webhook_url,
+                "webhook_secret_set": c.webhook_secret.is_some(),
+                "rules": c.rules,
+                "horizon_url": c.network.horizon_base_url(),
+                "explorer_url": format!("{}/contract/{}", c.network.explorer_base_url(), c.contract_id),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "valid": true,
+        "poll_interval_seconds": cfg.poll_interval_seconds,
+        "cursor_file": cfg.cursor_file,
+        "contracts": contracts,
+    })
 }
 
 async fn check_webhook_reachable(client: &Client, url: &str) -> Result<&'static str> {

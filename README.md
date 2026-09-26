@@ -124,10 +124,13 @@ For local development with webhook testing, see [Local Development with Docker C
 txwatch [--config <path>] <command>
 
 Commands:
-  watch                        Start the polling engine
-  validate                     Validate the config file and print a summary
-  test-webhook --url <URL>     Send a test payload to a webhook URL and exit
+  watch                          Start the polling engine
+  validate [--format text|json]  Validate the config file and print a summary
+  test-webhook --url <URL>       Send a test payload to a webhook URL and exit
 ```
+
+`validate --format json` prints the parsed config as a single JSON object (webhook secrets are
+redacted to `webhook_secret_set`), or `{"valid": false, "error": "..."}` with exit code 1.
 
 `--config` defaults to `config/example.toml`.
 
