@@ -24,11 +24,11 @@ The schema is also available from the CLI with `txwatch schema`. CI verifies tha
 
 | Field                         | Type            | Required | Default | Description |
 |-------------------------------|-----------------|----------|---------|-------------|
-| `poll_interval_seconds`       | u64             | yes      | —       | How often to poll Horizon (seconds). Must be ≥ 5 and ≤ 3600. |
-| `contracts`                   | array of tables | yes      | —       | The `[[contracts]]` entries (see below). At least one is required; labels must be unique. |
+| `poll_interval_seconds`       | u64             | no       | `10`    | How often to poll Horizon (seconds). Must be ≥ 5 and ≤ 3600. Each contract can override it (see below). |
+| `contracts`                   | array of tables | yes      | —       | The `[[contracts]]` entries (see below). At least one is required; labels must be unique (case-insensitive). |
 | `cursor_file`                 | string (path)   | no       | unset   | JSON file used to persist the per-contract cursor map. Loaded on startup and rewritten after each poll cycle. When unset, cursors start at Horizon's `now` and are not persisted. A missing or unparsable file falls back to `now`. |
-| `http_pool_max_idle_per_host` | usize           | no       | `10`    | Maximum idle connections kept per host in the HTTP pool. Lower values use less memory; higher values help with many contracts. |
-| `http_tcp_keepalive_secs`     | u64             | no       | `30`    | TCP keepalive interval (seconds) for pooled HTTP connections. |
+| `http_pool_max_idle_per_host` | usize           | no       | `10`    | Maximum idle connections kept per host in the HTTP pool. Must be 1–100. Lower values use less memory; higher values help with many contracts. |
+| `http_tcp_keepalive_secs`     | u64             | no       | `30`    | TCP keepalive interval (seconds) for pooled HTTP connections. Must be ≤ 7200; `0` disables keepalive. |
 | `http_connection_verbose`     | bool            | no       | `false` | Reserved for HTTP connection-pool debug output. Accepted by the parser but currently has no effect. |
 
 Unknown top-level keys are rejected.
@@ -37,8 +37,8 @@ Unknown top-level keys are rejected.
 > resulting in `429 Too Many Requests` responses. Sustained polling across six or more contracts at intervals below
 > 10 seconds is known to trigger rate limiting in production. The recommended minimum is
 > `poll_interval_seconds = 10`; for high-volume deployments with many contracts, `poll_interval_seconds = 30` or
-> higher is advised. TxWatch logs a startup warning when `poll_interval_seconds < 10` and more than 5 contracts
-> are configured.
+> higher is advised. TxWatch logs a startup warning when more than 5 contracts are polled at an effective
+> interval below 10 seconds.
 
 > **Contract limit:** `txwatch-config` declares `MAX_CONTRACTS = 100` as the supported upper bound for `[[contracts]]` entries. It is not yet enforced during validation, so keep configurations at or below 100 contracts to avoid exhausting memory or file descriptors with too many concurrent Horizon polling tasks.
 
@@ -48,11 +48,12 @@ Each entry defines one watched Soroban contract. At least one entry is required.
 
 | Field            | Type            | Required | Description |
 |------------------|-----------------|----------|-------------|
-| `label`          | string          | yes      | Human-readable name shown in logs and alert payloads. Must not be blank; must be unique across contracts. |
+| `label`          | string          | yes      | Human-readable name shown in logs and alert payloads. Surrounding whitespace is trimmed. Must not be blank, contain control characters (newlines, ANSI escapes, …) or exceed 128 characters; must be unique across contracts, ignoring case. |
 | `contract_id`    | string          | yes      | Stellar C-address (56 chars, starts with `C`). |
 | `network`        | string or table | yes      | `mainnet`, `testnet`, `futurenet`, or a custom network table (see below). |
 | `rules`          | array of tables | yes      | The `[[contracts.rules]]` entries (see below). At least one is required. |
 | `webhook_url`    | string          | yes      | `http://` or `https://` URL with a host that receives the alert JSON. |
+| `poll_interval_seconds` | u64      | no       | Polls this contract at its own interval instead of the top-level `poll_interval_seconds`. Same bounds (5–3600). Contracts are scheduled independently; `txwatch validate` prints each contract's effective interval. |
 | `webhook_secret` | string          | no       | When set, every webhook POST carries `X-TxWatch-Signature: sha256=<hex HMAC-SHA256 of the body>` **and** the raw secret in `X-TxWatch-Secret`. Supports `${ENV_VAR}` interpolation (e.g. `webhook_secret = "${MY_SECRET}"`); an unset variable is a startup error. |
 
 Unknown keys inside a `[[contracts]]` entry are rejected.
@@ -123,6 +124,8 @@ threshold_xlm = 10000          # must be > 0
 
 ### `FunctionCalled`
 Fires when the Soroban invocation calls exactly `function_name` (case-sensitive).
+Function names must be valid Soroban symbols: at most 32 characters from `[a-zA-Z0-9_]`
+(no spaces, hyphens or surrounding whitespace). The same applies to `AdminFunctionCalled`.
 
 ```toml
 [[contracts.rules]]

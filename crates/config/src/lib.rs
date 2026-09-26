@@ -10,6 +10,53 @@ use url::Url;
 
 const MAX_LARGE_TRANSFER_THRESHOLD_XLM: u64 = 1_000_000_000;
 
+/// Soroban function names are symbols: at most 32 characters from `[a-zA-Z0-9_]`.
+const MAX_SOROBAN_SYMBOL_LEN: usize = 32;
+
+/// Maximum length of a contract label, in characters.
+pub const MAX_LABEL_LEN: usize = 128;
+
+pub const DEFAULT_POLL_INTERVAL_SECONDS: u64 = 10;
+const MIN_POLL_INTERVAL_SECONDS: u64 = 5;
+const MAX_POLL_INTERVAL_SECONDS: u64 = 3600;
+
+pub const DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST: usize = 10;
+const MAX_HTTP_POOL_MAX_IDLE_PER_HOST: usize = 100;
+pub const DEFAULT_HTTP_TCP_KEEPALIVE_SECS: u64 = 30;
+const MAX_HTTP_TCP_KEEPALIVE_SECS: u64 = 7200;
+
+/// Rejects names that can never match a Soroban function: blank, longer than
+/// 32 characters, or containing anything outside `[a-zA-Z0-9_]`.
+fn validate_function_name(name: &str, rule: &str, contract_label: &str) -> Result<()> {
+    if name.len() > MAX_SOROBAN_SYMBOL_LEN
+        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        bail!(
+            "contract '{}': {} function name {:?} is not a valid Soroban symbol \
+             (at most {} characters from [a-zA-Z0-9_])",
+            contract_label,
+            rule,
+            name,
+            MAX_SOROBAN_SYMBOL_LEN
+        );
+    }
+    Ok(())
+}
+
+fn validate_poll_interval(value: u64, field: &str) -> Result<()> {
+    if value < MIN_POLL_INTERVAL_SECONDS {
+        bail!("{} must be >= {}", field, MIN_POLL_INTERVAL_SECONDS);
+    }
+    if value > MAX_POLL_INTERVAL_SECONDS {
+        bail!(
+            "{} must be <= {} (1 hour)",
+            field,
+            MAX_POLL_INTERVAL_SECONDS
+        );
+    }
+    Ok(())
+}
+
 // ── Network ───────────────────────────────────────────────────────────────────
 
 /// The Stellar network a contract lives on: one of the public networks by name
@@ -207,6 +254,7 @@ impl AlertRule {
                         contract_label
                     );
                 }
+                validate_function_name(function_name, "FunctionCalled", contract_label)?;
             }
             AlertRule::AdminFunctionCalled { function_names } => {
                 if function_names.is_empty() {
@@ -222,6 +270,7 @@ impl AlertRule {
                             contract_label
                         );
                     }
+                    validate_function_name(name, "AdminFunctionCalled", contract_label)?;
                     *name = name.to_lowercase();
                 }
             }
@@ -296,6 +345,10 @@ pub struct WatchedContract {
     /// Optional secret sent as X-TxWatch-Secret header on every webhook POST.
     /// Supports `${ENV_VAR}` interpolation (e.g. `webhook_secret = "${MY_SECRET}"`).
     pub webhook_secret: Option<String>,
+    /// Per-contract polling interval in seconds, overriding the top-level
+    /// `poll_interval_seconds`. Same bounds (5–3600).
+    #[serde(default)]
+    pub poll_interval_seconds: Option<u64>,
     /// Override the Horizon base URL; never read from TOML — set programmatically in tests.
     #[serde(skip, default)]
     #[schemars(skip)]
@@ -346,6 +399,12 @@ fn check_http_url(value: &str) -> Option<String> {
 }
 
 impl WatchedContract {
+    /// The interval this contract is polled at: its own override, or `default`
+    /// (the top-level `poll_interval_seconds`).
+    pub fn effective_poll_interval(&self, default: u64) -> u64 {
+        self.poll_interval_seconds.unwrap_or(default)
+    }
+
     pub fn validate(&mut self) -> Result<()> {
         ValidationErrors::into_result(self.collect_errors())
     }
@@ -357,6 +416,30 @@ impl WatchedContract {
 
         if self.label.trim().is_empty() {
             errors.push("a contract has an empty label".to_owned());
+        self.label = self.label.trim().to_owned();
+        if self.label.is_empty() {
+            bail!("a contract has an empty label");
+        }
+        // Labels end up in log lines and CLI output; `{:?}` escapes the
+        // offending characters so the error itself cannot inject them.
+        if self.label.chars().any(char::is_control) {
+            bail!(
+                "contract label {:?} must not contain control characters",
+                self.label
+            );
+        }
+        if self.label.chars().count() > MAX_LABEL_LEN {
+            bail!(
+                "contract label '{}…' is longer than {} characters",
+                self.label.chars().take(32).collect::<String>(),
+                MAX_LABEL_LEN
+            );
+        }
+        if let Some(interval) = self.poll_interval_seconds {
+            validate_poll_interval(
+                interval,
+                &format!("contract '{}': poll_interval_seconds", self.label),
+            )?;
         }
 
         // Stellar contract addresses start with 'C' and are 56 chars (base32)
@@ -423,6 +506,9 @@ pub const MAX_CONTRACTS: usize = 100;
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
+    /// Default polling interval in seconds for every contract (5–3600).
+    /// Default: 10.
+    #[serde(default = "default_poll_interval_seconds")]
     pub poll_interval_seconds: u64,
     pub contracts: Vec<WatchedContract>,
     /// Optional path to a JSON file used to persist the cursor map across restarts.
@@ -433,14 +519,14 @@ pub struct AppConfig {
     pub cursor_file: Option<String>,
     /// Maximum number of idle connections per host in the HTTP connection pool.
     /// Lower values reduce memory usage; higher values improve throughput for many contracts.
-    /// Default: 10.
+    /// Must be 1–100. Default: 10.
     #[serde(default = "default_http_pool_max_idle_per_host")]
-    pub http_pool_max_idle_per_host: Option<usize>,
+    pub http_pool_max_idle_per_host: usize,
     /// TCP keepalive interval in seconds for idle HTTP connections.
     /// Helps detect stalled connections quickly; 0 disables keepalive.
-    /// Default: 30 seconds.
+    /// Must be <= 7200. Default: 30 seconds.
     #[serde(default = "default_http_tcp_keepalive_secs")]
-    pub http_tcp_keepalive_secs: Option<u64>,
+    pub http_tcp_keepalive_secs: u64,
     /// Enable verbose output for HTTP connection pool debug information.
     /// Only useful for troubleshooting connection issues.
     /// Default: false.
@@ -448,12 +534,16 @@ pub struct AppConfig {
     pub http_connection_verbose: Option<bool>,
 }
 
-fn default_http_pool_max_idle_per_host() -> Option<usize> {
-    None
+fn default_poll_interval_seconds() -> u64 {
+    DEFAULT_POLL_INTERVAL_SECONDS
 }
 
-fn default_http_tcp_keepalive_secs() -> Option<u64> {
-    None
+fn default_http_pool_max_idle_per_host() -> usize {
+    DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST
+}
+
+fn default_http_tcp_keepalive_secs() -> u64 {
+    DEFAULT_HTTP_TCP_KEEPALIVE_SECS
 }
 
 fn deserialize_toml_with_field_context<T>(raw: &str, path: &Path) -> Result<T>
@@ -514,6 +604,20 @@ impl AppConfig {
         }
         if self.poll_interval_seconds > 3600 {
             errors.push("poll_interval_seconds must be <= 3600 (1 hour)".to_owned());
+        validate_poll_interval(self.poll_interval_seconds, "poll_interval_seconds")?;
+        if self.http_pool_max_idle_per_host == 0
+            || self.http_pool_max_idle_per_host > MAX_HTTP_POOL_MAX_IDLE_PER_HOST
+        {
+            bail!(
+                "http_pool_max_idle_per_host must be between 1 and {}",
+                MAX_HTTP_POOL_MAX_IDLE_PER_HOST
+            );
+        }
+        if self.http_tcp_keepalive_secs > MAX_HTTP_TCP_KEEPALIVE_SECS {
+            bail!(
+                "http_tcp_keepalive_secs must be <= {} (0 disables keepalive)",
+                MAX_HTTP_TCP_KEEPALIVE_SECS
+            );
         }
         if self.contracts.is_empty() {
             errors.push("at least one [[contracts]] entry is required".to_owned());
@@ -521,11 +625,15 @@ impl AppConfig {
         for contract in &mut self.contracts {
             errors.extend(contract.collect_errors());
         }
+        // Labels are already trimmed by `WatchedContract::validate`; compare
+        // case-insensitively so "Vault" and "vault" count as duplicates.
         let mut seen = std::collections::HashSet::new();
         let mut reported = std::collections::HashSet::new();
         for contract in &self.contracts {
             if !seen.insert(&contract.label) && reported.insert(&contract.label) {
                 errors.push(format!("duplicate contract label '{}'", contract.label));
+            if !seen.insert(contract.label.to_lowercase()) {
+                bail!("duplicate contract label '{}'", contract.label);
             }
         }
         ValidationErrors::into_result(errors)
@@ -547,6 +655,7 @@ mod tests {
             rules: vec![AlertRule::AnyTransaction],
             webhook_url: "https://example.com/hook".into(),
             webhook_secret: None,
+            poll_interval_seconds: None,
             horizon_base_url_override: None,
         }
     }
@@ -863,8 +972,8 @@ mod tests {
         let mut cfg = AppConfig {
             poll_interval_seconds: 10,
             contracts: vec![c.clone(), c],
-            http_pool_max_idle_per_host: None,
-            http_tcp_keepalive_secs: None,
+            http_pool_max_idle_per_host: DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST,
+            http_tcp_keepalive_secs: DEFAULT_HTTP_TCP_KEEPALIVE_SECS,
             http_connection_verbose: None,
             cursor_file: None,
         };
@@ -877,8 +986,8 @@ mod tests {
         let mut cfg = AppConfig {
             poll_interval_seconds: 10,
             contracts: vec![],
-            http_pool_max_idle_per_host: None,
-            http_tcp_keepalive_secs: None,
+            http_pool_max_idle_per_host: DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST,
+            http_tcp_keepalive_secs: DEFAULT_HTTP_TCP_KEEPALIVE_SECS,
             http_connection_verbose: None,
             cursor_file: None,
         };
@@ -948,8 +1057,8 @@ mod tests {
             let mut cfg = AppConfig {
                 poll_interval_seconds: val,
                 contracts: vec![valid_contract()],
-                http_pool_max_idle_per_host: None,
-                http_tcp_keepalive_secs: None,
+                http_pool_max_idle_per_host: DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST,
+                http_tcp_keepalive_secs: DEFAULT_HTTP_TCP_KEEPALIVE_SECS,
                 http_connection_verbose: None,
                 cursor_file: None,
             };
@@ -978,6 +1087,248 @@ mod tests {
         "#;
         let mut cfg: AppConfig = toml::from_str(raw).unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    fn config_with(contracts: Vec<WatchedContract>) -> AppConfig {
+        AppConfig {
+            poll_interval_seconds: DEFAULT_POLL_INTERVAL_SECONDS,
+            contracts,
+            http_pool_max_idle_per_host: DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST,
+            http_tcp_keepalive_secs: DEFAULT_HTTP_TCP_KEEPALIVE_SECS,
+            http_connection_verbose: None,
+            cursor_file: None,
+        }
+    }
+
+    const MINIMAL_TOML: &str = r#"
+        [[contracts]]
+        label = "x"
+        contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        network = "testnet"
+        webhook_url = "https://example.com/hook"
+        [[contracts.rules]]
+        type = "AnyTransaction"
+    "#;
+
+    // ── #97: poll interval default and per-contract override ─────────────────
+
+    #[test]
+    fn poll_interval_and_http_settings_default_when_omitted() {
+        let mut cfg: AppConfig = toml::from_str(MINIMAL_TOML).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.poll_interval_seconds, 10);
+        assert_eq!(cfg.http_pool_max_idle_per_host, 10);
+        assert_eq!(cfg.http_tcp_keepalive_secs, 30);
+        assert_eq!(cfg.contracts[0].poll_interval_seconds, None);
+        assert_eq!(
+            cfg.contracts[0].effective_poll_interval(cfg.poll_interval_seconds),
+            10
+        );
+    }
+
+    #[test]
+    fn per_contract_poll_interval_overrides_global() {
+        let raw = r#"
+            poll_interval_seconds = 60
+            [[contracts]]
+            label = "fast"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            poll_interval_seconds = 5
+            [[contracts.rules]]
+            type = "AnyTransaction"
+            [[contracts]]
+            label = "slow"
+            contract_id = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            [[contracts.rules]]
+            type = "AnyTransaction"
+        "#;
+        let mut cfg: AppConfig = toml::from_str(raw).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.contracts[0].effective_poll_interval(cfg.poll_interval_seconds),
+            5
+        );
+        assert_eq!(
+            cfg.contracts[1].effective_poll_interval(cfg.poll_interval_seconds),
+            60
+        );
+    }
+
+    #[test]
+    fn rejects_per_contract_poll_interval_out_of_bounds() {
+        for val in [0, 4, 3601] {
+            let mut c = valid_contract();
+            c.poll_interval_seconds = Some(val);
+            let err = config_with(vec![c]).validate().unwrap_err().to_string();
+            assert!(
+                err.contains("contract 'Test': poll_interval_seconds must be"),
+                "val={} should be rejected, got: {}",
+                val,
+                err
+            );
+        }
+    }
+
+    // ── #96: HTTP pool settings ──────────────────────────────────────────────
+
+    #[test]
+    fn rejects_zero_http_pool_max_idle_per_host() {
+        let mut cfg = config_with(vec![valid_contract()]);
+        cfg.http_pool_max_idle_per_host = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("http_pool_max_idle_per_host"));
+    }
+
+    #[test]
+    fn rejects_too_large_http_pool_max_idle_per_host() {
+        let mut cfg = config_with(vec![valid_contract()]);
+        cfg.http_pool_max_idle_per_host = MAX_HTTP_POOL_MAX_IDLE_PER_HOST + 1;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_too_large_http_tcp_keepalive_secs() {
+        let mut cfg = config_with(vec![valid_contract()]);
+        cfg.http_tcp_keepalive_secs = MAX_HTTP_TCP_KEEPALIVE_SECS + 1;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("http_tcp_keepalive_secs"));
+    }
+
+    #[test]
+    fn accepts_zero_http_tcp_keepalive_secs() {
+        let mut cfg = config_with(vec![valid_contract()]);
+        cfg.http_tcp_keepalive_secs = 0;
+        assert!(cfg.validate().is_ok());
+    }
+
+    // ── #95: contract labels ─────────────────────────────────────────────────
+
+    #[test]
+    fn rejects_label_with_newline() {
+        let mut c = valid_contract();
+        c.label = "Vault\nINFO forged log line".into();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("control characters"), "got: {}", err);
+        assert!(
+            !err.contains('\n'),
+            "error must not echo the raw newline: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn rejects_label_with_ansi_escape() {
+        let mut c = valid_contract();
+        c.label = "\u{1b}[31mVault\u{1b}[0m".into();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("control characters"), "got: {}", err);
+        assert!(
+            !err.contains('\u{1b}'),
+            "error must not echo the raw escape: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn rejects_label_longer_than_max() {
+        let mut c = valid_contract();
+        c.label = "a".repeat(MAX_LABEL_LEN + 1);
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("longer than 128 characters"), "got: {}", err);
+    }
+
+    #[test]
+    fn accepts_label_of_max_length() {
+        let mut c = valid_contract();
+        c.label = "é".repeat(MAX_LABEL_LEN);
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn label_is_trimmed() {
+        let mut c = valid_contract();
+        c.label = "  Vault \t".into();
+        c.validate().unwrap();
+        assert_eq!(c.label, "Vault");
+    }
+
+    #[test]
+    fn rejects_duplicate_labels_differing_in_case_and_whitespace() {
+        let mut a = valid_contract();
+        a.label = "Vault".into();
+        let mut b = valid_contract();
+        b.label = "vault ".into();
+        let err = config_with(vec![a, b]).validate().unwrap_err();
+        assert!(err.to_string().contains("duplicate contract label"));
+    }
+
+    // ── #94: Soroban function names ──────────────────────────────────────────
+
+    #[test]
+    fn rejects_function_name_longer_than_32_chars() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::FunctionCalled {
+            function_name: "a".repeat(33),
+        }];
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("contract 'Test'"), "got: {}", err);
+        assert!(err.contains("FunctionCalled"), "got: {}", err);
+        assert!(
+            err.contains("at most 32 characters from [a-zA-Z0-9_]"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn accepts_function_name_of_32_chars() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::FunctionCalled {
+            function_name: "a".repeat(32),
+        }];
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_function_name_with_invalid_characters() {
+        for name in ["with-draw", "with draw", "withdraw()", "wïthdraw"] {
+            let mut c = valid_contract();
+            c.rules = vec![AlertRule::FunctionCalled {
+                function_name: name.into(),
+            }];
+            let err = c.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("not a valid Soroban symbol"),
+                "{}: {}",
+                name,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_function_name_with_surrounding_whitespace() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::FunctionCalled {
+            function_name: "withdraw ".into(),
+        }];
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("\"withdraw \""), "got: {}", err);
+    }
+
+    #[test]
+    fn rejects_invalid_admin_function_name() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::AdminFunctionCalled {
+            function_names: vec!["set_admin".into(), " upgrade".into()],
+        }];
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("AdminFunctionCalled"), "got: {}", err);
+        assert!(err.contains("not a valid Soroban symbol"), "got: {}", err);
     }
 
     #[test]

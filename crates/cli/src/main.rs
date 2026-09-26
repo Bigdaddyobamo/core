@@ -117,6 +117,15 @@ async fn main() -> Result<()> {
                         "none"
                     }
                 );
+                println!(
+                    "    interval     : {}s{}",
+                    c.effective_poll_interval(cfg.poll_interval_seconds),
+                    if c.poll_interval_seconds.is_some() {
+                        " (override)"
+                    } else {
+                        ""
+                    }
+                );
                 println!("    rules        : {}", c.rules.len());
                 for rule in &c.rules {
                     println!("      - {}", rule.label());
