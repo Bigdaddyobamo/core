@@ -286,7 +286,7 @@ async fn main() -> Result<()> {
                 let selected = match network.as_str() { "mainnet" => txwatch_config::Network::Mainnet, "testnet" => txwatch_config::Network::Testnet, "futurenet" => txwatch_config::Network::Futurenet, other => return Err(anyhow::anyhow!("unknown network '{}'", other)) };
                 (url.ok_or_else(|| anyhow::anyhow!("--url is required unless --contract is provided"))?, network, selected.horizon_base_url().to_owned(), secret)
             };
-            let payload = test_payload_with_network(&label, &url, &network_name, &horizon_base_url);
+            let payload = test_payload_with_network(&label, &network_name, &horizon_base_url);
             let client = build_client().context("failed to build HTTP client")?;
 
             info!(url = %url, "sending test webhook");

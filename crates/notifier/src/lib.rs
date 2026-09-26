@@ -169,20 +169,23 @@ pub async fn send_webhook(
     Err(err)
 }
 
+/// Contract ID used by test payloads: a valid contract StrKey (base32, contract
+/// version byte, correct CRC16 checksum) that visibly reads as synthetic, so
+/// receivers that validate or decode addresses accept it.
+pub const TEST_CONTRACT_ID: &str = "CATXWATCHTESTCONTRACTAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA5UI";
+
 /// Build a synthetic `AlertPayload` suitable for `test-webhook`.
-pub fn test_payload(label: &str, webhook_url: &str) -> AlertPayload {
-    test_payload_with_network(
-        label,
-        webhook_url,
-        "testnet",
-        "https://horizon-testnet.stellar.org",
-    )
+pub fn test_payload(label: &str) -> AlertPayload {
+    test_payload_with_network(label, "testnet", "https://horizon-testnet.stellar.org")
 }
 
 /// Build a synthetic `AlertPayload` with an explicit network name and Horizon base URL.
+///
+/// `label` is used as-is. The webhook URL is deliberately not part of the
+/// payload: receivers often forward alerts to chat, and URLs can embed tokens.
+/// Test payloads are marked with `rule_type = "TestWebhook"` and `"test": true`.
 pub fn test_payload_with_network(
     label: &str,
-    webhook_url: &str,
     network: &str,
     horizon_base_url: &str,
 ) -> AlertPayload {
@@ -190,7 +193,7 @@ pub fn test_payload_with_network(
     let tx_hash = "0000000000000000000000000000000000000000000000000000000000000000";
     AlertPayload {
         label: label.to_string(),
-        contract_id: "CTEST000000000000000000000000000000000000000000000000000".into(),
+        contract_id: TEST_CONTRACT_ID.into(),
         network: network.to_string(),
         rule_type: "TestWebhook".into(),
         rule_triggered: "TestWebhook".into(),
@@ -203,8 +206,8 @@ pub fn test_payload_with_network(
         timestamp_iso: now.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         horizon_link: format!("{}/transactions/{}", horizon_base_url, tx_hash),
         explorer_link: format!("https://stellar.expert/explorer/{}/tx/{}", network, tx_hash),
+        test: true,
     }
-    .with_label(format!("{} (test-webhook to {})", label, webhook_url))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -233,6 +236,7 @@ mod tests {
             timestamp_iso: "2023-11-15T03:13:20Z".into(),
             horizon_link: "https://horizon-testnet.stellar.org/transactions/abc123".into(),
             explorer_link: "https://stellar.expert/explorer/testnet/tx/abc123".into(),
+            test: false,
         }
     }
 
@@ -455,17 +459,13 @@ mod tests {
         );
     }
 
-    /// Issue #13: test_payload produces a structurally valid AlertPayload (56-char contract ID).
+    /// Issue #13: test_payload produces a structurally valid AlertPayload.
     #[test]
     fn test_payload_is_structurally_valid() {
-        let p = test_payload("My Contract", "https://example.com/hook");
-        assert!(p.label.contains("My Contract"));
+        let p = test_payload("My Contract");
+        assert_eq!(p.rule_type, "TestWebhook");
         assert_eq!(p.rule_triggered, "TestWebhook");
-        assert_eq!(p.contract_id.len(), 56, "contract_id must be 56 characters");
-        assert!(
-            p.contract_id.starts_with('C'),
-            "contract_id must start with 'C'"
-        );
+        assert!(p.test, "test payloads must be marked as such");
         assert!(
             p.horizon_link.contains("/transactions/"),
             "horizon_link must contain /transactions/"
@@ -479,16 +479,35 @@ mod tests {
     /// Issue #13: test_payload_with_network derives links from the supplied network config.
     #[test]
     fn test_payload_with_network_derives_links_from_config() {
-        let p = test_payload_with_network(
-            "Label",
-            "https://example.com/hook",
-            "mainnet",
-            "https://horizon.stellar.org",
-        );
+        let p = test_payload_with_network("Label", "mainnet", "https://horizon.stellar.org");
         assert!(p
             .horizon_link
             .starts_with("https://horizon.stellar.org/transactions/"));
         assert!(p.explorer_link.contains("/mainnet/"));
+    }
+
+    /// The label is passed through unchanged; the webhook URL (which may embed
+    /// a token) never appears anywhere in the payload.
+    #[test]
+    fn test_payload_keeps_label_and_never_includes_webhook_url() {
+        let p = test_payload("My Contract");
+        assert_eq!(p.label, "My Contract");
+
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(!json.contains("test-webhook to"), "got: {}", json);
+        assert!(!json.contains("example.com"), "got: {}", json);
+        assert!(json.contains(r#""test":true"#), "got: {}", json);
+    }
+
+    /// The synthetic contract ID passes the same StrKey decoding (alphabet,
+    /// version byte, CRC16 checksum) that txwatch-config provides.
+    #[test]
+    fn test_payload_contract_id_is_a_valid_strkey() {
+        let p = test_payload("My Contract");
+        assert_eq!(p.contract_id, TEST_CONTRACT_ID);
+        txwatch_config::validate_contract_id(&p.contract_id)
+            .unwrap_or_else(|e| panic!("{} is not a valid contract StrKey: {}", p.contract_id, e));
+        assert!(p.contract_id.contains("TXWATCHTEST"));
     }
 
     #[tokio::test]

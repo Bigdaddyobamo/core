@@ -185,6 +185,10 @@ This example and the one in the README are checked against `AlertPayload` by
 - `timestamp` / `timestamp_iso` — ledger close time as Unix seconds and as an ISO 8601 string.
 - `function_name` — the first invoked Soroban function name (present for backward compatibility).
 - `function_names` — all Soroban function names invoked in the transaction (one per `invoke_host_function` operation). Most transactions have zero or one entry.
+- `test` — present and `true` only on payloads sent by `txwatch test-webhook`, which also use
+  `rule_type = "TestWebhook"`, the label exactly as given, and the synthetic but valid contract ID
+  `CATXWATCHTESTCONTRACTAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA5UI`. Real alerts omit the field. The
+  webhook URL is never included in a payload, since URLs often embed tokens.
 
 ## Environment variables
 

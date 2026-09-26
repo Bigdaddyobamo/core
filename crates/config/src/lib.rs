@@ -398,6 +398,119 @@ fn check_http_url(value: &str) -> Option<String> {
     }
 }
 
+// ── Contract StrKey ───────────────────────────────────────────────────────────
+
+/// Length of a contract StrKey: base32 of 1 version byte + 32 payload bytes +
+/// 2 checksum bytes (35 bytes = 280 bits = 56 base32 characters, no padding).
+const CONTRACT_STRKEY_LEN: usize = 56;
+
+/// StrKey version byte for contract addresses (`2 << 3`), which encodes to a
+/// leading 'C'.
+const CONTRACT_STRKEY_VERSION: u8 = 2 << 3;
+
+/// Why a string is not a valid Stellar contract StrKey.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContractIdError {
+    /// Not exactly 56 characters long.
+    Length(usize),
+    /// Contains a character outside the base32 alphabet `A–Z2–7`
+    /// (lowercase letters, `0`, `1`, `8` and `9` are the usual culprits).
+    Alphabet { position: usize, found: char },
+    /// Decodes, but the version byte is not the contract version ('C…').
+    VersionByte(u8),
+    /// Decodes, but the CRC16-XModem checksum does not match — usually a
+    /// copy-paste or typing error.
+    Checksum { expected: u16, found: u16 },
+}
+
+impl fmt::Display for ContractIdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ContractIdError::Length(len) => write!(
+                f,
+                "must be {} characters, got {}",
+                CONTRACT_STRKEY_LEN, len
+            ),
+            ContractIdError::Alphabet { position, found } => write!(
+                f,
+                "invalid character {:?} at position {} (only A-Z and 2-7 are allowed)",
+                found, position
+            ),
+            ContractIdError::VersionByte(byte) => write!(
+                f,
+                "wrong version byte 0x{:02x} (contract addresses start with 'C')",
+                byte
+            ),
+            ContractIdError::Checksum { expected, found } => write!(
+                f,
+                "checksum mismatch (expected 0x{:04x}, found 0x{:04x}); \
+                 the address is probably mistyped",
+                expected, found
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ContractIdError {}
+
+/// CRC16-XModem (poly 0x1021, init 0), as used by StrKey.
+fn crc16_xmodem(data: &[u8]) -> u16 {
+    let mut crc: u16 = 0;
+    for &byte in data {
+        crc ^= u16::from(byte) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x1021
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+/// Decodes and checks a contract StrKey (`C…`): length, base32 alphabet,
+/// version byte and CRC16-XModem checksum. Returns the 32-byte contract hash.
+pub fn validate_contract_id(id: &str) -> std::result::Result<[u8; 32], ContractIdError> {
+    let len = id.chars().count();
+    if len != CONTRACT_STRKEY_LEN {
+        return Err(ContractIdError::Length(len));
+    }
+
+    let mut bytes = [0u8; 35];
+    let mut buffer: u32 = 0;
+    let mut bits = 0;
+    let mut out = 0;
+    for (position, c) in id.chars().enumerate() {
+        let value = match c {
+            'A'..='Z' => c as u32 - 'A' as u32,
+            '2'..='7' => c as u32 - '2' as u32 + 26,
+            found => return Err(ContractIdError::Alphabet { position, found }),
+        };
+        buffer = (buffer << 5) | value;
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            bytes[out] = (buffer >> bits) as u8;
+            out += 1;
+        }
+    }
+
+    let (body, checksum) = bytes.split_at(33);
+    if body[0] != CONTRACT_STRKEY_VERSION {
+        return Err(ContractIdError::VersionByte(body[0]));
+    }
+    let expected = crc16_xmodem(body);
+    let found = u16::from_le_bytes([checksum[0], checksum[1]]);
+    if expected != found {
+        return Err(ContractIdError::Checksum { expected, found });
+    }
+
+    let mut payload = [0u8; 32];
+    payload.copy_from_slice(&body[1..]);
+    Ok(payload)
+}
+
 impl WatchedContract {
     /// The interval this contract is polled at: its own override, or `default`
     /// (the top-level `poll_interval_seconds`).
@@ -1479,5 +1592,40 @@ mod tests {
         assert_eq!(cfg.effective_max_contracts(), 500);
         let default: AppConfig = toml::from_str(MINIMAL_TOML).unwrap();
         assert_eq!(default.effective_max_contracts(), MAX_CONTRACTS);
+    }
+
+    // ── Contract StrKey ──────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_contract_id_accepts_real_contract_ids() {
+        // Native XLM Stellar Asset Contract on testnet and mainnet.
+        for id in [
+            "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+            "CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA",
+        ] {
+            assert!(validate_contract_id(id).is_ok(), "{}", id);
+        }
+    }
+
+    #[test]
+    fn validate_contract_id_reports_each_failure_distinctly() {
+        let valid = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+        assert_eq!(
+            validate_contract_id(&valid[..55]),
+            Err(ContractIdError::Length(55))
+        );
+        assert_eq!(
+            validate_contract_id("CTEST000000000000000000000000000000000000000000000000000"),
+            Err(ContractIdError::Alphabet { position: 5, found: '0' })
+        );
+        assert_eq!(
+            validate_contract_id("GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"),
+            Err(ContractIdError::VersionByte(6 << 3))
+        );
+        let mistyped = valid.replacen("LZ", "LY", 1);
+        assert!(matches!(
+            validate_contract_id(&mistyped),
+            Err(ContractIdError::Checksum { .. })
+        ));
     }
 }
