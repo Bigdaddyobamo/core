@@ -150,6 +150,19 @@ jobs:
       - name: Run cargo-deny to check dependencies
         uses: EmbarkStudios/cargo-deny-action@v2
 
+  # ── Docker image ────────────────────────────────────────────────────────────
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build the image
+        run: docker build --tag txwatch:ci .
+
+      - name: Smoke-test the image
+        run: docker run --rm txwatch:ci --version
+
   # ── Build (release) ─────────────────────────────────────────────────────────
   build:
     name: Build (release)
