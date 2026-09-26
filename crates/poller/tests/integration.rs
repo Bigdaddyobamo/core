@@ -101,6 +101,14 @@ async fn poll_includes_fee_charged_and_fires_high_fee_rule() {
                 }]
             }
         })))
+        .up_to_n_times(1)
+        .mount(&horizon)
+        .await;
+
+    // All subsequent transaction requests return an empty page.
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
         .mount(&horizon)
         .await;
 
@@ -872,9 +880,16 @@ async fn contracts_polled_concurrently() {
         cursor_file: None,
     };
 
+    // `run` never returns, so time how long it takes until both webhooks arrive.
     let start = std::time::Instant::now();
-    let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
+    let run = tokio::spawn(txwatch_poller::run(cfg));
+    while receiver.received_requests().await.unwrap().len() < 2
+        && start.elapsed() < Duration::from_secs(5)
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let elapsed = start.elapsed();
+    run.abort();
 
     // Sequential polling would take ≥ 2 × DELAY_MS. Concurrent polling takes ≈ DELAY_MS.
     // We allow generous headroom (1.8×) to avoid flakiness on slow CI.
@@ -900,15 +915,6 @@ async fn reload_keeps_existing_cursors_and_starts_new_contracts() {
         .mount(&horizon_a)
         .await;
     for horizon in [&horizon_a, &horizon_b] {
-/// A per-contract `poll_interval_seconds` override is scheduled independently:
-/// the fast contract is polled several times while the slow one (global
-/// interval) is polled only once. Closes #97.
-#[tokio::test]
-async fn per_contract_poll_interval_is_scheduled_independently() {
-    let fast_horizon = MockServer::start().await;
-    let slow_horizon = MockServer::start().await;
-
-    for horizon in [&fast_horizon, &slow_horizon] {
         Mock::given(method("GET"))
             .and(path_regex("/accounts/.*/transactions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
@@ -940,8 +946,8 @@ async fn per_contract_poll_interval_is_scheduled_independently() {
         poll_interval_seconds: 3600,
         contracts,
         cursor_file: None,
-        http_pool_max_idle_per_host: None,
-        http_tcp_keepalive_secs: None,
+        http_pool_max_idle_per_host: 10,
+        http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
     };
 
@@ -985,6 +991,28 @@ async fn per_contract_poll_interval_is_scheduled_independently() {
         cursors(horizon_b.received_requests().await.unwrap()),
         vec!["now"],
         "B is new and must start from 'now'"
+    );
+}
+
+/// A per-contract `poll_interval_seconds` override is scheduled independently:
+/// the fast contract is polled several times while the slow one (global
+/// interval) is polled only once. Closes #97.
+#[tokio::test]
+async fn per_contract_poll_interval_is_scheduled_independently() {
+    let fast_horizon = MockServer::start().await;
+    let slow_horizon = MockServer::start().await;
+
+    for horizon in [&fast_horizon, &slow_horizon] {
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+            .mount(horizon)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("/transactions/.*/operations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+            .mount(horizon)
+            .await;
     }
 
     let mut fast = helpers::contract(

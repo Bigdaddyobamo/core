@@ -145,11 +145,11 @@ enum NamedNetworkSchema {
 }
 
 impl JsonSchema for Network {
-    fn schema_name() -> String {
-        "Network".to_owned()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Network".into()
     }
 
-    fn json_schema(gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+    fn json_schema(gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
         NetworkSchema::json_schema(gen)
     }
 }
@@ -414,32 +414,32 @@ impl WatchedContract {
     fn collect_errors(&mut self) -> Vec<String> {
         let mut errors = Vec::new();
 
-        if self.label.trim().is_empty() {
-            errors.push("a contract has an empty label".to_owned());
         self.label = self.label.trim().to_owned();
         if self.label.is_empty() {
-            bail!("a contract has an empty label");
+            errors.push("a contract has an empty label".to_owned());
         }
         // Labels end up in log lines and CLI output; `{:?}` escapes the
         // offending characters so the error itself cannot inject them.
         if self.label.chars().any(char::is_control) {
-            bail!(
+            errors.push(format!(
                 "contract label {:?} must not contain control characters",
                 self.label
-            );
+            ));
         }
         if self.label.chars().count() > MAX_LABEL_LEN {
-            bail!(
+            errors.push(format!(
                 "contract label '{}…' is longer than {} characters",
                 self.label.chars().take(32).collect::<String>(),
                 MAX_LABEL_LEN
-            );
+            ));
         }
         if let Some(interval) = self.poll_interval_seconds {
-            validate_poll_interval(
+            if let Err(e) = validate_poll_interval(
                 interval,
                 &format!("contract '{}': poll_interval_seconds", self.label),
-            )?;
+            ) {
+                errors.push(e.to_string());
+            }
         }
 
         // Stellar contract addresses start with 'C' and are 56 chars (base32)
@@ -605,25 +605,23 @@ impl AppConfig {
     /// Validates the whole config and reports every error found, not just the first.
     pub fn validate(&mut self) -> Result<()> {
         let mut errors = Vec::new();
-        if self.poll_interval_seconds < 5 {
-            errors.push("poll_interval_seconds must be >= 5".to_owned());
+        if let Err(e) = validate_poll_interval(self.poll_interval_seconds, "poll_interval_seconds")
+        {
+            errors.push(e.to_string());
         }
-        if self.poll_interval_seconds > 3600 {
-            errors.push("poll_interval_seconds must be <= 3600 (1 hour)".to_owned());
-        validate_poll_interval(self.poll_interval_seconds, "poll_interval_seconds")?;
         if self.http_pool_max_idle_per_host == 0
             || self.http_pool_max_idle_per_host > MAX_HTTP_POOL_MAX_IDLE_PER_HOST
         {
-            bail!(
+            errors.push(format!(
                 "http_pool_max_idle_per_host must be between 1 and {}",
                 MAX_HTTP_POOL_MAX_IDLE_PER_HOST
-            );
+            ));
         }
         if self.http_tcp_keepalive_secs > MAX_HTTP_TCP_KEEPALIVE_SECS {
-            bail!(
+            errors.push(format!(
                 "http_tcp_keepalive_secs must be <= {} (0 disables keepalive)",
                 MAX_HTTP_TCP_KEEPALIVE_SECS
-            );
+            ));
         }
         if self.contracts.is_empty() {
             errors.push("at least one [[contracts]] entry is required".to_owned());
@@ -636,10 +634,9 @@ impl AppConfig {
         let mut seen = std::collections::HashSet::new();
         let mut reported = std::collections::HashSet::new();
         for contract in &self.contracts {
-            if !seen.insert(&contract.label) && reported.insert(&contract.label) {
+            let key = contract.label.to_lowercase();
+            if !seen.insert(key.clone()) && reported.insert(key) {
                 errors.push(format!("duplicate contract label '{}'", contract.label));
-            if !seen.insert(contract.label.to_lowercase()) {
-                bail!("duplicate contract label '{}'", contract.label);
             }
         }
         ValidationErrors::into_result(errors)
@@ -945,8 +942,8 @@ mod tests {
         let mut cfg = AppConfig {
             poll_interval_seconds: 1,
             contracts: vec![bad_id, bad_rule, valid_contract(), valid_contract()],
-            http_pool_max_idle_per_host: None,
-            http_tcp_keepalive_secs: None,
+            http_pool_max_idle_per_host: DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST,
+            http_tcp_keepalive_secs: DEFAULT_HTTP_TCP_KEEPALIVE_SECS,
             http_connection_verbose: None,
             cursor_file: None,
         };
