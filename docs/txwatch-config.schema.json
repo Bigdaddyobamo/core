@@ -15,6 +15,13 @@
     "WatchedContract": {
       "type": "object", "required": ["label", "contract_id", "network", "rules", "webhook_url"], "additionalProperties": false,
       "properties": {
+        "label": { "type": "string" }, "contract_id": { "type": "string", "pattern": "^C[A-Z2-7]{55}$" },
+        "network": { "oneOf": [
+          { "enum": ["mainnet", "testnet", "futurenet"] },
+          { "type": "object", "required": ["horizon_url"], "additionalProperties": false,
+            "properties": { "horizon_url": { "type": "string", "format": "uri" }, "explorer_url": { "type": ["string", "null"], "format": "uri" }, "passphrase": { "type": ["string", "null"] } } }
+        ] }, "webhook_url": { "type": "string", "format": "uri" },
+        "webhook_secret": { "type": ["string", "null"] }, "rules": { "type": "array", "items": { "$ref": "#/definitions/AlertRule" }, "minItems": 1 }
         "label": { "type": "string", "maxLength": 128 }, "contract_id": { "type": "string", "pattern": "^C[A-Z2-7]{55}$" },
         "network": { "enum": ["mainnet", "testnet", "futurenet"] }, "webhook_url": { "type": "string", "format": "uri" },
         "webhook_secret": { "type": ["string", "null"] },

@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `txwatch schema` command and a committed JSON Schema for editor validation
 - `txwatch validate --check-webhooks` and `--check-horizon` pre-flight checks
 - Horizon operations fetched inline with `join=operations`
+- Custom / local networks: `network = { horizon_url = "…", explorer_url = "…", passphrase = "…" }`, reported as `network = "custom"`; `docker-compose.local.yml` runs `stellar/quickstart --local` with TxWatch
+- `TXWATCH_CONFIG` environment variable for the config path
+- `SIGHUP` reloads the config without restarting; cursors of remaining contracts are kept and an invalid file is ignored
 - Per-contract `poll_interval_seconds` override; each contract is polled on its own schedule and `txwatch validate` shows the effective interval
 
 ### Changed
@@ -28,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `poll_interval_seconds` is bounded to 5–3600 seconds
 - `txwatch test-webhook` exits with code 1 when delivery fails
 - Config parse errors name the offending field path
+- Config validation reports every error at once instead of stopping at the first
+- `--config` defaults to `./txwatch.toml` instead of `config/example.toml`, and a missing config file is an error
 - `poll_interval_seconds` defaults to 10 and is no longer required
 - `http_pool_max_idle_per_host` and `http_tcp_keepalive_secs` have concrete defaults (10 and 30) and are range-checked (1–100 and 0–7200); `http_tcp_keepalive_secs = 0` now disables keepalive as documented
 - Contract labels are trimmed, must not contain control characters, are limited to 128 characters, and are compared case-insensitively for duplicates
