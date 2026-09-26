@@ -23,8 +23,7 @@ use txwatch_rules::{evaluate, EnrichedTransaction, HorizonTransaction};
 #[cfg(feature = "metrics")]
 pub mod metrics;
 
-/// Bind address for the optional `/metrics` HTTP endpoint.
-/// Set via `AppConfig::metrics_addr` when the `metrics` feature is enabled.
+/// Starts the optional `/metrics`, `/healthz` and `/readyz` HTTP endpoint.
 #[cfg(feature = "metrics")]
 pub use metrics::serve_metrics;
 
@@ -150,6 +149,11 @@ pub async fn run_with_shutdown(
     };
 
     let interval = Duration::from_secs(cfg.poll_interval_seconds);
+    #[cfg(feature = "metrics")]
+    {
+        metrics::set_poll_interval(cfg.poll_interval_seconds);
+        metrics::register_build_info();
+    }
     let summary_every = Duration::from_secs(60);
     let counters = Arc::new(Counters::default());
     let n_contracts = cfg.contracts.len();
@@ -237,11 +241,18 @@ pub async fn run_with_shutdown(
                     // Issue #25: increment Prometheus counters when metrics feature is enabled.
                     #[cfg(feature = "metrics")]
                     {
-                        metrics::inc_transactions(txs);
-                        metrics::inc_alerts(alerts);
+                        let network = contract.network.as_str();
+                        metrics::inc_transactions(&contract.label, network, txs);
+                        metrics::inc_alerts(&contract.label, network, alerts);
+                        metrics::record_poll_success(&contract.label, network);
+                        metrics::mark_poll_success();
                     }
                 }
-                Err(e) => error!(error = %e, "contract polling task failed"),
+                Err(e) => {
+                    error!(error = %e, "contract polling task failed");
+                    #[cfg(feature = "metrics")]
+                    metrics::record_poll_failure(&contract.label, contract.network.as_str());
+                }
             }
         }
         if *shutdown.borrow() {
@@ -307,11 +318,15 @@ async fn poll_contract(
             poll_base, contract.contract_id, page_cursor
         );
 
-        let response = client
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("GET {} failed", url))?;
+        #[cfg(feature = "metrics")]
+        let started = std::time::Instant::now();
+        let response = client.get(&url).send().await;
+        #[cfg(feature = "metrics")]
+        metrics::observe_horizon_request(
+            contract.network.as_str(),
+            started.elapsed().as_secs_f64(),
+        );
+        let response = response.with_context(|| format!("GET {} failed", url))?;
 
         if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
             let retry_after = response
@@ -429,19 +444,23 @@ async fn poll_contract(
                 info!(contract = %contract.label, rule = %payload.rule_triggered,
                     tx = %payload.transaction_hash, "rule fired — sending webhook");
                 let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-                if let Err(e) = send_webhook(
+                #[cfg(feature = "metrics")]
+                let started = std::time::Instant::now();
+                let delivery = send_webhook(
                     client,
                     &contract.webhook_url,
                     &payload,
                     contract.webhook_secret.as_deref(),
                     shutdown_rx,
                 )
-                .await
-                {
+                .await;
+                #[cfg(feature = "metrics")]
+                metrics::observe_webhook_delivery(started.elapsed().as_secs_f64());
+                if let Err(e) = delivery {
                     error!(contract = %contract.label, rule = %payload.rule_triggered,
                         tx = %payload.transaction_hash, error = %e, "webhook delivery failed");
                     #[cfg(feature = "metrics")]
-                    metrics::inc_webhook_failures();
+                    metrics::inc_webhook_failures(&contract.label, contract.network.as_str());
                 }
             }
         }
