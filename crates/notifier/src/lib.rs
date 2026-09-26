@@ -7,6 +7,7 @@ use anyhow::{anyhow, Result};
 use chrono::Utc;
 use hmac::{Hmac, KeyInit, Mac};
 use reqwest::Client;
+use serde::Serialize;
 use sha2::Sha256;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
@@ -60,13 +61,79 @@ pub async fn send_webhook(
     url: &str,
     payload: &AlertPayload,
     secret: Option<&str>,
-    mut shutdown: oneshot::Receiver<()>,
+    shutdown: oneshot::Receiver<()>,
 ) -> Result<DeliveryResult> {
-    let mut shutdown_live = true;
     let span = span!(Level::INFO, "send_webhook", contract = %payload.label, rule = %payload.rule_triggered);
     let _enter = span.enter();
 
     let body = serde_json::to_string(payload)?;
+    deliver(
+        client,
+        url,
+        body,
+        secret,
+        shutdown,
+        &payload.rule_triggered,
+        &payload.transaction_hash,
+    )
+    .await
+}
+
+/// Maximum number of alerts in one batched POST; larger sets are split.
+pub const MAX_BATCH_SIZE: usize = 50;
+
+/// Body of a batched webhook POST: `{"alerts": [<AlertPayload>, ...]}`.
+#[derive(Debug, Serialize)]
+pub struct AlertBatch<'a> {
+    pub alerts: &'a [AlertPayload],
+}
+
+/// POST `payloads` as one `{"alerts": [...]}` request, with the same retries,
+/// headers and signature as [`send_webhook`] (the signature covers the whole
+/// batch body). At most [`MAX_BATCH_SIZE`] payloads are accepted; split
+/// larger sets with `payloads.chunks(MAX_BATCH_SIZE)`.
+pub async fn send_webhook_batch(
+    client: &Client,
+    url: &str,
+    payloads: &[AlertPayload],
+    secret: Option<&str>,
+    shutdown: oneshot::Receiver<()>,
+) -> Result<DeliveryResult> {
+    if payloads.is_empty() {
+        return Err(anyhow!("cannot send an empty alert batch"));
+    }
+    if payloads.len() > MAX_BATCH_SIZE {
+        return Err(anyhow!(
+            "alert batch of {} exceeds the maximum of {}",
+            payloads.len(),
+            MAX_BATCH_SIZE
+        ));
+    }
+    let span = span!(Level::INFO, "send_webhook_batch", contract = %payloads[0].label, alerts = payloads.len());
+    let _enter = span.enter();
+
+    let body = serde_json::to_string(&AlertBatch { alerts: payloads })?;
+    let rule = format!("batch of {}", payloads.len());
+    let txs = payloads
+        .iter()
+        .map(|p| p.transaction_hash.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    deliver(client, url, body, secret, shutdown, &rule, &txs).await
+}
+
+/// POSTs `body` with retries and exponential backoff; `rule` and `tx` only
+/// label the log lines.
+async fn deliver(
+    client: &Client,
+    url: &str,
+    body: String,
+    secret: Option<&str>,
+    mut shutdown: oneshot::Receiver<()>,
+    rule: &str,
+    tx: &str,
+) -> Result<DeliveryResult> {
+    let mut shutdown_live = true;
     let mut last_err: Option<anyhow::Error> = None;
 
     for attempt in 1..=MAX_RETRIES {
@@ -107,8 +174,8 @@ pub async fn send_webhook(
                 info!(
                     timestamp = %ts,
                     url       = %url,
-                    rule      = %payload.rule_triggered,
-                    tx        = %payload.transaction_hash,
+                    rule      = %rule,
+                    tx        = %tx,
                     attempts  = attempt,
                     "webhook delivered"
                 );
@@ -161,8 +228,8 @@ pub async fn send_webhook(
     let err = last_err.unwrap_or_else(|| anyhow!("webhook failed after {} retries", MAX_RETRIES));
     error!(
         url  = %url,
-        rule = %payload.rule_triggered,
-        tx   = %payload.transaction_hash,
+        rule = %rule,
+        tx   = %tx,
         "webhook delivery failed permanently: {}",
         err
     );
@@ -544,5 +611,59 @@ mod tests {
         let url = format!("{}/hook", server.uri());
         let result = send_webhook(&client, &url, &sample_payload(), None, dummy_shutdown()).await;
         assert!(result.is_ok());
+    }
+
+    // ── Batched delivery ─────────────────────────────────────────────────────
+
+    fn payload_for(tx: &str) -> AlertPayload {
+        let mut p = sample_payload();
+        p.transaction_hash = tx.into();
+        p
+    }
+
+    #[tokio::test]
+    async fn batch_posts_alerts_array_once_with_signature_over_the_batch() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let payloads = vec![payload_for("tx1"), payload_for("tx2")];
+        let client = build_client().unwrap();
+        let url = format!("{}/hook", server.uri());
+        let delivery = send_webhook_batch(&client, &url, &payloads, Some("s3"), dummy_shutdown())
+            .await
+            .unwrap();
+        assert_eq!(delivery.attempts, 1);
+
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let alerts = body["alerts"].as_array().expect("alerts array");
+        assert_eq!(alerts.len(), 2);
+        assert_eq!(alerts[0]["transaction_hash"], "tx1");
+        assert_eq!(alerts[1]["transaction_hash"], "tx2");
+        assert_eq!(body.as_object().unwrap().len(), 1, "only the alerts key");
+
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"s3").unwrap();
+        mac.update(&requests[0].body);
+        let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        assert_eq!(requests[0].headers.get("x-txwatch-signature").unwrap(), &expected);
+    }
+
+    #[tokio::test]
+    async fn batch_rejects_empty_and_oversized_batches() {
+        let client = build_client().unwrap();
+        let url = "http://127.0.0.1:9/hook";
+        assert!(send_webhook_batch(&client, url, &[], None, dummy_shutdown())
+            .await
+            .is_err());
+        let too_many: Vec<_> = (0..=MAX_BATCH_SIZE).map(|i| payload_for(&i.to_string())).collect();
+        let err = send_webhook_batch(&client, url, &too_many, None, dummy_shutdown())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("exceeds the maximum of 50"), "got: {}", err);
     }
 }

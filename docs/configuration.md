@@ -56,6 +56,7 @@ Each entry defines one watched Soroban contract. At least one entry is required.
 | `webhook_url`    | string          | yes      | `http://` or `https://` URL with a host that receives the alert JSON. |
 | `poll_interval_seconds` | u64      | no       | Polls this contract at its own interval instead of the top-level `poll_interval_seconds`. Same bounds (5–3600). Contracts are scheduled independently; `txwatch validate` prints each contract's effective interval. |
 | `webhook_secret` | string          | no       | When set, every webhook POST carries `X-TxWatch-Signature: sha256=<hex HMAC-SHA256 of the body>` **and** the raw secret in `X-TxWatch-Secret`. Supports `${ENV_VAR}` interpolation (e.g. `webhook_secret = "${MY_SECRET}"`); an unset variable is a startup error. |
+| `batch_alerts`   | bool            | no       | Default `false`. When `true`, all alerts from one poll cycle are sent as a single `{"alerts": [...]}` POST (at most 50 per request, larger bursts are split). Useful for digest receivers and rate-limited targets such as Slack. See [Batched payload](#batched-payload). |
 
 Unknown keys inside a `[[contracts]]` entry are rejected.
 
@@ -189,6 +190,28 @@ This example and the one in the README are checked against `AlertPayload` by
   `rule_type = "TestWebhook"`, the label exactly as given, and the synthetic but valid contract ID
   `CATXWATCHTESTCONTRACTAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA5UI`. Real alerts omit the field. The
   webhook URL is never included in a payload, since URLs often embed tokens.
+
+### Batched payload
+
+With `batch_alerts = true`, the alerts a contract fires during one poll cycle are
+delivered together instead of one POST per alert. The body wraps the usual payloads
+in an `alerts` array:
+
+```json
+{
+  "alerts": [
+    { "label": "My Escrow Contract", "rule_type": "LargeTransfer", "transaction_hash": "abc123...", "...": "..." },
+    { "label": "My Escrow Contract", "rule_type": "FunctionCalled", "transaction_hash": "def456...", "...": "..." }
+  ]
+}
+```
+
+- Each element has exactly the single-alert shape above.
+- A batch holds at most 50 alerts; a larger burst is split into several POSTs
+  (e.g. 120 alerts → 50, 50, 20). Cycles without alerts send nothing.
+- Retries, `X-TxWatch-Version`, and the `X-TxWatch-Secret` / `X-TxWatch-Signature`
+  headers work as for single alerts; the signature covers the whole batch body.
+- A batch that still fails after all retries counts as one failed webhook delivery.
 
 ## Environment variables
 

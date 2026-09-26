@@ -11,6 +11,7 @@ pub fn contract(webhook_url: &str, rules: Vec<AlertRule>) -> WatchedContract {
         webhook_secret: None,
         poll_interval_seconds: None,
         horizon_base_url_override: None,
+        batch_alerts: false,
     }
 }
 

@@ -24,6 +24,7 @@
         ] }, "webhook_url": { "type": "string", "format": "uri" },
         "webhook_secret": { "type": ["string", "null"] },
         "poll_interval_seconds": { "type": ["integer", "null"], "minimum": 5, "maximum": 3600 },
+        "batch_alerts": { "type": "boolean", "default": false, "description": "Deliver each poll cycle's alerts as one {\"alerts\": [...]} POST (split into batches of at most 50)." },
         "rules": { "type": "array", "items": { "$ref": "#/definitions/AlertRule" }, "minItems": 1 }
       }
     },

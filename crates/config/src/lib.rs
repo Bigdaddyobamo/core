@@ -349,6 +349,11 @@ pub struct WatchedContract {
     /// `poll_interval_seconds`. Same bounds (5–3600).
     #[serde(default)]
     pub poll_interval_seconds: Option<u64>,
+    /// Deliver all alerts from one poll cycle as a single `{"alerts": [...]}`
+    /// POST (split into batches of at most 50) instead of one POST per alert.
+    /// Default: false.
+    #[serde(default)]
+    pub batch_alerts: bool,
     /// Override the Horizon base URL; never read from TOML — set programmatically in tests.
     #[serde(skip, default)]
     #[schemars(skip)]
@@ -808,6 +813,7 @@ mod tests {
             webhook_secret: None,
             poll_interval_seconds: None,
             horizon_base_url_override: None,
+            batch_alerts: false,
         }
     }
 
@@ -1627,5 +1633,17 @@ mod tests {
             validate_contract_id(&mistyped),
             Err(ContractIdError::Checksum { .. })
         ));
+    }
+
+    #[test]
+    fn batch_alerts_defaults_to_false_and_parses() {
+        let cfg: AppConfig = toml::from_str(MINIMAL_TOML).unwrap();
+        assert!(!cfg.contracts[0].batch_alerts);
+        let raw = MINIMAL_TOML.replace(
+            "network = \"testnet\"",
+            "network = \"testnet\"\n        batch_alerts = true",
+        );
+        let cfg: AppConfig = toml::from_str(&raw).unwrap();
+        assert!(cfg.contracts[0].batch_alerts);
     }
 }
