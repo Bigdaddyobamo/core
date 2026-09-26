@@ -69,8 +69,8 @@ async fn run_polls_once_and_fires_webhook() {
         poll_interval_seconds: 1,
         contracts: vec![contract],
         cursor_file: None,
-        http_pool_max_idle_per_host: None,
-        http_tcp_keepalive_secs: None,
+        http_pool_max_idle_per_host: 10,
+        http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
     };
 
@@ -131,8 +131,8 @@ async fn poll_includes_fee_charged_and_fires_high_fee_rule() {
         poll_interval_seconds: 1,
         contracts: vec![contract],
         cursor_file: None,
-        http_pool_max_idle_per_host: None,
-        http_tcp_keepalive_secs: None,
+        http_pool_max_idle_per_host: 10,
+        http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
     };
 
@@ -175,8 +175,8 @@ async fn cursor_file_is_loaded_and_used_for_initial_cursor() {
         poll_interval_seconds: 1,
         contracts: vec![contract],
         cursor_file: Some(tmp.to_string_lossy().to_string()),
-        http_pool_max_idle_per_host: None,
-        http_tcp_keepalive_secs: None,
+        http_pool_max_idle_per_host: 10,
+        http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
     };
 
@@ -631,8 +631,8 @@ async fn run_polls_once_and_skips_webhook_in_dry_run() {
         poll_interval_seconds: 1,
         contracts: vec![contract],
         cursor_file: None,
-        http_pool_max_idle_per_host: None,
-        http_tcp_keepalive_secs: None,
+        http_pool_max_idle_per_host: 10,
+        http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
     };
 
@@ -694,8 +694,8 @@ async fn large_transfer_poll_fires_webhook_and_advances_cursor() {
         poll_interval_seconds: 1,
         contracts: vec![contract],
         cursor_file: None,
-        http_pool_max_idle_per_host: None,
-        http_tcp_keepalive_secs: None,
+        http_pool_max_idle_per_host: 10,
+        http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
     };
 
@@ -770,8 +770,8 @@ async fn horizon_link_uses_canonical_url_not_mock_server() {
         poll_interval_seconds: 1,
         contracts: vec![contract],
         cursor_file: None,
-        http_pool_max_idle_per_host: None,
-        http_tcp_keepalive_secs: None,
+        http_pool_max_idle_per_host: 10,
+        http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
     };
 
@@ -866,8 +866,8 @@ async fn contracts_polled_concurrently() {
             make_contract("A", &horizon1.uri()),
             make_contract("B", &horizon2.uri()),
         ],
-        http_pool_max_idle_per_host: None,
-        http_tcp_keepalive_secs: None,
+        http_pool_max_idle_per_host: 10,
+        http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
         cursor_file: None,
     };
@@ -883,5 +883,62 @@ async fn contracts_polled_concurrently() {
         "contracts should be polled concurrently; elapsed {:?} ≥ {:.0}ms",
         elapsed,
         DELAY_MS as f64 * 1.8 + 300.0,
+    );
+}
+
+/// A per-contract `poll_interval_seconds` override is scheduled independently:
+/// the fast contract is polled several times while the slow one (global
+/// interval) is polled only once. Closes #97.
+#[tokio::test]
+async fn per_contract_poll_interval_is_scheduled_independently() {
+    let fast_horizon = MockServer::start().await;
+    let slow_horizon = MockServer::start().await;
+
+    for horizon in [&fast_horizon, &slow_horizon] {
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+            .mount(horizon)
+            .await;
+    }
+
+    let mut fast = helpers::contract(
+        "https://hooks.example.com/fast",
+        vec![AlertRule::AnyTransaction],
+    );
+    fast.label = "fast".into();
+    fast.poll_interval_seconds = Some(1);
+    fast.horizon_base_url_override = Some(fast_horizon.uri());
+
+    let mut slow = helpers::contract(
+        "https://hooks.example.com/slow",
+        vec![AlertRule::AnyTransaction],
+    );
+    slow.label = "slow".into();
+    slow.contract_id = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into();
+    slow.horizon_base_url_override = Some(slow_horizon.uri());
+
+    let cfg = AppConfig {
+        poll_interval_seconds: 3600,
+        contracts: vec![fast, slow],
+        cursor_file: None,
+        http_pool_max_idle_per_host: 10,
+        http_tcp_keepalive_secs: 30,
+        http_connection_verbose: None,
+    };
+
+    let _ = tokio::time::timeout(Duration::from_millis(2500), txwatch_poller::run(cfg)).await;
+
+    let fast_polls = fast_horizon.received_requests().await.unwrap().len();
+    let slow_polls = slow_horizon.received_requests().await.unwrap().len();
+    assert!(
+        fast_polls >= 2,
+        "fast contract should be polled repeatedly, got {}",
+        fast_polls
+    );
+    assert_eq!(
+        slow_polls, 1,
+        "slow contract should be polled once, got {}",
+        slow_polls
     );
 }
