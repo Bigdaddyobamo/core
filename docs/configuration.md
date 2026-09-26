@@ -1,6 +1,14 @@
 # Configuration Reference
 
-Config is a TOML file passed via `--config` (default: `config/example.toml`).
+Config is a TOML file passed via `--config`, or the `TXWATCH_CONFIG` environment variable, defaulting to
+`./txwatch.toml`. TxWatch exits with an error if the file does not exist.
+
+`txwatch validate` (and startup) reports every validation error at once, one per line, rather than stopping
+at the first.
+
+While `txwatch watch` is running, `SIGHUP` re-reads and validates the file. A valid config is applied in place:
+contracts that remain keep their cursors, and new contracts start from their `cursor_file` entry or `now`. An
+invalid config is logged and the previous one keeps running. HTTP pool settings only change on restart.
 
 ## Editor validation
 
@@ -42,7 +50,7 @@ Each entry defines one watched Soroban contract. At least one entry is required.
 |------------------|-----------------|----------|-------------|
 | `label`          | string          | yes      | Human-readable name shown in logs and alert payloads. Must not be blank; must be unique across contracts. |
 | `contract_id`    | string          | yes      | Stellar C-address (56 chars, starts with `C`). |
-| `network`        | string          | yes      | `mainnet`, `testnet`, or `futurenet`. |
+| `network`        | string or table | yes      | `mainnet`, `testnet`, `futurenet`, or a custom network table (see below). |
 | `rules`          | array of tables | yes      | The `[[contracts.rules]]` entries (see below). At least one is required. |
 | `webhook_url`    | string          | yes      | `http://` or `https://` URL with a host that receives the alert JSON. |
 | `webhook_secret` | string          | no       | When set, every webhook POST carries `X-TxWatch-Signature: sha256=<hex HMAC-SHA256 of the body>` **and** the raw secret in `X-TxWatch-Secret`. Supports `${ENV_VAR}` interpolation (e.g. `webhook_secret = "${MY_SECRET}"`); an unset variable is a startup error. |
@@ -66,6 +74,23 @@ Error: unknown variant `main`, expected one of `mainnet`, `testnet`, `futurenet`
 ```
 
 To fix: replace your `network` value with one of the valid values listed above.
+
+### Custom / local networks
+
+For `stellar/quickstart --local` or a private network, give `network` an inline table instead of a name:
+
+```toml
+network = { horizon_url = "http://localhost:8000", passphrase = "Standalone Network ; February 2017" }
+```
+
+| Field          | Required | Description |
+|----------------|----------|-------------|
+| `horizon_url`  | yes      | `http://` or `https://` Horizon base URL. |
+| `explorer_url` | no       | Explorer base URL; alert `explorer_link` becomes `<explorer_url>/tx/<hash>`. Without it, `explorer_link` is the transaction's Horizon URL. |
+| `passphrase`   | no       | Network passphrase, for reference. |
+
+Alert payloads and logs report such contracts with `network = "custom"`. See `docker-compose.local.yml` and
+`config/local.toml` for a ready-made quickstart + TxWatch setup.
 
 ## `[[contracts.rules]]`
 

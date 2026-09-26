@@ -175,3 +175,40 @@ fn validate_exits_one_for_invalid_config() {
         "expected exit code 1 for invalid config"
     );
 }
+
+#[test]
+fn validate_prints_every_error_and_exits_one() {
+    const MULTI_ERROR_CONFIG: &str = r#"
+poll_interval_seconds = 1
+
+[[contracts]]
+label       = "Alpha"
+contract_id = "CSHORT"
+network     = "testnet"
+webhook_url = "ftp://hooks.example.com/alpha"
+
+  [[contracts.rules]]
+  type          = "LargeTransfer"
+  threshold_xlm = 0
+"#;
+
+    let path = env::temp_dir().join("txwatch_validate_multi_error_test.toml");
+    fs::write(&path, MULTI_ERROR_CONFIG).unwrap();
+
+    let output = txwatch_bin()
+        .args(["--config", path.to_str().unwrap(), "validate"])
+        .output()
+        .expect("failed to run txwatch");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for expected in [
+        "4 configuration errors:",
+        "  - poll_interval_seconds must be >= 5",
+        "  - contract 'Alpha': contract_id 'CSHORT' is not a valid Stellar contract address",
+        "  - contract 'Alpha': webhook_url 'ftp://hooks.example.com/alpha' must use http or https scheme",
+        "  - contract 'Alpha': LargeTransfer threshold_xlm must be > 0",
+    ] {
+        assert!(stderr.contains(expected), "missing {:?} in:\n{}", expected, stderr);
+    }
+}

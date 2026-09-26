@@ -5,10 +5,11 @@ services:
     build: .
     container_name: txwatch-dev
     volumes:
-      - ./config/example.toml:/config.toml
+      - ./config/example.toml:/config/txwatch.toml:ro
     environment:
       RUST_LOG: debug
-    command: --config /config.toml watch
+      TXWATCH_CONFIG: /config/txwatch.toml
+    command: watch
     depends_on:
       - webhook
     networks:

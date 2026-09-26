@@ -885,3 +885,96 @@ async fn contracts_polled_concurrently() {
         DELAY_MS as f64 * 1.8 + 300.0,
     );
 }
+
+/// Reloading the config keeps the cursor of a contract that still exists and
+/// starts a newly added contract from `now`. Closes #98.
+#[tokio::test]
+async fn reload_keeps_existing_cursors_and_starts_new_contracts() {
+    let horizon_a = MockServer::start().await;
+    let horizon_b = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::tx_page("tx_a", "5", true)))
+        .up_to_n_times(1)
+        .mount(&horizon_a)
+        .await;
+    for horizon in [&horizon_a, &horizon_b] {
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+            .mount(horizon)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("/transactions/.*/operations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+            .mount(horizon)
+            .await;
+    }
+
+    let mut a = helpers::contract(
+        "https://hooks.example.com/a",
+        vec![AlertRule::AnyTransaction],
+    );
+    a.label = "A".into();
+    a.horizon_base_url_override = Some(horizon_a.uri());
+    let mut b = helpers::contract(
+        "https://hooks.example.com/b",
+        vec![AlertRule::AnyTransaction],
+    );
+    b.label = "B".into();
+    b.contract_id = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into();
+    b.horizon_base_url_override = Some(horizon_b.uri());
+
+    let config = |contracts| AppConfig {
+        // Long interval: the only second poll comes from the reload.
+        poll_interval_seconds: 3600,
+        contracts,
+        cursor_file: None,
+        http_pool_max_idle_per_host: None,
+        http_tcp_keepalive_secs: None,
+        http_connection_verbose: None,
+    };
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (reload_tx, reload_rx) = tokio::sync::mpsc::channel(1);
+    let run = tokio::spawn(txwatch_poller::run_with_reload(
+        config(vec![a.clone()]),
+        true,
+        shutdown_rx,
+        reload_rx,
+    ));
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    reload_tx.send(config(vec![a, b])).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("poller should stop after shutdown")
+        .unwrap()
+        .unwrap();
+
+    let cursors = |requests: Vec<wiremock::Request>| -> Vec<String> {
+        requests
+            .iter()
+            .filter(|r| r.url.path().ends_with("/transactions"))
+            .filter_map(|r| {
+                r.url
+                    .query_pairs()
+                    .find(|(k, _)| k == "cursor")
+                    .map(|(_, v)| v.into_owned())
+            })
+            .collect()
+    };
+    assert_eq!(
+        cursors(horizon_a.received_requests().await.unwrap()),
+        vec!["now", "5"],
+        "A must keep its advanced cursor across the reload"
+    );
+    assert_eq!(
+        cursors(horizon_b.received_requests().await.unwrap()),
+        vec!["now"],
+        "B is new and must start from 'now'"
+    );
+}

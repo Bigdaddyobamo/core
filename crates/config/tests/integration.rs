@@ -31,6 +31,19 @@ fn example_toml_parses_and_validates_successfully() {
 }
 
 #[test]
+fn local_toml_parses_and_validates_successfully() {
+    let path = project_root().join("config").join("local.toml");
+    let cfg =
+        AppConfig::from_file(&path).expect("local.toml should parse and validate successfully");
+
+    assert_eq!(cfg.contracts[0].network.as_str(), "custom");
+    assert_eq!(
+        cfg.contracts[0].network.horizon_base_url(),
+        "http://stellar:8000"
+    );
+}
+
+#[test]
 fn broken_toml_fixture_fails_with_meaningful_error() {
     let path = crate_fixture_path("broken-example.toml");
     let err = AppConfig::from_file(&path).expect_err("broken TOML fixture should fail");

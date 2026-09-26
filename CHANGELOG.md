@@ -21,12 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `txwatch schema` command and a committed JSON Schema for editor validation
 - `txwatch validate --check-webhooks` and `--check-horizon` pre-flight checks
 - Horizon operations fetched inline with `join=operations`
+- Custom / local networks: `network = { horizon_url = "…", explorer_url = "…", passphrase = "…" }`, reported as `network = "custom"`; `docker-compose.local.yml` runs `stellar/quickstart --local` with TxWatch
+- `TXWATCH_CONFIG` environment variable for the config path
+- `SIGHUP` reloads the config without restarting; cursors of remaining contracts are kept and an invalid file is ignored
 
 ### Changed
 
 - `poll_interval_seconds` is bounded to 5–3600 seconds
 - `txwatch test-webhook` exits with code 1 when delivery fails
 - Config parse errors name the offending field path
+- Config validation reports every error at once instead of stopping at the first
+- `--config` defaults to `./txwatch.toml` instead of `config/example.toml`, and a missing config file is an error
 
 ## [0.1.0] - 2025-01-01
 
