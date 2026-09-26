@@ -589,8 +589,14 @@ impl AppConfig {
     pub fn from_file(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("cannot read config file '{}'", path.display()))?;
-        let mut cfg: AppConfig = deserialize_toml_with_field_context(&raw, path)
-            .with_context(|| format!("failed to parse config file '{}'", path.display()))?;
+        Self::parse(&raw, path)
+    }
+
+    /// Parse and validate TOML exactly as [`AppConfig::from_file`] does;
+    /// `source` only labels error messages.
+    pub fn parse(raw: &str, source: &Path) -> Result<Self> {
+        let mut cfg: AppConfig = deserialize_toml_with_field_context(raw, source)
+            .with_context(|| format!("failed to parse config file '{}'", source.display()))?;
         cfg.resolve_env_vars()?;
         cfg.validate()?;
         Ok(cfg)

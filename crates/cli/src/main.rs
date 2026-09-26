@@ -1,3 +1,7 @@
+use std::{fs, path::PathBuf, time::Duration};
+
+use anyhow::{Context, Result};
+use clap::{CommandFactory, Parser, Subcommand};
 use std::{
     path::{Path, PathBuf},
     time::Duration,
@@ -68,6 +72,10 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
 
+        /// Serve Prometheus /metrics (plus /healthz and /readyz) on this address, e.g. 127.0.0.1:9090
+        #[cfg(feature = "metrics")]
+        #[arg(long)]
+        metrics_addr: Option<std::net::SocketAddr>,
         /// Run a single poll cycle, deliver alerts, save cursors and exit
         #[arg(long)]
         once: bool,
@@ -116,6 +124,39 @@ enum Command {
     /// Print the JSON Schema for the TOML configuration file.
     Schema,
 
+    /// Print a shell completion script, e.g. `txwatch completions bash > /etc/bash_completion.d/txwatch`
+    Completions {
+        /// Shell to generate completions for
+        shell: clap_complete::Shell,
+    },
+
+    /// Print the txwatch(1) man page in roff format, e.g. `txwatch man > txwatch.1`
+    Man,
+
+    /// Write a starter config file for one contract
+    ///
+    /// Missing values are prompted for on stdin. The result is validated before
+    /// it is written, and an existing file is never overwritten without --force.
+    Init {
+        /// Soroban contract address to watch (56 characters, starts with 'C')
+        #[arg(long)]
+        contract_id: Option<String>,
+
+        /// Stellar network: mainnet, testnet or futurenet
+        #[arg(long)]
+        network: Option<String>,
+
+        /// URL that receives webhook alerts
+        #[arg(long)]
+        webhook_url: Option<String>,
+
+        /// Where to write the config
+        #[arg(long, default_value = "txwatch.toml")]
+        output: PathBuf,
+
+        /// Overwrite the output file if it already exists
+        #[arg(long)]
+        force: bool,
     /// Evaluate a contract's rules against one historical transaction
     ///
     /// Prints the rules that matched and their webhook payloads. Nothing is sent
@@ -255,6 +296,36 @@ async fn main() -> Result<()> {
             println!("Test webhook delivered successfully to {} (status {}, attempts {})", url, result.final_status, result.attempts);
         }
 
+        Command::Init { ref contract_id, ref network, ref webhook_url, ref output, force } => {
+            if output.exists() && !force {
+                return Err(anyhow::anyhow!(
+                    "'{}' already exists; pass --force to overwrite it",
+                    output.display()
+                ));
+            }
+            let contract_id = value_or_prompt(contract_id, "Contract ID (C...)")?;
+            let network = match network {
+                Some(n) => n.clone(),
+                None => prompt("Network [testnet]")?.filter(|n| !n.is_empty()).unwrap_or_else(|| "testnet".into()),
+            };
+            let webhook_url = value_or_prompt(webhook_url, "Webhook URL")?;
+
+            let raw = render_init_config(&contract_id, &network, &webhook_url)?;
+            // Validate with the config crate before touching the filesystem.
+            AppConfig::parse(&raw, output).context("the generated config is not valid")?;
+            fs::write(output, raw).with_context(|| format!("failed to write '{}'", output.display()))?;
+            println!("Wrote {}. Check it with: txwatch --config {} validate", output.display(), output.display());
+        }
+
+        Command::Completions { shell } => {
+            clap_complete::generate(shell, &mut Cli::command(), "txwatch", &mut std::io::stdout());
+        }
+
+        Command::Man => {
+            match clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout()) {
+                // The reader (e.g. `| head`) closing early isn't an error.
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+                other => other.context("failed to render the man page")?,
         Command::Replay { ref contract, ref tx, send } => {
             let cfg = load_config(&cli)?;
             let contract = cfg
@@ -284,6 +355,12 @@ async fn main() -> Result<()> {
 
         Command::Schema => println!("{}", serde_json::to_string_pretty(&schemars::schema_for!(txwatch_config::AppConfig))?),
 
+        Command::Watch {
+            dry_run,
+            #[cfg(feature = "metrics")]
+            metrics_addr,
+        } => {
+            let cfg = AppConfig::from_file(&required_config(&cli)?)?;
         Command::Watch { dry_run, once } => {
             let cfg = load_config(&cli)?;
 
@@ -320,6 +397,10 @@ async fn main() -> Result<()> {
                 let _ = shutdown_tx.send(true);
             });
 
+            #[cfg(feature = "metrics")]
+            if let Some(addr) = metrics_addr {
+                txwatch_poller::serve_metrics(addr, shutdown_rx.clone()).await?;
+            }
             let (reload_tx, reload_rx) = tokio::sync::mpsc::channel(1);
             spawn_reload_on_sighup(config_path, reload_tx)?;
 
@@ -336,6 +417,51 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
+/// Read one trimmed line from stdin after printing `label`; `None` on EOF.
+fn prompt(label: &str) -> Result<Option<String>> {
+    use std::io::{BufRead, Write};
+    eprint!("{label}: ");
+    std::io::stderr().flush().ok();
+    let mut line = String::new();
+    let read = std::io::stdin().lock().read_line(&mut line).context("failed to read from stdin")?;
+    Ok((read > 0).then(|| line.trim().to_owned()))
+}
+
+fn value_or_prompt(value: &Option<String>, label: &str) -> Result<String> {
+    match value {
+        Some(v) => Ok(v.clone()),
+        None => prompt(label)?
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("{label} is required")),
+    }
+}
+
+/// Starter config for `txwatch init`: one contract and an AnyTransaction rule.
+fn render_init_config(contract_id: &str, network: &str, webhook_url: &str) -> Result<String> {
+    // TOML basic strings share JSON's escaping, so serde_json quotes values safely.
+    let quote = |s: &str| serde_json::to_string(s);
+    Ok(format!(
+        r#"# Generated by `txwatch init`. See docs/configuration.md for every option.
+poll_interval_seconds = 10
+
+[[contracts]]
+label       = "My Contract"
+contract_id = {contract_id}
+network     = {network}
+webhook_url = {webhook_url}
+# webhook_secret = "${{TXWATCH_WEBHOOK_SECRET}}"   # optional: signs each webhook
+
+  [[contracts.rules]]
+  type = "AnyTransaction"
+"#,
+        contract_id = quote(contract_id)?,
+        network = quote(network)?,
+        webhook_url = quote(webhook_url)?,
+    ))
+}
+
+fn required_config(cli: &Cli) -> Result<PathBuf> {
+    Ok(cli.config.clone().unwrap_or_else(|| PathBuf::from("config/example.toml")))
 /// The config path from `--config`, `TXWATCH_CONFIG` or the `./txwatch.toml`
 /// default, which must exist.
 fn required_config(path: &Path) -> Result<PathBuf> {

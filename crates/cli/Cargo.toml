@@ -15,6 +15,10 @@ categories.workspace = true
 name = "txwatch"
 path = "src/main.rs"
 
+[features]
+# Expose Prometheus metrics plus /healthz and /readyz via `watch --metrics-addr`.
+metrics = ["txwatch-poller/metrics"]
+
 [dependencies]
 txwatch-config   = { path = "../config", version = "0.1.0" }
 txwatch-poller   = { path = "../poller", version = "0.1.0" }
@@ -28,6 +32,8 @@ tracing-subscriber = { workspace = true, features = ["json"] }
 futures = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }
+clap_complete = "4"
+clap_mangen = "0.2"
 
 [dev-dependencies]
 wiremock = { workspace = true }
