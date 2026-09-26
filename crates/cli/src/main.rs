@@ -42,6 +42,11 @@ enum Command {
         /// Do not actually send webhooks; only log matched rules
         #[arg(long)]
         dry_run: bool,
+
+        /// Serve Prometheus /metrics (plus /healthz and /readyz) on this address, e.g. 127.0.0.1:9090
+        #[cfg(feature = "metrics")]
+        #[arg(long)]
+        metrics_addr: Option<std::net::SocketAddr>,
     },
 
     /// Parse and validate the config file, then print a summary
@@ -193,7 +198,11 @@ async fn main() -> Result<()> {
 
         Command::Schema => println!("{}", serde_json::to_string_pretty(&schemars::schema_for!(txwatch_config::AppConfig))?),
 
-        Command::Watch { dry_run } => {
+        Command::Watch {
+            dry_run,
+            #[cfg(feature = "metrics")]
+            metrics_addr,
+        } => {
             let cfg = AppConfig::from_file(&required_config(&cli)?)?;
 
             // Graceful shutdown: allow the current poll cycle to finish before exiting.
@@ -205,6 +214,11 @@ async fn main() -> Result<()> {
                 }
                 let _ = shutdown_tx.send(true);
             });
+
+            #[cfg(feature = "metrics")]
+            if let Some(addr) = metrics_addr {
+                txwatch_poller::serve_metrics(addr, shutdown_rx.clone()).await?;
+            }
 
             info!(
                 version = VERSION,

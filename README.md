@@ -252,23 +252,25 @@ Set `RUST_LOG=info` or a more specific filter to view structured tracing output 
 
 ### Prometheus metrics (optional)
 
-Build with the `metrics` feature to expose Prometheus counters and an HTTP `/metrics` endpoint:
+Build the `txwatch` binary with the `metrics` feature and pass `--metrics-addr` to `watch`:
 
 ```bash
-cargo build -p txwatch-poller --features metrics
+cargo build --release -p txwatch --features metrics
+./target/release/txwatch --config config.toml watch --metrics-addr 127.0.0.1:9090
 ```
 
-Three counters are registered:
+This serves `GET /metrics` (Prometheus text format), `GET /healthz` (process alive) and
+`GET /readyz` (200 once a poll has succeeded recently, else 503). Exported series include
+`txwatch_transactions_total`, `txwatch_alerts_total` and `txwatch_webhook_failures_total`
+(labelled by `contract` and `network`), Horizon request and webhook delivery latency histograms,
+per-contract freshness gauges and `txwatch_build_info`. Without the feature (the default build),
+the `--metrics-addr` flag doesn't exist.
 
-| Counter | Description |
-|---|---|
-| `txwatch_transactions_total` | Total Stellar transactions processed across all watched contracts |
-| `txwatch_alerts_total` | Total alert payloads sent (rules matched) |
-| `txwatch_webhook_failures_total` | Total permanent webhook delivery failures (after all retries) |
+Library users can call `txwatch_poller::serve_metrics(addr, shutdown)` themselves before
+`run_with_shutdown`, with `txwatch-poller`'s `metrics` feature enabled.
 
-To start the `/metrics` endpoint, call `txwatch_poller::serve_metrics(addr)` before `run_with`.
-The endpoint serves the standard Prometheus text exposition format and can be scraped by any
-Prometheus-compatible monitoring stack (Prometheus, Grafana Agent, VictoriaMetrics, etc.).
+The endpoint can be scraped by any Prometheus-compatible monitoring stack (Prometheus, Grafana
+Agent, VictoriaMetrics, etc.).
 
 Example scrape config:
 
