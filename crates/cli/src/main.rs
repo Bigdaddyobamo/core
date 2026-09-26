@@ -1,7 +1,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use futures::future::join_all;
 use reqwest::{Client, StatusCode};
 use tokio::sync::watch;
@@ -31,8 +31,18 @@ struct Cli {
     #[arg(short, long, default_value = "config/example.toml")]
     config: Option<PathBuf>,
 
+    /// Log output format: human-readable text or one JSON object per line
+    #[arg(long, global = true, value_enum, env = "TXWATCH_LOG_FORMAT", default_value = "text")]
+    log_format: LogFormat,
+
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum LogFormat {
+    Text,
+    Json,
 }
 
 #[derive(Subcommand)]
@@ -87,9 +97,8 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_tracing();
-
     let cli = Cli::parse();
+    init_tracing(cli.log_format);
 
     match cli.command {
         Command::Validate { check_webhooks, check_horizon } => {
@@ -274,12 +283,21 @@ async fn check_horizon_contract(client: &Client, contract: &txwatch_config::Watc
 }
 // ── Tracing initialisation ────────────────────────────────────────────────────
 
-fn init_tracing() {
+fn init_tracing(format: LogFormat) {
     use tracing_subscriber::{fmt, EnvFilter};
-    fmt()
+    let builder = fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
-        .with_target(false)
-        .init();
+        .with_target(false);
+    match format {
+        LogFormat::Text => builder.init(),
+        // One JSON object per line, with the current span and the full span
+        // list so fields such as `contract` and `tx` stay structured.
+        LogFormat::Json => builder
+            .json()
+            .with_current_span(true)
+            .with_span_list(true)
+            .init(),
+    }
 }

@@ -250,6 +250,16 @@ TxWatch uses `tracing` spans to correlate work across each poll cycle and webhoo
 
 Set `RUST_LOG=info` or a more specific filter to view structured tracing output in the CLI.
 
+Logs are human-readable text by default. For log pipelines (Loki, Datadog, CloudWatch), pass
+`--log-format json` or set `TXWATCH_LOG_FORMAT=json` to emit one JSON object per line. Event
+fields (`contract`, `tx`, `rule`, `attempt`, ...) stay as JSON fields, and each line includes the
+current span and the full span list:
+
+```sh
+txwatch --log-format json watch
+TXWATCH_LOG_FORMAT=json txwatch watch
+```
+
 ### Prometheus metrics (optional)
 
 Build with the `metrics` feature to expose Prometheus counters and an HTTP `/metrics` endpoint:
