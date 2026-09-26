@@ -127,7 +127,13 @@ Commands:
   watch                        Start the polling engine
   validate                     Validate the config file and print a summary
   test-webhook --url <URL>     Send a test payload to a webhook URL and exit
+  init                         Write a starter config (prompts for anything not passed)
 ```
+
+Start a new config with `txwatch init --contract-id C... --network testnet --webhook-url https://...`
+(add `--output <path>`, default `txwatch.toml`). Any value not passed as a flag is prompted for.
+The generated file is validated before it's written, and an existing file is only replaced with
+`--force`.
 
 `--config` defaults to `config/example.toml`.
 
