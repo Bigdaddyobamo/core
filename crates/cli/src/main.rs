@@ -35,6 +35,10 @@ struct Cli {
     #[arg(long, global = true, value_enum, env = "TXWATCH_LOG_FORMAT", default_value = "text")]
     log_format: LogFormat,
 
+    /// Override the Horizon base URL for every contract (e.g. a private Horizon instance)
+    #[arg(long, global = true)]
+    horizon_url: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -54,10 +58,16 @@ enum OutputFormat {
 #[derive(Subcommand)]
 enum Command {
     /// Start the polling engine (watches all contracts in the config)
+    ///
+    /// With --once, exit codes: 0 = every poll and webhook delivery succeeded, 1 = otherwise
     Watch {
         /// Do not actually send webhooks; only log matched rules
         #[arg(long)]
         dry_run: bool,
+
+        /// Run a single poll cycle, deliver alerts, save cursors and exit
+        #[arg(long)]
+        once: bool,
     },
 
     /// Parse and validate the config file, then print a summary
@@ -224,8 +234,28 @@ async fn main() -> Result<()> {
 
         Command::Schema => println!("{}", serde_json::to_string_pretty(&schemars::schema_for!(txwatch_config::AppConfig))?),
 
-        Command::Watch { dry_run } => {
-            let cfg = AppConfig::from_file(&required_config(&cli)?)?;
+        Command::Watch { dry_run, once } => {
+            let cfg = load_config(&cli)?;
+
+            if once {
+                info!(version = VERSION, contracts = cfg.contracts.len(), dry_run, "running a single TxWatch poll cycle");
+                let report = txwatch_poller::run_once(cfg, dry_run).await?;
+                info!(
+                    transactions = report.transactions,
+                    alerts = report.alerts,
+                    poll_failures = report.poll_failures,
+                    webhook_failures = report.webhook_failures,
+                    "poll cycle finished"
+                );
+                if !report.is_success() {
+                    return Err(anyhow::anyhow!(
+                        "poll cycle had {} failed contract poll(s) and {} failed webhook delivery(ies)",
+                        report.poll_failures,
+                        report.webhook_failures
+                    ));
+                }
+                return Ok(());
+            }
 
             // Graceful shutdown: allow the current poll cycle to finish before exiting.
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -252,6 +282,18 @@ async fn main() -> Result<()> {
 }
 fn required_config(cli: &Cli) -> Result<PathBuf> {
     Ok(cli.config.clone().unwrap_or_else(|| PathBuf::from("config/example.toml")))
+}
+
+/// Load the config and apply `--horizon-url`, if given, to every contract.
+fn load_config(cli: &Cli) -> Result<AppConfig> {
+    let mut cfg = AppConfig::from_file(&required_config(cli)?)?;
+    if let Some(url) = &cli.horizon_url {
+        let url = url.trim_end_matches('/');
+        for c in &mut cfg.contracts {
+            c.horizon_base_url_override = Some(url.to_string());
+        }
+    }
+    Ok(cfg)
 }
 
 /// Machine-readable `validate` summary. Webhook secrets are never printed;

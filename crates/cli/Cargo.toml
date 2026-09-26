@@ -28,3 +28,6 @@ tracing-subscriber = { workspace = true, features = ["json"] }
 futures = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }
+
+[dev-dependencies]
+wiremock = { workspace = true }

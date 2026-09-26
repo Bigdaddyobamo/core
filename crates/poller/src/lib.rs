@@ -104,50 +104,8 @@ pub async fn run_with_shutdown(
     dry_run: bool,
     shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    // 0 disables keepalive, as documented on `AppConfig::http_tcp_keepalive_secs`.
-    let keepalive =
-        (cfg.http_tcp_keepalive_secs > 0).then(|| Duration::from_secs(cfg.http_tcp_keepalive_secs));
-
-    let client = Client::builder()
-        .timeout(Duration::from_secs(15))
-        .pool_max_idle_per_host(cfg.http_pool_max_idle_per_host)
-        .tcp_keepalive(keepalive)
-        .build()
-        .context("failed to build HTTP client")?;
-
-    let cursors: HashMap<String, String> = if let Some(path) = &cfg.cursor_file {
-        match fs::read_to_string(path) {
-            Ok(raw) => match serde_json::from_str::<HashMap<String, String>>(&raw) {
-                Ok(mut map) => {
-                    // Ensure every configured contract has a cursor entry.
-                    for c in &cfg.contracts {
-                        map.entry(c.contract_id.clone())
-                            .or_insert_with(|| "now".to_string());
-                    }
-                    map
-                }
-                Err(e) => {
-                    warn!(error = ?e, "failed to parse cursor_file; starting from 'now' for all contracts");
-                    cfg.contracts
-                        .iter()
-                        .map(|c| (c.contract_id.clone(), "now".to_string()))
-                        .collect()
-                }
-            },
-            Err(e) => {
-                debug!(error = ?e, "could not read cursor_file; starting from 'now'");
-                cfg.contracts
-                    .iter()
-                    .map(|c| (c.contract_id.clone(), "now".to_string()))
-                    .collect()
-            }
-        }
-    } else {
-        cfg.contracts
-            .iter()
-            .map(|c| (c.contract_id.clone(), "now".to_string()))
-            .collect()
-    };
+    let client = build_poll_client(&cfg)?;
+    let cursors = load_cursors(&cfg);
 
     let interval = Duration::from_secs(cfg.poll_interval_seconds);
     #[cfg(feature = "metrics")]
@@ -250,7 +208,7 @@ pub async fn run_with_shutdown(
         tasks.spawn(async move {
             loop {
                 match poll_contract(&client, &contract, &mut contract_cursors, dry_run).await {
-                    Ok((txs, alerts)) => {
+                    Ok((txs, alerts, _webhook_failures)) => {
                         counters.transactions.fetch_add(txs, Ordering::Relaxed);
                         counters.alerts.fetch_add(alerts, Ordering::Relaxed);
                         counters
@@ -268,7 +226,7 @@ pub async fn run_with_shutdown(
     loop {
         for contract in &cfg.contracts {
             match poll_contract(&client, contract, &mut cursors, dry_run).await {
-                Ok((txs, alerts)) => {
+                Ok((txs, alerts, _webhook_failures)) => {
                     counters.transactions.fetch_add(txs, Ordering::Relaxed);
                     counters.alerts.fetch_add(alerts, Ordering::Relaxed);
                     counters
@@ -328,9 +286,116 @@ pub async fn run_with_shutdown(
     Ok(())
 }
 
+/// Load the cursor map from `cfg.cursor_file`, defaulting every configured
+/// contract without a saved cursor to Horizon's `now`.
+fn load_cursors(cfg: &AppConfig) -> HashMap<String, String> {
+    if let Some(path) = &cfg.cursor_file {
+        match fs::read_to_string(path) {
+            Ok(raw) => match serde_json::from_str::<HashMap<String, String>>(&raw) {
+                Ok(mut map) => {
+                    // Ensure every configured contract has a cursor entry.
+                    for c in &cfg.contracts {
+                        map.entry(c.contract_id.clone())
+                            .or_insert_with(|| "now".to_string());
+                    }
+                    map
+                }
+                Err(e) => {
+                    warn!(error = ?e, "failed to parse cursor_file; starting from 'now' for all contracts");
+                    cfg.contracts
+                        .iter()
+                        .map(|c| (c.contract_id.clone(), "now".to_string()))
+                        .collect()
+                }
+            },
+            Err(e) => {
+                debug!(error = ?e, "could not read cursor_file; starting from 'now'");
+                cfg.contracts
+                    .iter()
+                    .map(|c| (c.contract_id.clone(), "now".to_string()))
+                    .collect()
+            }
+        }
+    } else {
+        cfg.contracts
+            .iter()
+            .map(|c| (c.contract_id.clone(), "now".to_string()))
+            .collect()
+    }
+}
+
+/// Write the cursor map to `cfg.cursor_file`, if one is configured. Writes to a
+/// temporary file first so an interrupted write never corrupts the saved map.
+fn save_cursors(cfg: &AppConfig, cursors: &HashMap<String, String>) -> Result<()> {
+    let Some(path) = &cfg.cursor_file else {
+        return Ok(());
+    };
+    let raw = serde_json::to_string_pretty(cursors).context("failed to serialize cursors")?;
+    let tmp = format!("{}.tmp", path);
+    fs::write(&tmp, raw).with_context(|| format!("failed to write cursor file '{}'", tmp))?;
+    fs::rename(&tmp, path).with_context(|| format!("failed to write cursor file '{}'", path))?;
+    Ok(())
+}
+
+fn build_poll_client(cfg: &AppConfig) -> Result<Client> {
+    // 0 disables keepalive, as documented on `AppConfig::http_tcp_keepalive_secs`.
+    let keepalive =
+        (cfg.http_tcp_keepalive_secs > 0).then(|| Duration::from_secs(cfg.http_tcp_keepalive_secs));
+
+    Client::builder()
+        .timeout(Duration::from_secs(15))
+        .pool_max_idle_per_host(cfg.http_pool_max_idle_per_host)
+        .tcp_keepalive(keepalive)
+        .build()
+        .context("failed to build HTTP client")
+}
+
+/// Outcome of a single poll cycle, used by [`run_once`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CycleReport {
+    pub transactions: u64,
+    pub alerts: u64,
+    /// Contracts whose poll returned an error.
+    pub poll_failures: u64,
+    /// Webhooks that could not be delivered after all retries.
+    pub webhook_failures: u64,
+}
+
+impl CycleReport {
+    pub fn is_success(&self) -> bool {
+        self.poll_failures == 0 && self.webhook_failures == 0
+    }
+}
+
+/// Run exactly one poll cycle over every contract, persist the cursors to
+/// `cfg.cursor_file` (if set) and return what happened. Used by
+/// `txwatch watch --once` for cron/CI/scheduler runs.
+pub async fn run_once(cfg: AppConfig, dry_run: bool) -> Result<CycleReport> {
+    let client = build_poll_client(&cfg)?;
+    let mut cursors = load_cursors(&cfg);
+    let mut report = CycleReport::default();
+
+    for contract in &cfg.contracts {
+        match poll_contract(&client, contract, &mut cursors, dry_run).await {
+            Ok((txs, alerts, webhook_failures)) => {
+                report.transactions += txs;
+                report.alerts += alerts;
+                report.webhook_failures += webhook_failures;
+            }
+            Err(e) => {
+                error!(contract = %contract.label, error = %e, "contract polling task failed");
+                report.poll_failures += 1;
+            }
+        }
+    }
+
+    save_cursors(&cfg, &cursors)?;
+    Ok(report)
+}
+
 // ── Per-contract poll ─────────────────────────────────────────────────────────
 
-/// Returns `(transactions_processed, alerts_fired)`.
+/// Returns `(transactions_processed, alerts_fired, webhook_failures)`.
 ///
 /// Uses `join=operations` on the transactions endpoint so that Horizon returns
 /// operations inline, eliminating one HTTP request per transaction (#23).
@@ -346,7 +411,7 @@ async fn poll_contract(
     contract: &WatchedContract,
     cursors: &mut HashMap<String, String>,
     dry_run: bool,
-) -> Result<(u64, u64)> {
+) -> Result<(u64, u64, u64)> {
     let cursor = cursors
         .get(&contract.contract_id)
         .cloned()
@@ -392,7 +457,7 @@ async fn poll_contract(
                 .unwrap_or(5);
             warn!(contract = %contract.label, retry_after, "Horizon returned 429 — backing off");
             tokio::time::sleep(Duration::from_secs(retry_after)).await;
-            return Ok((0, 0));
+            return Ok((0, 0, 0));
         }
 
         let page: HorizonPage = response
@@ -429,6 +494,7 @@ async fn poll_contract(
 
     let mut tx_count = 0u64;
     let mut alert_count = 0u64;
+    let mut webhook_failures = 0u64;
 
     for record in all_records {
         let paging_token = record.tx.paging_token.clone();
@@ -514,6 +580,7 @@ async fn poll_contract(
                 if let Err(e) = delivery {
                     error!(contract = %contract.label, rule = %payload.rule_triggered,
                         tx = %payload.transaction_hash, error = %e, "webhook delivery failed");
+                    webhook_failures += 1;
                     #[cfg(feature = "metrics")]
                     metrics::inc_webhook_failures(&contract.label, contract.network.as_str());
                 }
@@ -526,7 +593,7 @@ async fn poll_contract(
             "poll cycle complete");
     }
 
-    Ok((tx_count, alert_count))
+    Ok((tx_count, alert_count, webhook_failures))
 }
 
 // ── Soroban operation enrichment ──────────────────────────────────────────────
@@ -702,7 +769,7 @@ mod tests {
         let mut cursors: HashMap<String, String> = HashMap::new();
         cursors.insert(contract.contract_id.clone(), "now".to_string());
 
-        let (txs, alerts) = poll_contract(&client, &contract, &mut cursors, false)
+        let (txs, alerts, _) = poll_contract(&client, &contract, &mut cursors, false)
             .await
             .unwrap();
         assert_eq!(txs, 1);
@@ -821,10 +888,10 @@ mod tests {
             horizon_base_url_override: Some(server.uri()),
         };
 
-        // 429 is handled with a back-off and returns Ok((0,0)), not an error
+        // 429 is handled with a back-off and returns Ok((0,0,0)), not an error
         let result = poll_contract(&client, &contract, &mut cursors, false).await;
         assert!(result.is_ok(), "429 should return Ok after back-off");
-        assert_eq!(result.unwrap(), (0, 0));
+        assert_eq!(result.unwrap(), (0, 0, 0));
     }
 
     #[tokio::test]
@@ -997,7 +1064,7 @@ mod tests {
         let mut cursors: HashMap<String, String> = HashMap::new();
         cursors.insert(contract.contract_id.clone(), "now".to_string());
 
-        let (txs, alerts) = poll_contract(&client, &contract, &mut cursors, false)
+        let (txs, alerts, _) = poll_contract(&client, &contract, &mut cursors, false)
             .await
             .unwrap();
         assert_eq!(txs, 201);
