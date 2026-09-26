@@ -27,8 +27,8 @@ webhook_url = "https://hooks.example.com/test"
     )
 }
 
-const ALPHA: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-const BETA: &str = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+const ALPHA: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+const BETA: &str = "CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526";
 
 fn wait_for(lines: &Receiver<String>, needle: &str) -> String {
     let deadline = Instant::now() + Duration::from_secs(15);
