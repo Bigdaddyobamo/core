@@ -63,6 +63,7 @@ subscriptions, no infrastructure beyond a single Rust binary.
 | Mainnet | `https://horizon.stellar.org` |
 | Testnet | `https://horizon-testnet.stellar.org` |
 | Futurenet | `https://horizon-futurenet.stellar.org` |
+| Custom / local | Your own `horizon_url`, e.g. `http://localhost:8000` for `stellar/quickstart --local` |
 
 ---
 
@@ -73,20 +74,22 @@ subscriptions, no infrastructure beyond a single Rust binary.
 git clone https://github.com/Tx-wats/core
 cd tx-watch-core
 
-# 2. Copy and edit the example config
-cp config/example.toml config/my-config.toml
-$EDITOR config/my-config.toml
+# 2. Copy and edit the example config (./txwatch.toml is the default path)
+cp config/example.toml txwatch.toml
+$EDITOR txwatch.toml
 
 # 3. Validate your config
-cargo run -p txwatch -- --config config/my-config.toml validate
+cargo run -p txwatch -- validate
 
 # 4. Send a test webhook to confirm your receiver works
-cargo run -p txwatch -- --config config/my-config.toml \
-  test-webhook --url https://hooks.example.com/my-webhook
+cargo run -p txwatch -- test-webhook --url https://hooks.example.com/my-webhook
 
 # 5. Start watching
-cargo run -p txwatch -- --config config/my-config.toml watch
+cargo run -p txwatch -- watch
 ```
+
+To pick up config changes without restarting (and without losing cursors),
+send `SIGHUP`: `kill -HUP <pid>`. An invalid file is logged and ignored.
 
 Set `RUST_LOG=debug` for verbose output. This also enables per-contract idle
 poll logs — the poller emits `"no new transactions"` debug messages with the
@@ -102,17 +105,20 @@ Build the image:
 docker build -t txwatch .
 ```
 
-Run with a config file:
+Run with a config file (the image reads `TXWATCH_CONFIG=/config/txwatch.toml`):
 
 ```bash
-docker run -v $(pwd)/config.toml:/config.toml txwatch --config /config.toml watch
+docker run -v $(pwd)/txwatch.toml:/config/txwatch.toml txwatch watch
 ```
 
 Or validate your config:
 
 ```bash
-docker run -v $(pwd)/config.toml:/config.toml txwatch --config /config.toml validate
+docker run -v $(pwd)/txwatch.toml:/config/txwatch.toml txwatch validate
 ```
+
+To watch contracts on a local standalone network, `docker compose -f docker-compose.local.yml up`
+starts `stellar/quickstart --local` together with TxWatch using [`config/local.toml`](config/local.toml).
 
 For local development with webhook testing, see [Local Development with Docker Compose](#local-development-with-docker-compose) in [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -129,7 +135,8 @@ Commands:
   test-webhook --url <URL>     Send a test payload to a webhook URL and exit
 ```
 
-`--config` defaults to `config/example.toml`.
+The config path comes from `--config`, else the `TXWATCH_CONFIG` environment variable, else
+`./txwatch.toml`. TxWatch exits with an error if that file does not exist.
 
 ---
 

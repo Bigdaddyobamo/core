@@ -1,11 +1,14 @@
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use futures::future::join_all;
 use reqwest::{Client, StatusCode};
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use txwatch_config::AppConfig;
 use txwatch_notifier::{build_client, send_webhook_simple, test_payload_with_network};
 
@@ -28,8 +31,8 @@ const VERSION: &str = concat!(
 )]
 struct Cli {
     /// Path to the TOML config file
-    #[arg(short, long, default_value = "config/example.toml")]
-    config: Option<PathBuf>,
+    #[arg(short, long, env = "TXWATCH_CONFIG", default_value = "txwatch.toml")]
+    config: PathBuf,
 
     #[command(subcommand)]
     command: Command,
@@ -93,7 +96,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Validate { check_webhooks, check_horizon } => {
-            let cfg = AppConfig::from_file(&required_config(&cli)?)?;
+            let cfg = AppConfig::from_file(&required_config(&cli.config)?)?;
             println!("Config is valid.");
             println!("  poll_interval_seconds : {}", cfg.poll_interval_seconds);
             println!("  contracts             : {}", cfg.contracts.len());
@@ -128,11 +131,12 @@ async fn main() -> Result<()> {
                     println!("      - {}", rule.label());
                 }
                 println!("    horizon      : {}", c.network.horizon_base_url());
-                println!(
-                    "    explorer     : {}/contract/{}",
-                    c.network.explorer_base_url(),
-                    c.contract_id
-                );
+                match c.network.explorer_base_url() {
+                    Some(explorer) => {
+                        println!("    explorer     : {}/contract/{}", explorer, c.contract_id)
+                    }
+                    None => println!("    explorer     : none"),
+                }
             }
 
             if check_webhooks {
@@ -171,8 +175,7 @@ async fn main() -> Result<()> {
 
         Command::TestWebhook { url, label, network, contract, secret } => {
             let configured = contract.as_ref().map(|wanted| {
-                let path = cli.config.as_ref().ok_or_else(|| anyhow::anyhow!("--contract requires --config"))?;
-                let cfg = AppConfig::from_file(path)?;
+                let cfg = AppConfig::from_file(&required_config(&cli.config)?)?;
                 cfg.contracts.into_iter().find(|c| c.label == *wanted).ok_or_else(|| anyhow::anyhow!("configured contract '{}' not found", wanted))
             }).transpose()?;
             let (url, network_name, horizon_base_url, secret) = if let Some(c) = configured {
@@ -194,7 +197,8 @@ async fn main() -> Result<()> {
         Command::Schema => println!("{}", serde_json::to_string_pretty(&schemars::schema_for!(txwatch_config::AppConfig))?),
 
         Command::Watch { dry_run } => {
-            let cfg = AppConfig::from_file(&required_config(&cli)?)?;
+            let config_path = required_config(&cli.config)?;
+            let cfg = AppConfig::from_file(&config_path)?;
 
             // Graceful shutdown: allow the current poll cycle to finish before exiting.
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -206,6 +210,9 @@ async fn main() -> Result<()> {
                 let _ = shutdown_tx.send(true);
             });
 
+            let (reload_tx, reload_rx) = tokio::sync::mpsc::channel(1);
+            spawn_reload_on_sighup(config_path, reload_tx)?;
+
             info!(
                 version = VERSION,
                 contracts = cfg.contracts.len(),
@@ -213,14 +220,65 @@ async fn main() -> Result<()> {
                 dry_run = dry_run,
                 "starting TxWatch"
             );
-            txwatch_poller::run_with_shutdown(cfg, dry_run, shutdown_rx).await?;
+            txwatch_poller::run_with_reload(cfg, dry_run, shutdown_rx, reload_rx).await?;
         }
     }
 
     Ok(())
 }
-fn required_config(cli: &Cli) -> Result<PathBuf> {
-    Ok(cli.config.clone().unwrap_or_else(|| PathBuf::from("config/example.toml")))
+/// The config path from `--config`, `TXWATCH_CONFIG` or the `./txwatch.toml`
+/// default, which must exist.
+fn required_config(path: &Path) -> Result<PathBuf> {
+    if !path.exists() {
+        anyhow::bail!(
+            "config file '{}' not found. Pass --config <path>, set TXWATCH_CONFIG, \
+             or create ./txwatch.toml (config/example.toml is a starting point)",
+            path.display()
+        );
+    }
+    Ok(path.to_path_buf())
+}
+
+/// On SIGHUP, re-read and validate the config file and hand it to the poller.
+/// An invalid file is logged and ignored, so the previous config keeps running.
+#[cfg(unix)]
+fn spawn_reload_on_sighup(
+    path: PathBuf,
+    reload_tx: tokio::sync::mpsc::Sender<AppConfig>,
+) -> Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut hangup = signal(SignalKind::hangup()).context("failed to install SIGHUP handler")?;
+    tokio::spawn(async move {
+        while hangup.recv().await.is_some() {
+            info!(path = %path.display(), "SIGHUP received — reloading config");
+            if let Some(cfg) = reload_config(&path) {
+                if reload_tx.send(cfg).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn spawn_reload_on_sighup(
+    _path: PathBuf,
+    _reload_tx: tokio::sync::mpsc::Sender<AppConfig>,
+) -> Result<()> {
+    Ok(())
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+fn reload_config(path: &Path) -> Option<AppConfig> {
+    match AppConfig::from_file(path) {
+        Ok(cfg) => Some(cfg),
+        Err(e) => {
+            error!(error = %format!("{:#}", e), "config reload failed — keeping the previous config");
+            None
+        }
+    }
 }
 
 async fn check_webhook_reachable(client: &Client, url: &str) -> Result<&'static str> {
