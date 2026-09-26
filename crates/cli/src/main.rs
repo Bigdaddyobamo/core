@@ -112,6 +112,24 @@ enum Command {
 
     /// Print the JSON Schema for the TOML configuration file.
     Schema,
+
+    /// Evaluate a contract's rules against one historical transaction
+    ///
+    /// Prints the rules that matched and their webhook payloads. Nothing is sent
+    /// unless --send is given. Exit codes: 0 = done, 1 = lookup or delivery failed
+    Replay {
+        /// Label of the configured contract whose rules to evaluate
+        #[arg(long)]
+        contract: String,
+
+        /// Transaction hash to replay
+        #[arg(long)]
+        tx: String,
+
+        /// Also deliver the resulting webhooks to the contract's webhook_url
+        #[arg(long)]
+        send: bool,
+    },
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -230,6 +248,33 @@ async fn main() -> Result<()> {
                 .await
                 .with_context(|| format!("test webhook to '{}' failed", url))?;
             println!("Test webhook delivered successfully to {} (status {}, attempts {})", url, result.final_status, result.attempts);
+        }
+
+        Command::Replay { ref contract, ref tx, send } => {
+            let cfg = load_config(&cli)?;
+            let contract = cfg
+                .contracts
+                .into_iter()
+                .find(|c| c.label == *contract)
+                .ok_or_else(|| anyhow::anyhow!("configured contract '{}' not found", contract))?;
+            let client = build_client().context("failed to build HTTP client")?;
+
+            let payloads = txwatch_poller::replay_transaction(&client, &contract, tx).await?;
+            println!("{} rule(s) matched transaction {} for '{}'", payloads.len(), tx, contract.label);
+            for payload in &payloads {
+                println!();
+                println!("  rule: {}", payload.rule_triggered);
+                println!("{}", serde_json::to_string_pretty(payload)?);
+            }
+
+            if send {
+                for payload in &payloads {
+                    let result = send_webhook_simple(&client, &contract.webhook_url, payload, contract.webhook_secret.as_deref())
+                        .await
+                        .with_context(|| format!("webhook for rule '{}' to '{}' failed", payload.rule_triggered, contract.webhook_url))?;
+                    println!("Delivered '{}' to {} (status {})", payload.rule_triggered, contract.webhook_url, result.final_status);
+                }
+            }
         }
 
         Command::Schema => println!("{}", serde_json::to_string_pretty(&schemars::schema_for!(txwatch_config::AppConfig))?),

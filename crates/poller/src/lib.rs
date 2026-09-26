@@ -596,6 +596,56 @@ async fn poll_contract(
     Ok((tx_count, alert_count, webhook_failures))
 }
 
+// ── Replay ────────────────────────────────────────────────────────────────────
+
+/// Fetch one historical transaction and its operations from Horizon and run the
+/// contract's rules against it, exactly as the poller would. Returns the
+/// payloads of every rule that matched; nothing is delivered. Used by
+/// `txwatch replay`.
+pub async fn replay_transaction(
+    client: &Client,
+    contract: &WatchedContract,
+    tx_hash: &str,
+) -> Result<Vec<txwatch_rules::AlertPayload>> {
+    let base = contract
+        .horizon_base_url_override
+        .as_deref()
+        .unwrap_or_else(|| contract.network.horizon_base_url());
+    let url = format!("{}/transactions/{}", base, tx_hash);
+
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("GET {} failed", url))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        anyhow::bail!(
+            "transaction {} not found on {}",
+            tx_hash,
+            contract.network.as_str()
+        );
+    }
+    let tx: HorizonTransaction = response
+        .error_for_status()
+        .with_context(|| format!("GET {} failed", url))?
+        .json()
+        .await
+        .with_context(|| format!("failed to parse Horizon transaction from {}", url))?;
+
+    let (function_names, amount_stroops) = fetch_soroban_details(client, base, tx_hash).await?;
+    let enriched = EnrichedTransaction::from_horizon(tx, function_names, amount_stroops, None)?;
+
+    Ok(evaluate(
+        &contract.label,
+        &contract.contract_id,
+        contract.network.as_str(),
+        contract.network.horizon_base_url(),
+        contract.network.explorer_base_url(),
+        &contract.rules,
+        &enriched,
+    ))
+}
+
 // ── Soroban operation enrichment ──────────────────────────────────────────────
 
 /// Extract Soroban details from a slice of already-fetched operations.

@@ -127,7 +127,13 @@ Commands:
   watch [--once] [--dry-run]     Start the polling engine
   validate [--format text|json]  Validate the config file and print a summary
   test-webhook --url <URL>       Send a test payload to a webhook URL and exit
+  replay --contract <label> --tx <hash> [--send]
+                                 Evaluate a contract's rules against one transaction
 ```
+
+`replay` fetches a historical transaction and its operations from Horizon, runs the named
+contract's rules against it and prints every matched rule with its webhook payload, so rule authors
+can check "would my rules have fired for transaction X?". Nothing is sent unless `--send` is given.
 
 `validate --format json` prints the parsed config as a single JSON object (webhook secrets are
 redacted to `webhook_secret_set`), or `{"valid": false, "error": "..."}` with exit code 1.
