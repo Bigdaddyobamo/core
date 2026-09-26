@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::Deserialize;
 use std::fs;
+use tokio::sync::{mpsc, watch};
 use tokio::{sync::watch, task::JoinSet};
 use tracing::{debug, error, info, warn};
 use txwatch_config::{AppConfig, WatchedContract};
@@ -74,6 +75,7 @@ struct OpsEmbedded {
 
 #[derive(Default)]
 struct Counters {
+    contracts: AtomicU64,
     transactions: AtomicU64,
     alerts: AtomicU64,
     interval_transactions: AtomicU64,
@@ -104,6 +106,21 @@ pub async fn run_with_shutdown(
     dry_run: bool,
     shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
+    // No reloads: hold the sender so the channel never closes.
+    let (_reload_tx, reload_rx) = mpsc::channel(1);
+    run_with_reload(cfg, dry_run, shutdown, reload_rx).await
+}
+
+/// Like [`run_with_shutdown`], but also applies every validated config received
+/// on `reload` (the CLI sends one per SIGHUP). Contracts that are still present
+/// keep their cursors; new contracts start from the start-cursor rules
+/// (`cursor_file` entry, else `now`). HTTP client settings are not reloaded.
+pub async fn run_with_reload(
+    mut cfg: AppConfig,
+    dry_run: bool,
+    mut shutdown: watch::Receiver<bool>,
+    mut reload: mpsc::Receiver<AppConfig>,
+) -> Result<()> {
     // 0 disables keepalive, as documented on `AppConfig::http_tcp_keepalive_secs`.
     let keepalive =
         (cfg.http_tcp_keepalive_secs > 0).then(|| Duration::from_secs(cfg.http_tcp_keepalive_secs));
@@ -115,6 +132,7 @@ pub async fn run_with_shutdown(
         .build()
         .context("failed to build HTTP client")?;
 
+    let mut cursors = start_cursors(&cfg);
     let cursors: HashMap<String, String> = if let Some(path) = &cfg.cursor_file {
         match fs::read_to_string(path) {
             Ok(raw) => match serde_json::from_str::<HashMap<String, String>>(&raw) {
@@ -149,6 +167,7 @@ pub async fn run_with_shutdown(
             .collect()
     };
 
+    let mut interval = Duration::from_secs(cfg.poll_interval_seconds);
     let interval = Duration::from_secs(cfg.poll_interval_seconds);
     #[cfg(feature = "metrics")]
     {
@@ -158,6 +177,9 @@ pub async fn run_with_shutdown(
     let summary_every = Duration::from_secs(60);
     let counters = Arc::new(Counters::default());
     let n_contracts = cfg.contracts.len();
+    counters
+        .contracts
+        .store(n_contracts as u64, Ordering::Relaxed);
 
     let contracts_list = cfg
         .contracts
@@ -217,7 +239,7 @@ pub async fn run_with_shutdown(
                     let interval_txs = c.interval_transactions.swap(0, Ordering::Relaxed);
                     let interval_alerts = c.interval_alerts.swap(0, Ordering::Relaxed);
                     info!(
-                        contracts = n_contracts,
+                        contracts = c.contracts.load(Ordering::Relaxed),
                         transactions_total = c.transactions.load(Ordering::Relaxed),
                         alerts_total = c.alerts.load(Ordering::Relaxed),
                         transactions_interval = interval_txs,
@@ -315,6 +337,32 @@ pub async fn run_with_shutdown(
                     }
                 }
             }
+            Some(new_cfg) = reload.recv() => {
+                let start = start_cursors(&new_cfg);
+                cursors = new_cfg
+                    .contracts
+                    .iter()
+                    .map(|c| {
+                        let id = c.contract_id.clone();
+                        let cursor = cursors
+                            .get(&id)
+                            .or_else(|| start.get(&id))
+                            .cloned()
+                            .unwrap_or_else(|| "now".to_string());
+                        (id, cursor)
+                    })
+                    .collect();
+                interval = Duration::from_secs(new_cfg.poll_interval_seconds);
+                counters
+                    .contracts
+                    .store(new_cfg.contracts.len() as u64, Ordering::Relaxed);
+                info!(
+                    contracts = new_cfg.contracts.len(),
+                    interval_secs = new_cfg.poll_interval_seconds,
+                    "configuration reloaded"
+                );
+                cfg = new_cfg;
+            }
         });
     }
 
@@ -326,6 +374,29 @@ pub async fn run_with_shutdown(
 
     info!("TxWatch polling engine stopped cleanly");
     Ok(())
+}
+
+/// Initial cursor per contract: the `cursor_file` entry when present, else `now`.
+fn start_cursors(cfg: &AppConfig) -> HashMap<String, String> {
+    let mut cursors: HashMap<String, String> = HashMap::new();
+    if let Some(path) = &cfg.cursor_file {
+        match fs::read_to_string(path) {
+            Ok(raw) => match serde_json::from_str::<HashMap<String, String>>(&raw) {
+                Ok(map) => cursors = map,
+                Err(e) => {
+                    warn!(error = ?e, "failed to parse cursor_file; starting from 'now' for all contracts")
+                }
+            },
+            Err(e) => debug!(error = ?e, "could not read cursor_file; starting from 'now'"),
+        }
+    }
+    // Ensure every configured contract has a cursor entry.
+    for c in &cfg.contracts {
+        cursors
+            .entry(c.contract_id.clone())
+            .or_insert_with(|| "now".to_string());
+    }
+    cursors
 }
 
 // ── Per-contract poll ─────────────────────────────────────────────────────────
@@ -472,15 +543,22 @@ async fn poll_contract(
 
         tx_count += 1;
 
-        let payloads = evaluate(
+        let mut payloads = evaluate(
             &contract.label,
             &contract.contract_id,
             contract.network.as_str(),
             canonical_base,
-            contract.network.explorer_base_url(),
+            contract.network.explorer_base_url().unwrap_or_default(),
             &contract.rules,
             &enriched,
         );
+        // A custom network without `explorer_url` has no explorer; link to the
+        // transaction on Horizon instead.
+        if contract.network.explorer_base_url().is_none() {
+            for payload in &mut payloads {
+                payload.explorer_link = payload.horizon_link.clone();
+            }
+        }
 
         if payloads.is_empty() {
             debug!(contract = %contract.label, tx = %tx_hash, rules = ?contract.rules,

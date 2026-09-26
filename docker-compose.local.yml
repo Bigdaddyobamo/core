@@ -1,0 +1,48 @@
+# Local development loop: a standalone Stellar network (stellar/quickstart
+# --local) plus TxWatch watching it and posting alerts to an echo receiver.
+#
+#   docker compose -f docker-compose.local.yml up
+#
+# Deploy your contract to the local network (http://localhost:8000), put its
+# address in config/local.toml, then reload TxWatch without restarting:
+#
+#   docker compose -f docker-compose.local.yml kill -s HUP txwatch
+
+services:
+  stellar:
+    image: stellar/quickstart:latest
+    container_name: stellar-local
+    command: --local
+    ports:
+      - "8000:8000"
+    networks:
+      - txwatch
+
+  txwatch:
+    build: .
+    container_name: txwatch-local
+    volumes:
+      - ./config/local.toml:/config/txwatch.toml:ro
+    environment:
+      RUST_LOG: info
+      TXWATCH_CONFIG: /config/txwatch.toml
+    command: watch
+    depends_on:
+      - stellar
+      - webhook
+    networks:
+      - txwatch
+
+  webhook:
+    image: mendhak/http-https-echo:latest
+    container_name: webhook-echo-local
+    ports:
+      - "8080:8080"
+    environment:
+      HTTP_PORT: "8080"
+    networks:
+      - txwatch
+
+networks:
+  txwatch:
+    driver: bridge
