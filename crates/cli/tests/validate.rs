@@ -148,6 +148,7 @@ webhook_url = "https://hooks.example.com/test"
         "    contract_id  : CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
         "    webhook_url  : https://hooks.example.com/test\n",
         "    secret       : none\n",
+        "    interval     : 10s\n",
         "    rules        : 2\n",
         "      - AnyTransaction\n",
         "      - TransactionFailed\n",
@@ -174,4 +175,53 @@ fn validate_exits_one_for_invalid_config() {
         Some(1),
         "expected exit code 1 for invalid config"
     );
+}
+
+#[test]
+fn validate_output_shows_effective_poll_interval_per_contract() {
+    const OVERRIDE_CONFIG: &str = r#"
+[[contracts]]
+label                 = "Fast"
+contract_id           = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+network               = "testnet"
+webhook_url           = "https://hooks.example.com/fast"
+poll_interval_seconds = 5
+
+  [[contracts.rules]]
+  type = "AnyTransaction"
+
+[[contracts]]
+label       = "Default"
+contract_id = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+network     = "testnet"
+webhook_url = "https://hooks.example.com/default"
+
+  [[contracts.rules]]
+  type = "AnyTransaction"
+"#;
+
+    let path = env::temp_dir().join("txwatch_validate_interval_test.toml");
+    fs::write(&path, OVERRIDE_CONFIG).unwrap();
+
+    let output = txwatch_bin()
+        .args(["--config", path.to_str().unwrap(), "validate"])
+        .output()
+        .expect("failed to run txwatch");
+
+    assert!(
+        output.status.success(),
+        "expected exit code 0 for valid config"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("  poll_interval_seconds : 10\n"),
+        "{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("    interval     : 5s (override)\n"),
+        "{}",
+        stdout
+    );
+    assert!(stdout.contains("    interval     : 10s\n"), "{}", stdout);
 }

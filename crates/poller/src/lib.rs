@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::Deserialize;
 use std::fs;
-use tokio::sync::watch;
+use tokio::{sync::watch, task::JoinSet};
 use tracing::{debug, error, info, warn};
 use txwatch_config::{AppConfig, WatchedContract};
 use txwatch_notifier::send_webhook;
@@ -102,19 +102,20 @@ pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
 pub async fn run_with_shutdown(
     cfg: AppConfig,
     dry_run: bool,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    let max_idle = cfg.http_pool_max_idle_per_host.unwrap_or(10);
-    let keepalive_secs = cfg.http_tcp_keepalive_secs.unwrap_or(30);
+    // 0 disables keepalive, as documented on `AppConfig::http_tcp_keepalive_secs`.
+    let keepalive =
+        (cfg.http_tcp_keepalive_secs > 0).then(|| Duration::from_secs(cfg.http_tcp_keepalive_secs));
 
     let client = Client::builder()
         .timeout(Duration::from_secs(15))
-        .pool_max_idle_per_host(max_idle)
-        .tcp_keepalive(Some(Duration::from_secs(keepalive_secs)))
+        .pool_max_idle_per_host(cfg.http_pool_max_idle_per_host)
+        .tcp_keepalive(keepalive)
         .build()
         .context("failed to build HTTP client")?;
 
-    let mut cursors: HashMap<String, String> = if let Some(path) = &cfg.cursor_file {
+    let cursors: HashMap<String, String> = if let Some(path) = &cfg.cursor_file {
         match fs::read_to_string(path) {
             Ok(raw) => match serde_json::from_str::<HashMap<String, String>>(&raw) {
                 Ok(mut map) => {
@@ -192,10 +193,15 @@ pub async fn run_with_shutdown(
         "TxWatch polling engine started"
     );
 
-    if cfg.poll_interval_seconds < 10 && cfg.contracts.len() > 5 {
+    let fast_contracts = cfg
+        .contracts
+        .iter()
+        .filter(|c| c.effective_poll_interval(cfg.poll_interval_seconds) < 10)
+        .count();
+    if fast_contracts > 5 {
         warn!(
             poll_interval_seconds = cfg.poll_interval_seconds,
-            contracts = cfg.contracts.len(),
+            contracts = fast_contracts,
             "polling interval is very short with many contracts — Horizon rate limits may apply; \
              consider poll_interval_seconds >= 10"
         );
@@ -226,6 +232,39 @@ pub async fn run_with_shutdown(
         }
     });
 
+    // Each contract runs on its own task and interval, so a slow contract or a
+    // short per-contract interval never affects the schedule of the others.
+    let mut tasks = JoinSet::new();
+    for contract in cfg.contracts {
+        let interval =
+            Duration::from_secs(contract.effective_poll_interval(cfg.poll_interval_seconds));
+        let mut contract_cursors: HashMap<String, String> = cursors
+            .get_key_value(&contract.contract_id)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .into_iter()
+            .collect();
+        let client = client.clone();
+        let counters = Arc::clone(&counters);
+        let mut shutdown = shutdown.clone();
+
+        tasks.spawn(async move {
+            loop {
+                match poll_contract(&client, &contract, &mut contract_cursors, dry_run).await {
+                    Ok((txs, alerts)) => {
+                        counters.transactions.fetch_add(txs, Ordering::Relaxed);
+                        counters.alerts.fetch_add(alerts, Ordering::Relaxed);
+                        counters
+                            .interval_transactions
+                            .fetch_add(txs, Ordering::Relaxed);
+                        counters
+                            .interval_alerts
+                            .fetch_add(alerts, Ordering::Relaxed);
+                        // Issue #25: increment Prometheus counters when metrics feature is enabled.
+                        #[cfg(feature = "metrics")]
+                        {
+                            metrics::inc_transactions(txs);
+                            metrics::inc_alerts(alerts);
+                        }
     loop {
         for contract in &cfg.contracts {
             match poll_contract(&client, contract, &mut cursors, dry_run).await {
@@ -247,6 +286,7 @@ pub async fn run_with_shutdown(
                         metrics::record_poll_success(&contract.label, network);
                         metrics::mark_poll_success();
                     }
+                    Err(e) => error!(contract = %contract.label, error = %e, "contract polling task failed"),
                 }
                 Err(e) => {
                     error!(error = %e, "contract polling task failed");
@@ -265,7 +305,22 @@ pub async fn run_with_shutdown(
                 if *shutdown.borrow() {
                     break;
                 }
+
+                tokio::select! {
+                    () = tokio::time::sleep(interval) => {}
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() {
+                            break;
+                        }
+                    }
+                }
             }
+        });
+    }
+
+    while let Some(result) = tasks.join_next().await {
+        if let Err(e) = result {
+            error!(error = ?e, "contract polling task panicked");
         }
     }
 
@@ -641,6 +696,7 @@ mod tests {
             }],
             webhook_url: format!("{}/hook", receiver.uri()),
             webhook_secret: None,
+            poll_interval_seconds: None,
             horizon_base_url_override: Some(server.uri()),
         };
         let mut cursors: HashMap<String, String> = HashMap::new();
@@ -761,6 +817,7 @@ mod tests {
             rules: vec![txwatch_config::AlertRule::AnyTransaction],
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
+            poll_interval_seconds: None,
             horizon_base_url_override: Some(server.uri()),
         };
 
@@ -791,6 +848,7 @@ mod tests {
             rules: vec![txwatch_config::AlertRule::AnyTransaction],
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
+            poll_interval_seconds: None,
             horizon_base_url_override: Some(server.uri()),
         };
 
@@ -825,6 +883,7 @@ mod tests {
             rules: vec![AlertRule::AnyTransaction],
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
+            poll_interval_seconds: None,
             horizon_base_url_override: Some(server.uri()),
         };
 
@@ -841,8 +900,8 @@ mod tests {
     fn startup_log_includes_version_contracts_list_and_networks() {
         let cfg = AppConfig {
             poll_interval_seconds: 10,
-            http_pool_max_idle_per_host: None,
-            http_tcp_keepalive_secs: None,
+            http_pool_max_idle_per_host: 10,
+            http_tcp_keepalive_secs: 30,
             http_connection_verbose: None,
             cursor_file: None,
             contracts: vec![
@@ -853,6 +912,7 @@ mod tests {
                     rules: vec![txwatch_config::AlertRule::AnyTransaction],
                     webhook_url: "https://hooks.example.com/a".into(),
                     webhook_secret: None,
+                    poll_interval_seconds: None,
                     horizon_base_url_override: None,
                 },
                 WatchedContract {
@@ -862,6 +922,7 @@ mod tests {
                     rules: vec![txwatch_config::AlertRule::AnyTransaction],
                     webhook_url: "https://hooks.example.com/b".into(),
                     webhook_secret: None,
+                    poll_interval_seconds: None,
                     horizon_base_url_override: None,
                 },
                 WatchedContract {
@@ -871,6 +932,7 @@ mod tests {
                     rules: vec![txwatch_config::AlertRule::AnyTransaction],
                     webhook_url: "https://hooks.example.com/c".into(),
                     webhook_secret: None,
+                    poll_interval_seconds: None,
                     horizon_base_url_override: None,
                 },
             ],
@@ -929,6 +991,7 @@ mod tests {
             rules: vec![AlertRule::AnyTransaction],
             webhook_url: format!("{}/hooks", server.uri()),
             webhook_secret: None,
+            poll_interval_seconds: None,
             horizon_base_url_override: Some(server.uri()),
         };
         let mut cursors: HashMap<String, String> = HashMap::new();
