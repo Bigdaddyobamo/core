@@ -30,6 +30,7 @@ The schema is also available from the CLI with `txwatch schema`. CI verifies tha
 | `http_pool_max_idle_per_host` | usize           | no       | `10`    | Maximum idle connections kept per host in the HTTP pool. Must be 1–100. Lower values use less memory; higher values help with many contracts. |
 | `http_tcp_keepalive_secs`     | u64             | no       | `30`    | TCP keepalive interval (seconds) for pooled HTTP connections. Must be ≤ 7200; `0` disables keepalive. |
 | `http_connection_verbose`     | bool            | no       | `false` | Reserved for HTTP connection-pool debug output. Accepted by the parser but currently has no effect. |
+| `max_contracts`               | usize           | no       | `100`   | Maximum number of `[[contracts]]` entries. Must be 1–10000. Raise it only when your Horizon instance (typically your own) can take the extra polling load. |
 
 Unknown top-level keys are rejected.
 
@@ -40,7 +41,7 @@ Unknown top-level keys are rejected.
 > higher is advised. TxWatch logs a startup warning when more than 5 contracts are polled at an effective
 > interval below 10 seconds.
 
-> **Contract limit:** `txwatch-config` declares `MAX_CONTRACTS = 100` as the supported upper bound for `[[contracts]]` entries. It is not yet enforced during validation, so keep configurations at or below 100 contracts to avoid exhausting memory or file descriptors with too many concurrent Horizon polling tasks.
+> **Contract limit:** a configuration may hold at most `max_contracts` (default `100`, `MAX_CONTRACTS` in `txwatch-config`) `[[contracts]]` entries; more is rejected at startup. Every contract is polled by its own task, so very large lists can exhaust memory, file descriptors or the public Horizon rate limit. Split large deployments across several TxWatch instances, or raise `max_contracts` (up to 10000) when polling your own Horizon.
 
 ## `[[contracts]]`
 

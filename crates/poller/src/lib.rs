@@ -1091,6 +1091,7 @@ mod tests {
             http_pool_max_idle_per_host: 10,
             http_tcp_keepalive_secs: 30,
             http_connection_verbose: None,
+            max_contracts: None,
             cursor_file: None,
             contracts: vec![
                 WatchedContract {

@@ -9,21 +9,19 @@
     "http_pool_max_idle_per_host": { "type": "integer", "minimum": 1, "maximum": 100, "default": 10 },
     "http_tcp_keepalive_secs": { "type": "integer", "minimum": 0, "maximum": 7200, "default": 30 },
     "http_connection_verbose": { "type": ["boolean", "null"] },
-    "contracts": { "type": "array", "items": { "$ref": "#/definitions/WatchedContract" }, "minItems": 1, "maxItems": 100 }
+    "max_contracts": { "type": ["integer", "null"], "minimum": 1, "maximum": 10000, "description": "Maximum number of [[contracts]] entries. Default: 100." },
+    "contracts": { "type": "array", "items": { "$ref": "#/definitions/WatchedContract" }, "minItems": 1 }
   },
   "definitions": {
     "WatchedContract": {
       "type": "object", "required": ["label", "contract_id", "network", "rules", "webhook_url"], "additionalProperties": false,
       "properties": {
-        "label": { "type": "string" }, "contract_id": { "type": "string", "pattern": "^C[A-Z2-7]{55}$" },
+        "label": { "type": "string", "maxLength": 128 }, "contract_id": { "type": "string", "pattern": "^C[A-Z2-7]{55}$" },
         "network": { "oneOf": [
           { "enum": ["mainnet", "testnet", "futurenet"] },
           { "type": "object", "required": ["horizon_url"], "additionalProperties": false,
             "properties": { "horizon_url": { "type": "string", "format": "uri" }, "explorer_url": { "type": ["string", "null"], "format": "uri" }, "passphrase": { "type": ["string", "null"] } } }
         ] }, "webhook_url": { "type": "string", "format": "uri" },
-        "webhook_secret": { "type": ["string", "null"] }, "rules": { "type": "array", "items": { "$ref": "#/definitions/AlertRule" }, "minItems": 1 }
-        "label": { "type": "string", "maxLength": 128 }, "contract_id": { "type": "string", "pattern": "^C[A-Z2-7]{55}$" },
-        "network": { "enum": ["mainnet", "testnet", "futurenet"] }, "webhook_url": { "type": "string", "format": "uri" },
         "webhook_secret": { "type": ["string", "null"] },
         "poll_interval_seconds": { "type": ["integer", "null"], "minimum": 5, "maximum": 3600 },
         "rules": { "type": "array", "items": { "$ref": "#/definitions/AlertRule" }, "minItems": 1 }
