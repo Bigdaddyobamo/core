@@ -3,17 +3,24 @@ name    = "txwatch"
 version = "0.1.0"
 edition = "2021"
 license.workspace = true
+rust-version.workspace = true
+description = "TxWatch command-line tool: monitor Soroban smart contracts and send webhook alerts"
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [[bin]]
 name = "txwatch"
 path = "src/main.rs"
 
 [dependencies]
-txwatch-config   = { path = "../config" }
-txwatch-poller   = { path = "../poller" }
-txwatch-notifier = { path = "../notifier" }
+txwatch-config   = { path = "../config", version = "0.1.0" }
+txwatch-poller   = { path = "../poller", version = "0.1.0" }
+txwatch-notifier = { path = "../notifier", version = "0.1.0" }
 clap             = { workspace = true }
-tokio            = { workspace = true }
+tokio            = { workspace = true, features = ["full"] }
 anyhow           = { workspace = true }
 reqwest          = { workspace = true }
 tracing          = { workspace = true }

@@ -65,7 +65,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 rustup update stable
 ```
 
-Requires Rust stable ≥ 1.75.
+Requires Rust stable ≥ 1.88 (the `rust-version` declared in the workspace `Cargo.toml`, checked by the MSRV CI job).
 
 ### 2. Clone and build
 

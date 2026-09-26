@@ -3,6 +3,13 @@ name    = "txwatch-config"
 version = "0.1.0"
 edition = "2021"
 license.workspace = true
+rust-version.workspace = true
+description = "TOML configuration model and validation for TxWatch"
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 serde   = { workspace = true }

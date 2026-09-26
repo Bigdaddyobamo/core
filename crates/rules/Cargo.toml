@@ -3,9 +3,16 @@ name    = "txwatch-rules"
 version = "0.1.0"
 edition = "2021"
 license.workspace = true
+rust-version.workspace = true
+description = "Alert rule evaluation and payload construction for TxWatch"
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
-txwatch-config = { path = "../config" }
+txwatch-config = { path = "../config", version = "0.1.0" }
 serde          = { workspace = true }
 serde_json     = { workspace = true }
 anyhow         = { workspace = true }
