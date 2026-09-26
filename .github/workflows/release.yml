@@ -64,10 +64,39 @@ jobs:
           name: txwatch-${{ matrix.target }}
           path: txwatch-*.${{ matrix.archive }}
 
+  # ── Shell completions and man page ─────────────────────────────────────────
+  # Generated once from a host build: the cross-compiled targets can't run
+  # their own binary on the build machine.
+  extras:
+    name: Completions and man page
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Generate
+        shell: bash
+        run: |
+          cargo build --release --locked -p txwatch
+          bin=target/release/txwatch
+          name="txwatch-${GITHUB_REF_NAME}-completions-and-man"
+          mkdir -p "$name/completions"
+          "$bin" man > "$name/txwatch.1"
+          for shell in bash zsh fish powershell elvish; do
+            "$bin" completions "$shell" > "$name/completions/txwatch.$shell"
+          done
+          tar czf "$name.tar.gz" "$name"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: txwatch-completions-and-man
+          path: txwatch-*.tar.gz
+
   # ── GitHub Release with checksums ──────────────────────────────────────────
   release:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, extras]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8

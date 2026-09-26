@@ -1,7 +1,7 @@
 use std::{fs, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use futures::future::join_all;
 use reqwest::{Client, StatusCode};
 use tokio::sync::watch;
@@ -86,6 +86,15 @@ enum Command {
 
     /// Print the JSON Schema for the TOML configuration file.
     Schema,
+
+    /// Print a shell completion script, e.g. `txwatch completions bash > /etc/bash_completion.d/txwatch`
+    Completions {
+        /// Shell to generate completions for
+        shell: clap_complete::Shell,
+    },
+
+    /// Print the txwatch(1) man page in roff format, e.g. `txwatch man > txwatch.1`
+    Man,
 
     /// Write a starter config file for one contract
     ///
@@ -241,6 +250,18 @@ async fn main() -> Result<()> {
             AppConfig::parse(&raw, output).context("the generated config is not valid")?;
             fs::write(output, raw).with_context(|| format!("failed to write '{}'", output.display()))?;
             println!("Wrote {}. Check it with: txwatch --config {} validate", output.display(), output.display());
+        }
+
+        Command::Completions { shell } => {
+            clap_complete::generate(shell, &mut Cli::command(), "txwatch", &mut std::io::stdout());
+        }
+
+        Command::Man => {
+            match clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout()) {
+                // The reader (e.g. `| head`) closing early isn't an error.
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+                other => other.context("failed to render the man page")?,
+            }
         }
 
         Command::Schema => println!("{}", serde_json::to_string_pretty(&schemars::schema_for!(txwatch_config::AppConfig))?),

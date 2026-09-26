@@ -128,7 +128,14 @@ Commands:
   validate                     Validate the config file and print a summary
   test-webhook --url <URL>     Send a test payload to a webhook URL and exit
   init                         Write a starter config (prompts for anything not passed)
+  completions <shell>          Print a completion script (bash, zsh, fish, powershell, elvish)
+  man                          Print the txwatch(1) man page
 ```
+
+Install completions with e.g. `txwatch completions bash > ~/.local/share/bash-completion/completions/txwatch`
+or `txwatch completions zsh > "${fpath[1]}/_txwatch"`, and the man page with
+`txwatch man > ~/.local/share/man/man1/txwatch.1`. Release archives also ship a
+`completions-and-man` bundle with both pre-generated.
 
 Start a new config with `txwatch init --contract-id C... --network testnet --webhook-url https://...`
 (add `--output <path>`, default `txwatch.toml`). Any value not passed as a flag is prompted for.
