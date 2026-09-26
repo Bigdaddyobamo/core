@@ -130,11 +130,27 @@ For local development with webhook testing, see [Local Development with Docker C
 txwatch [--config <path>] <command>
 
 Commands:
-  watch                        Start the polling engine
-  validate                     Validate the config file and print a summary
-  test-webhook --url <URL>     Send a test payload to a webhook URL and exit
+  watch [--once] [--dry-run]     Start the polling engine
+  validate [--format text|json]  Validate the config file and print a summary
+  test-webhook --url <URL>       Send a test payload to a webhook URL and exit
+  replay --contract <label> --tx <hash> [--send]
+                                 Evaluate a contract's rules against one transaction
 ```
 
+`replay` fetches a historical transaction and its operations from Horizon, runs the named
+contract's rules against it and prints every matched rule with its webhook payload, so rule authors
+can check "would my rules have fired for transaction X?". Nothing is sent unless `--send` is given.
+
+`validate --format json` prints the parsed config as a single JSON object (webhook secrets are
+redacted to `webhook_secret_set`), or `{"valid": false, "error": "..."}` with exit code 1.
+
+`--config` defaults to `config/example.toml`. `--horizon-url <URL>` overrides the Horizon base URL
+for every contract (for example a private Horizon instance).
+
+`watch --once` runs a single poll cycle, delivers any alerts, saves cursors to `cursor_file` (if
+configured) and exits, for use from cron, CI jobs or serverless schedulers. It exits `1` if any
+contract poll or webhook delivery failed, `0` otherwise. Set `cursor_file` so each run picks up
+where the previous one stopped; without it every run starts from `now`.
 The config path comes from `--config`, else the `TXWATCH_CONFIG` environment variable, else
 `./txwatch.toml`. TxWatch exits with an error if that file does not exist.
 
@@ -256,6 +272,16 @@ TxWatch uses `tracing` spans to correlate work across each poll cycle and webhoo
 - `txwatch-notifier::send_webhook` creates a span with `contract` and `rule` fields before sending the webhook request.
 
 Set `RUST_LOG=info` or a more specific filter to view structured tracing output in the CLI.
+
+Logs are human-readable text by default. For log pipelines (Loki, Datadog, CloudWatch), pass
+`--log-format json` or set `TXWATCH_LOG_FORMAT=json` to emit one JSON object per line. Event
+fields (`contract`, `tx`, `rule`, `attempt`, ...) stay as JSON fields, and each line includes the
+current span and the full span list:
+
+```sh
+txwatch --log-format json watch
+TXWATCH_LOG_FORMAT=json txwatch watch
+```
 
 ### Prometheus metrics (optional)
 
