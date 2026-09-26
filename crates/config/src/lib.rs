@@ -59,28 +59,118 @@ fn validate_poll_interval(value: u64, field: &str) -> Result<()> {
 
 // ── Network ───────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+/// The Stellar network a contract lives on: one of the public networks by name
+/// (`network = "testnet"`), or a custom / local network such as
+/// `stellar/quickstart --local` given as an inline table
+/// (`network = { horizon_url = "http://localhost:8000" }`).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Network {
+    Mainnet,
+    Testnet,
+    Futurenet,
+    Custom(CustomNetwork),
+}
+
+/// A standalone or private network reached through its own Horizon instance.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CustomNetwork {
+    /// Horizon base URL, e.g. `http://localhost:8000` for stellar/quickstart.
+    pub horizon_url: String,
+    /// Optional block-explorer base URL; transaction links are `<explorer_url>/tx/<hash>`.
+    #[serde(default)]
+    pub explorer_url: Option<String>,
+    /// Optional network passphrase, e.g. `Standalone Network ; February 2017`.
+    #[serde(default)]
+    pub passphrase: Option<String>,
+}
+
+const NAMED_NETWORKS: &[&str] = &["mainnet", "testnet", "futurenet"];
+
+impl<'de> Deserialize<'de> for Network {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct NetworkVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for NetworkVisitor {
+            type Value = Network;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("`mainnet`, `testnet`, `futurenet` or a { horizon_url = \"…\" } table")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Network, E> {
+                match value {
+                    "mainnet" => Ok(Network::Mainnet),
+                    "testnet" => Ok(Network::Testnet),
+                    "futurenet" => Ok(Network::Futurenet),
+                    other => Err(E::unknown_variant(other, NAMED_NETWORKS)),
+                }
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<Network, A::Error> {
+                CustomNetwork::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(Network::Custom)
+            }
+        }
+
+        deserializer.deserialize_any(NetworkVisitor)
+    }
+}
+
+impl Serialize for Network {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Network::Custom(custom) => custom.serialize(serializer),
+            named => serializer.serialize_str(named.as_str()),
+        }
+    }
+}
+
+/// A public Stellar network name, or a custom network table with `horizon_url`.
+#[derive(JsonSchema)]
+#[serde(untagged)]
+#[allow(dead_code)]
+enum NetworkSchema {
+    Named(NamedNetworkSchema),
+    Custom(CustomNetwork),
+}
+
+#[derive(JsonSchema)]
+#[serde(rename_all = "lowercase")]
+#[allow(dead_code)]
+enum NamedNetworkSchema {
     Mainnet,
     Testnet,
     Futurenet,
 }
 
+impl JsonSchema for Network {
+    fn schema_name() -> String {
+        "Network".to_owned()
+    }
+
+    fn json_schema(gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        NetworkSchema::json_schema(gen)
+    }
+}
+
 impl Network {
-    pub fn horizon_base_url(&self) -> &'static str {
+    pub fn horizon_base_url(&self) -> &str {
         match self {
             Network::Mainnet => "https://horizon.stellar.org",
             Network::Testnet => "https://horizon-testnet.stellar.org",
             Network::Futurenet => "https://horizon-futurenet.stellar.org",
+            Network::Custom(custom) => &custom.horizon_url,
         }
     }
 
+    /// Network name used in logs and the `network` field of alert payloads.
     pub fn as_str(&self) -> &'static str {
         match self {
             Network::Mainnet => "mainnet",
             Network::Testnet => "testnet",
             Network::Futurenet => "futurenet",
+            Network::Custom(_) => "custom",
         }
     }
 
@@ -90,15 +180,18 @@ impl Network {
             Network::Mainnet => "Stellar Mainnet",
             Network::Testnet => "Stellar Testnet",
             Network::Futurenet => "Stellar Futurenet",
+            Network::Custom(_) => "Custom Network",
         }
     }
 
-    /// Stellar Expert explorer base URL for this network.
-    pub fn explorer_base_url(&self) -> &'static str {
+    /// Explorer base URL for this network (Stellar Expert for the public
+    /// networks); `None` for a custom network without `explorer_url`.
+    pub fn explorer_base_url(&self) -> Option<&str> {
         match self {
-            Network::Mainnet => "https://stellar.expert/explorer/public",
-            Network::Testnet => "https://stellar.expert/explorer/testnet",
-            Network::Futurenet => "https://stellar.expert/explorer/futurenet",
+            Network::Mainnet => Some("https://stellar.expert/explorer/public"),
+            Network::Testnet => Some("https://stellar.expert/explorer/testnet"),
+            Network::Futurenet => Some("https://stellar.expert/explorer/futurenet"),
+            Network::Custom(custom) => custom.explorer_url.as_deref(),
         }
     }
 }
@@ -262,6 +355,49 @@ pub struct WatchedContract {
     pub horizon_base_url_override: Option<String>,
 }
 
+/// Every problem found while validating a config. Each entry keeps the
+/// `contract '<label>': <message>` format; `Display` prints one per line.
+#[derive(Debug)]
+pub struct ValidationErrors(pub Vec<String>);
+
+impl ValidationErrors {
+    fn into_result(errors: Vec<String>) -> Result<()> {
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(ValidationErrors(errors).into())
+        }
+    }
+}
+
+impl fmt::Display for ValidationErrors {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let [only] = self.0.as_slice() {
+            return f.write_str(only);
+        }
+        write!(f, "{} configuration errors:", self.0.len())?;
+        for error in &self.0 {
+            write!(f, "\n  - {}", error)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ValidationErrors {}
+
+/// Checks that `value` is an http(s) URL with a host; returns a description
+/// of the problem otherwise.
+fn check_http_url(value: &str) -> Option<String> {
+    match Url::parse(value) {
+        Err(e) => Some(format!("'{}' is not a valid URL: {}", value, e)),
+        Ok(url) if url.scheme() != "http" && url.scheme() != "https" => {
+            Some(format!("'{}' must use http or https scheme", value))
+        }
+        Ok(url) if url.host().is_none() => Some(format!("'{}' has no host", value)),
+        Ok(_) => None,
+    }
+}
+
 impl WatchedContract {
     /// The interval this contract is polled at: its own override, or `default`
     /// (the top-level `poll_interval_seconds`).
@@ -270,6 +406,16 @@ impl WatchedContract {
     }
 
     pub fn validate(&mut self) -> Result<()> {
+        ValidationErrors::into_result(self.collect_errors())
+    }
+
+    /// Runs every contract check and returns all failures instead of stopping
+    /// at the first one.
+    fn collect_errors(&mut self) -> Vec<String> {
+        let mut errors = Vec::new();
+
+        if self.label.trim().is_empty() {
+            errors.push("a contract has an empty label".to_owned());
         self.label = self.label.trim().to_owned();
         if self.label.is_empty() {
             bail!("a contract has an empty label");
@@ -298,47 +444,55 @@ impl WatchedContract {
 
         // Stellar contract addresses start with 'C' and are 56 chars (base32)
         if self.contract_id.len() != 56 || !self.contract_id.starts_with('C') {
-            bail!(
+            errors.push(format!(
                 "contract '{}': contract_id '{}' is not a valid Stellar contract address \
                  (must start with 'C' and be 56 characters)",
-                self.label,
-                self.contract_id
-            );
+                self.label, self.contract_id
+            ));
         }
 
-        let parsed_url = Url::parse(&self.webhook_url).map_err(|e| {
-            anyhow::anyhow!(
-                "contract '{}': webhook_url '{}' is not a valid URL: {}",
-                self.label,
-                self.webhook_url,
-                e
-            )
-        })?;
-        if parsed_url.scheme() != "http" && parsed_url.scheme() != "https" {
-            bail!(
-                "contract '{}': webhook_url '{}' must use http or https scheme",
-                self.label,
-                self.webhook_url
-            );
+        if let Some(problem) = check_http_url(&self.webhook_url) {
+            errors.push(format!(
+                "contract '{}': webhook_url {}",
+                self.label, problem
+            ));
         }
-        if parsed_url.host().is_none() {
-            bail!(
-                "contract '{}': webhook_url '{}' has no host",
-                self.label,
-                self.webhook_url
-            );
+
+        if let Network::Custom(custom) = &mut self.network {
+            // Links and request URLs are built as "<base>/...".
+            custom.horizon_url = custom.horizon_url.trim_end_matches('/').to_owned();
+            if let Some(problem) = check_http_url(&custom.horizon_url) {
+                errors.push(format!(
+                    "contract '{}': network horizon_url {}",
+                    self.label, problem
+                ));
+            }
+            if let Some(explorer_url) = &mut custom.explorer_url {
+                *explorer_url = explorer_url.trim_end_matches('/').to_owned();
+                if let Some(problem) = check_http_url(explorer_url) {
+                    errors.push(format!(
+                        "contract '{}': network explorer_url {}",
+                        self.label, problem
+                    ));
+                }
+            }
         }
 
         if self.rules.is_empty() {
-            bail!("contract '{}': at least one rule is required", self.label);
+            errors.push(format!(
+                "contract '{}': at least one rule is required",
+                self.label
+            ));
         }
 
         let label = self.label.clone();
         for rule in &mut self.rules {
-            rule.validate(&label)?;
+            if let Err(e) = rule.validate(&label) {
+                errors.push(e.to_string());
+            }
         }
 
-        Ok(())
+        errors
     }
 }
 
@@ -448,7 +602,14 @@ impl AppConfig {
         Ok(cfg)
     }
 
+    /// Validates the whole config and reports every error found, not just the first.
     pub fn validate(&mut self) -> Result<()> {
+        let mut errors = Vec::new();
+        if self.poll_interval_seconds < 5 {
+            errors.push("poll_interval_seconds must be >= 5".to_owned());
+        }
+        if self.poll_interval_seconds > 3600 {
+            errors.push("poll_interval_seconds must be <= 3600 (1 hour)".to_owned());
         validate_poll_interval(self.poll_interval_seconds, "poll_interval_seconds")?;
         if self.http_pool_max_idle_per_host == 0
             || self.http_pool_max_idle_per_host > MAX_HTTP_POOL_MAX_IDLE_PER_HOST
@@ -465,20 +626,23 @@ impl AppConfig {
             );
         }
         if self.contracts.is_empty() {
-            bail!("at least one [[contracts]] entry is required");
+            errors.push("at least one [[contracts]] entry is required".to_owned());
         }
         for contract in &mut self.contracts {
-            contract.validate()?;
+            errors.extend(contract.collect_errors());
         }
         // Labels are already trimmed by `WatchedContract::validate`; compare
         // case-insensitively so "Vault" and "vault" count as duplicates.
         let mut seen = std::collections::HashSet::new();
+        let mut reported = std::collections::HashSet::new();
         for contract in &self.contracts {
+            if !seen.insert(&contract.label) && reported.insert(&contract.label) {
+                errors.push(format!("duplicate contract label '{}'", contract.label));
             if !seen.insert(contract.label.to_lowercase()) {
                 bail!("duplicate contract label '{}'", contract.label);
             }
         }
-        Ok(())
+        ValidationErrors::into_result(errors)
     }
 }
 
@@ -672,8 +836,140 @@ mod tests {
 
     #[test]
     fn network_explorer_urls() {
-        assert!(Network::Mainnet.explorer_base_url().contains("public"));
-        assert!(Network::Testnet.explorer_base_url().contains("testnet"));
+        assert!(Network::Mainnet
+            .explorer_base_url()
+            .unwrap()
+            .contains("public"));
+        assert!(Network::Testnet
+            .explorer_base_url()
+            .unwrap()
+            .contains("testnet"));
+    }
+
+    // ── #99: custom / local network ──────────────────────────────────────────
+
+    const CUSTOM_NETWORK_TOML: &str = r#"
+        [[contracts]]
+        label = "local"
+        contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        network = { horizon_url = "http://localhost:8000/", passphrase = "Standalone Network ; February 2017" }
+        webhook_url = "https://example.com/hook"
+        [[contracts.rules]]
+        type = "AnyTransaction"
+    "#;
+
+    fn parse_with_interval(contracts_toml: &str) -> AppConfig {
+        toml::from_str(&format!("poll_interval_seconds = 10\n{}", contracts_toml)).unwrap()
+    }
+
+    #[test]
+    fn custom_network_parses_and_validates() {
+        let mut cfg = parse_with_interval(CUSTOM_NETWORK_TOML);
+        cfg.validate().unwrap();
+        let network = &cfg.contracts[0].network;
+        assert_eq!(
+            network,
+            &Network::Custom(CustomNetwork {
+                horizon_url: "http://localhost:8000".into(),
+                explorer_url: None,
+                passphrase: Some("Standalone Network ; February 2017".into()),
+            })
+        );
+        assert_eq!(network.horizon_base_url(), "http://localhost:8000");
+        assert_eq!(network.explorer_base_url(), None);
+        assert_eq!(network.as_str(), "custom");
+        assert_eq!(network.display_name(), "Custom Network");
+    }
+
+    #[test]
+    fn custom_network_requires_horizon_url() {
+        let raw = CUSTOM_NETWORK_TOML.replace(
+            r#"{ horizon_url = "http://localhost:8000/", passphrase"#,
+            r#"{ passphrase"#,
+        );
+        let err = toml::from_str::<AppConfig>(&format!("poll_interval_seconds = 10\n{}", raw))
+            .unwrap_err();
+        assert!(err.to_string().contains("horizon_url"), "got: {}", err);
+    }
+
+    #[test]
+    fn custom_network_rejects_invalid_urls() {
+        let raw = CUSTOM_NETWORK_TOML.replace(
+            r#"horizon_url = "http://localhost:8000/""#,
+            r#"horizon_url = "ftp://localhost", explorer_url = "not a url""#,
+        );
+        let err = parse_with_interval(&raw)
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("contract 'local': network horizon_url"),
+            "got: {}",
+            err
+        );
+        assert!(
+            err.contains("contract 'local': network explorer_url"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn unknown_network_name_is_still_rejected_with_variant_list() {
+        let raw = CUSTOM_NETWORK_TOML.replace(
+            r#"{ horizon_url = "http://localhost:8000/", passphrase = "Standalone Network ; February 2017" }"#,
+            r#""main""#,
+        );
+        let err = toml::from_str::<AppConfig>(&format!("poll_interval_seconds = 10\n{}", raw))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "unknown variant `main`, expected one of `mainnet`, `testnet`, `futurenet`"
+            ),
+            "got: {}",
+            err
+        );
+    }
+
+    // ── #101: all validation errors reported together ────────────────────────
+
+    #[test]
+    fn validate_reports_all_errors_together() {
+        let mut bad_id = valid_contract();
+        bad_id.label = "A".into();
+        bad_id.contract_id = "CSHORT".into();
+        bad_id.webhook_url = "ftp://bad".into();
+        let mut bad_rule = valid_contract();
+        bad_rule.label = "B".into();
+        bad_rule.rules = vec![AlertRule::LargeTransfer { threshold_xlm: 0 }];
+        let mut cfg = AppConfig {
+            poll_interval_seconds: 1,
+            contracts: vec![bad_id, bad_rule, valid_contract(), valid_contract()],
+            http_pool_max_idle_per_host: None,
+            http_tcp_keepalive_secs: None,
+            http_connection_verbose: None,
+            cursor_file: None,
+        };
+        let err = cfg.validate().unwrap_err();
+        let errors = &err.downcast_ref::<ValidationErrors>().unwrap().0;
+        assert_eq!(
+            errors,
+            &[
+                "poll_interval_seconds must be >= 5".to_owned(),
+                "contract 'A': contract_id 'CSHORT' is not a valid Stellar contract address \
+                 (must start with 'C' and be 56 characters)"
+                    .to_owned(),
+                "contract 'A': webhook_url 'ftp://bad' must use http or https scheme".to_owned(),
+                "contract 'B': LargeTransfer threshold_xlm must be > 0".to_owned(),
+                "duplicate contract label 'Test'".to_owned(),
+            ]
+        );
+        let text = err.to_string();
+        assert!(
+            text.starts_with("5 configuration errors:\n  - "),
+            "got: {}",
+            text
+        );
     }
 
     #[test]

@@ -2,10 +2,17 @@ use std::{fs, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand, ValueEnum};
 use futures::future::join_all;
 use reqwest::{Client, StatusCode};
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use txwatch_config::AppConfig;
 use txwatch_notifier::{build_client, send_webhook_simple, test_payload_with_network};
 
@@ -28,16 +35,38 @@ const VERSION: &str = concat!(
 )]
 struct Cli {
     /// Path to the TOML config file
-    #[arg(short, long, default_value = "config/example.toml")]
-    config: Option<PathBuf>,
+    #[arg(short, long, env = "TXWATCH_CONFIG", default_value = "txwatch.toml")]
+    config: PathBuf,
+
+    /// Log output format: human-readable text or one JSON object per line
+    #[arg(long, global = true, value_enum, env = "TXWATCH_LOG_FORMAT", default_value = "text")]
+    log_format: LogFormat,
+
+    /// Override the Horizon base URL for every contract (e.g. a private Horizon instance)
+    #[arg(long, global = true)]
+    horizon_url: Option<String>,
 
     #[command(subcommand)]
     command: Command,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum LogFormat {
+    Text,
+    Json,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum OutputFormat {
+    Text,
+    Json,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Start the polling engine (watches all contracts in the config)
+    ///
+    /// With --once, exit codes: 0 = every poll and webhook delivery succeeded, 1 = otherwise
     Watch {
         /// Do not actually send webhooks; only log matched rules
         #[arg(long)]
@@ -47,6 +76,9 @@ enum Command {
         #[cfg(feature = "metrics")]
         #[arg(long)]
         metrics_addr: Option<std::net::SocketAddr>,
+        /// Run a single poll cycle, deliver alerts, save cursors and exit
+        #[arg(long)]
+        once: bool,
     },
 
     /// Parse and validate the config file, then print a summary
@@ -60,6 +92,11 @@ enum Command {
         /// Verify that each contract exists on its configured Horizon network.
         #[arg(long)]
         check_horizon: bool,
+
+        /// Output format. `json` prints the parsed config (secrets redacted) or the
+        /// validation error as a single JSON object on stdout.
+        #[arg(long, value_enum, default_value = "text", conflicts_with_all = ["check_webhooks", "check_horizon"])]
+        format: OutputFormat,
     },
 
     /// Send a test webhook payload to a URL and exit
@@ -120,6 +157,22 @@ enum Command {
         /// Overwrite the output file if it already exists
         #[arg(long)]
         force: bool,
+    /// Evaluate a contract's rules against one historical transaction
+    ///
+    /// Prints the rules that matched and their webhook payloads. Nothing is sent
+    /// unless --send is given. Exit codes: 0 = done, 1 = lookup or delivery failed
+    Replay {
+        /// Label of the configured contract whose rules to evaluate
+        #[arg(long)]
+        contract: String,
+
+        /// Transaction hash to replay
+        #[arg(long)]
+        tx: String,
+
+        /// Also deliver the resulting webhooks to the contract's webhook_url
+        #[arg(long)]
+        send: bool,
     },
 }
 
@@ -127,13 +180,25 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_tracing();
-
     let cli = Cli::parse();
+    init_tracing(cli.log_format);
 
     match cli.command {
-        Command::Validate { check_webhooks, check_horizon } => {
+        Command::Validate { format: OutputFormat::Json, .. } => {
+            match AppConfig::from_file(&required_config(&cli)?) {
+                Ok(cfg) => println!("{}", serde_json::to_string_pretty(&config_summary_json(&cfg))?),
+                Err(e) => {
+                    let error = serde_json::json!({ "valid": false, "error": format!("{:#}", e) });
+                    println!("{}", serde_json::to_string_pretty(&error)?);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Command::Validate { check_webhooks, check_horizon, .. } => {
             let cfg = AppConfig::from_file(&required_config(&cli)?)?;
+        Command::Validate { check_webhooks, check_horizon } => {
+            let cfg = AppConfig::from_file(&required_config(&cli.config)?)?;
             println!("Config is valid.");
             println!("  poll_interval_seconds : {}", cfg.poll_interval_seconds);
             println!("  contracts             : {}", cfg.contracts.len());
@@ -168,11 +233,12 @@ async fn main() -> Result<()> {
                     println!("      - {}", rule.label());
                 }
                 println!("    horizon      : {}", c.network.horizon_base_url());
-                println!(
-                    "    explorer     : {}/contract/{}",
-                    c.network.explorer_base_url(),
-                    c.contract_id
-                );
+                match c.network.explorer_base_url() {
+                    Some(explorer) => {
+                        println!("    explorer     : {}/contract/{}", explorer, c.contract_id)
+                    }
+                    None => println!("    explorer     : none"),
+                }
             }
 
             if check_webhooks {
@@ -211,8 +277,7 @@ async fn main() -> Result<()> {
 
         Command::TestWebhook { url, label, network, contract, secret } => {
             let configured = contract.as_ref().map(|wanted| {
-                let path = cli.config.as_ref().ok_or_else(|| anyhow::anyhow!("--contract requires --config"))?;
-                let cfg = AppConfig::from_file(path)?;
+                let cfg = AppConfig::from_file(&required_config(&cli.config)?)?;
                 cfg.contracts.into_iter().find(|c| c.label == *wanted).ok_or_else(|| anyhow::anyhow!("configured contract '{}' not found", wanted))
             }).transpose()?;
             let (url, network_name, horizon_base_url, secret) = if let Some(c) = configured {
@@ -261,6 +326,30 @@ async fn main() -> Result<()> {
                 // The reader (e.g. `| head`) closing early isn't an error.
                 Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
                 other => other.context("failed to render the man page")?,
+        Command::Replay { ref contract, ref tx, send } => {
+            let cfg = load_config(&cli)?;
+            let contract = cfg
+                .contracts
+                .into_iter()
+                .find(|c| c.label == *contract)
+                .ok_or_else(|| anyhow::anyhow!("configured contract '{}' not found", contract))?;
+            let client = build_client().context("failed to build HTTP client")?;
+
+            let payloads = txwatch_poller::replay_transaction(&client, &contract, tx).await?;
+            println!("{} rule(s) matched transaction {} for '{}'", payloads.len(), tx, contract.label);
+            for payload in &payloads {
+                println!();
+                println!("  rule: {}", payload.rule_triggered);
+                println!("{}", serde_json::to_string_pretty(payload)?);
+            }
+
+            if send {
+                for payload in &payloads {
+                    let result = send_webhook_simple(&client, &contract.webhook_url, payload, contract.webhook_secret.as_deref())
+                        .await
+                        .with_context(|| format!("webhook for rule '{}' to '{}' failed", payload.rule_triggered, contract.webhook_url))?;
+                    println!("Delivered '{}' to {} (status {})", payload.rule_triggered, contract.webhook_url, result.final_status);
+                }
             }
         }
 
@@ -272,6 +361,31 @@ async fn main() -> Result<()> {
             metrics_addr,
         } => {
             let cfg = AppConfig::from_file(&required_config(&cli)?)?;
+        Command::Watch { dry_run, once } => {
+            let cfg = load_config(&cli)?;
+
+            if once {
+                info!(version = VERSION, contracts = cfg.contracts.len(), dry_run, "running a single TxWatch poll cycle");
+                let report = txwatch_poller::run_once(cfg, dry_run).await?;
+                info!(
+                    transactions = report.transactions,
+                    alerts = report.alerts,
+                    poll_failures = report.poll_failures,
+                    webhook_failures = report.webhook_failures,
+                    "poll cycle finished"
+                );
+                if !report.is_success() {
+                    return Err(anyhow::anyhow!(
+                        "poll cycle had {} failed contract poll(s) and {} failed webhook delivery(ies)",
+                        report.poll_failures,
+                        report.webhook_failures
+                    ));
+                }
+                return Ok(());
+            }
+        Command::Watch { dry_run } => {
+            let config_path = required_config(&cli.config)?;
+            let cfg = AppConfig::from_file(&config_path)?;
 
             // Graceful shutdown: allow the current poll cycle to finish before exiting.
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -287,6 +401,8 @@ async fn main() -> Result<()> {
             if let Some(addr) = metrics_addr {
                 txwatch_poller::serve_metrics(addr, shutdown_rx.clone()).await?;
             }
+            let (reload_tx, reload_rx) = tokio::sync::mpsc::channel(1);
+            spawn_reload_on_sighup(config_path, reload_tx)?;
 
             info!(
                 version = VERSION,
@@ -295,7 +411,7 @@ async fn main() -> Result<()> {
                 dry_run = dry_run,
                 "starting TxWatch"
             );
-            txwatch_poller::run_with_shutdown(cfg, dry_run, shutdown_rx).await?;
+            txwatch_poller::run_with_reload(cfg, dry_run, shutdown_rx, reload_rx).await?;
         }
     }
 
@@ -346,6 +462,99 @@ webhook_url = {webhook_url}
 
 fn required_config(cli: &Cli) -> Result<PathBuf> {
     Ok(cli.config.clone().unwrap_or_else(|| PathBuf::from("config/example.toml")))
+/// The config path from `--config`, `TXWATCH_CONFIG` or the `./txwatch.toml`
+/// default, which must exist.
+fn required_config(path: &Path) -> Result<PathBuf> {
+    if !path.exists() {
+        anyhow::bail!(
+            "config file '{}' not found. Pass --config <path>, set TXWATCH_CONFIG, \
+             or create ./txwatch.toml (config/example.toml is a starting point)",
+            path.display()
+        );
+    }
+    Ok(path.to_path_buf())
+}
+
+/// On SIGHUP, re-read and validate the config file and hand it to the poller.
+/// An invalid file is logged and ignored, so the previous config keeps running.
+#[cfg(unix)]
+fn spawn_reload_on_sighup(
+    path: PathBuf,
+    reload_tx: tokio::sync::mpsc::Sender<AppConfig>,
+) -> Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut hangup = signal(SignalKind::hangup()).context("failed to install SIGHUP handler")?;
+    tokio::spawn(async move {
+        while hangup.recv().await.is_some() {
+            info!(path = %path.display(), "SIGHUP received — reloading config");
+            if let Some(cfg) = reload_config(&path) {
+                if reload_tx.send(cfg).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn spawn_reload_on_sighup(
+    _path: PathBuf,
+    _reload_tx: tokio::sync::mpsc::Sender<AppConfig>,
+) -> Result<()> {
+    Ok(())
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+fn reload_config(path: &Path) -> Option<AppConfig> {
+    match AppConfig::from_file(path) {
+        Ok(cfg) => Some(cfg),
+        Err(e) => {
+            error!(error = %format!("{:#}", e), "config reload failed — keeping the previous config");
+            None
+        }
+    }
+}
+
+/// Load the config and apply `--horizon-url`, if given, to every contract.
+fn load_config(cli: &Cli) -> Result<AppConfig> {
+    let mut cfg = AppConfig::from_file(&required_config(cli)?)?;
+    if let Some(url) = &cli.horizon_url {
+        let url = url.trim_end_matches('/');
+        for c in &mut cfg.contracts {
+            c.horizon_base_url_override = Some(url.to_string());
+        }
+    }
+    Ok(cfg)
+}
+
+/// Machine-readable `validate` summary. Webhook secrets are never printed;
+/// only whether one is set.
+fn config_summary_json(cfg: &AppConfig) -> serde_json::Value {
+    let contracts: Vec<_> = cfg
+        .contracts
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "label": c.label,
+                "contract_id": c.contract_id,
+                "network": c.network.as_str(),
+                "poll_interval_seconds": c.effective_poll_interval(cfg.poll_interval_seconds),
+                "webhook_url": c.webhook_url,
+                "webhook_secret_set": c.webhook_secret.is_some(),
+                "rules": c.rules,
+                "horizon_url": c.network.horizon_base_url(),
+                "explorer_url": format!("{}/contract/{}", c.network.explorer_base_url(), c.contract_id),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "valid": true,
+        "poll_interval_seconds": cfg.poll_interval_seconds,
+        "cursor_file": cfg.cursor_file,
+        "contracts": contracts,
+    })
 }
 
 async fn check_webhook_reachable(client: &Client, url: &str) -> Result<&'static str> {
@@ -399,12 +608,21 @@ async fn check_horizon_contract(client: &Client, contract: &txwatch_config::Watc
 }
 // ── Tracing initialisation ────────────────────────────────────────────────────
 
-fn init_tracing() {
+fn init_tracing(format: LogFormat) {
     use tracing_subscriber::{fmt, EnvFilter};
-    fmt()
+    let builder = fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
-        .with_target(false)
-        .init();
+        .with_target(false);
+    match format {
+        LogFormat::Text => builder.init(),
+        // One JSON object per line, with the current span and the full span
+        // list so fields such as `contract` and `tx` stay structured.
+        LogFormat::Json => builder
+            .json()
+            .with_current_span(true)
+            .with_span_list(true)
+            .init(),
+    }
 }

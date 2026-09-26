@@ -178,6 +178,23 @@ fn validate_exits_one_for_invalid_config() {
 }
 
 #[test]
+fn validate_prints_every_error_and_exits_one() {
+    const MULTI_ERROR_CONFIG: &str = r#"
+poll_interval_seconds = 1
+
+[[contracts]]
+label       = "Alpha"
+contract_id = "CSHORT"
+network     = "testnet"
+webhook_url = "ftp://hooks.example.com/alpha"
+
+  [[contracts.rules]]
+  type          = "LargeTransfer"
+  threshold_xlm = 0
+"#;
+
+    let path = env::temp_dir().join("txwatch_validate_multi_error_test.toml");
+    fs::write(&path, MULTI_ERROR_CONFIG).unwrap();
 fn validate_output_shows_effective_poll_interval_per_contract() {
     const OVERRIDE_CONFIG: &str = r#"
 [[contracts]]
@@ -208,6 +225,17 @@ webhook_url = "https://hooks.example.com/default"
         .output()
         .expect("failed to run txwatch");
 
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for expected in [
+        "4 configuration errors:",
+        "  - poll_interval_seconds must be >= 5",
+        "  - contract 'Alpha': contract_id 'CSHORT' is not a valid Stellar contract address",
+        "  - contract 'Alpha': webhook_url 'ftp://hooks.example.com/alpha' must use http or https scheme",
+        "  - contract 'Alpha': LargeTransfer threshold_xlm must be > 0",
+    ] {
+        assert!(stderr.contains(expected), "missing {:?} in:\n{}", expected, stderr);
+    }
     assert!(
         output.status.success(),
         "expected exit code 0 for valid config"
@@ -224,4 +252,103 @@ webhook_url = "https://hooks.example.com/default"
         stdout
     );
     assert!(stdout.contains("    interval     : 10s\n"), "{}", stdout);
+}
+
+#[test]
+fn validate_json_output_snapshot() {
+    const JSON_CONFIG: &str = r#"
+poll_interval_seconds = 10
+
+[[contracts]]
+label          = "Test Contract"
+contract_id    = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+network        = "testnet"
+webhook_url    = "https://hooks.example.com/test"
+webhook_secret = "super-secret-value"
+
+  [[contracts.rules]]
+  type = "AnyTransaction"
+"#;
+
+    let dir = env::temp_dir();
+    let path = dir.join("txwatch_validate_json_snapshot_test.toml");
+    fs::write(&path, JSON_CONFIG).unwrap();
+
+    let output = txwatch_bin()
+        .args([
+            "--config",
+            path.to_str().unwrap(),
+            "validate",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run txwatch");
+
+    assert!(
+        output.status.success(),
+        "expected exit code 0 for valid config"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("super-secret-value"),
+        "webhook secret must be redacted"
+    );
+    let expected = r#"{
+  "contracts": [
+    {
+      "contract_id": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "explorer_url": "https://stellar.expert/explorer/testnet/contract/CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "horizon_url": "https://horizon-testnet.stellar.org",
+      "label": "Test Contract",
+      "network": "testnet",
+      "poll_interval_seconds": 10,
+      "rules": [
+        {
+          "type": "AnyTransaction"
+        }
+      ],
+      "webhook_secret_set": true,
+      "webhook_url": "https://hooks.example.com/test"
+    }
+  ],
+  "cursor_file": null,
+  "poll_interval_seconds": 10,
+  "valid": true
+}
+"#;
+    assert_eq!(stdout, expected);
+}
+
+#[test]
+fn validate_json_reports_errors() {
+    let dir = env::temp_dir();
+    let path = dir.join("txwatch_validate_json_invalid_test.toml");
+    fs::write(&path, "this is not valid toml = = =").unwrap();
+
+    let output = txwatch_bin()
+        .args([
+            "--config",
+            path.to_str().unwrap(),
+            "validate",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run txwatch");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "expected exit code 1 for invalid config"
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout must be a JSON object");
+    assert_eq!(json["valid"], false);
+    assert!(json["error"]
+        .as_str()
+        .unwrap()
+        .contains("failed to parse config file"));
 }

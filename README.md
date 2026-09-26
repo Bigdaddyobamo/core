@@ -63,6 +63,7 @@ subscriptions, no infrastructure beyond a single Rust binary.
 | Mainnet | `https://horizon.stellar.org` |
 | Testnet | `https://horizon-testnet.stellar.org` |
 | Futurenet | `https://horizon-futurenet.stellar.org` |
+| Custom / local | Your own `horizon_url`, e.g. `http://localhost:8000` for `stellar/quickstart --local` |
 
 ---
 
@@ -73,20 +74,22 @@ subscriptions, no infrastructure beyond a single Rust binary.
 git clone https://github.com/Tx-wats/core
 cd tx-watch-core
 
-# 2. Copy and edit the example config
-cp config/example.toml config/my-config.toml
-$EDITOR config/my-config.toml
+# 2. Copy and edit the example config (./txwatch.toml is the default path)
+cp config/example.toml txwatch.toml
+$EDITOR txwatch.toml
 
 # 3. Validate your config
-cargo run -p txwatch -- --config config/my-config.toml validate
+cargo run -p txwatch -- validate
 
 # 4. Send a test webhook to confirm your receiver works
-cargo run -p txwatch -- --config config/my-config.toml \
-  test-webhook --url https://hooks.example.com/my-webhook
+cargo run -p txwatch -- test-webhook --url https://hooks.example.com/my-webhook
 
 # 5. Start watching
-cargo run -p txwatch -- --config config/my-config.toml watch
+cargo run -p txwatch -- watch
 ```
+
+To pick up config changes without restarting (and without losing cursors),
+send `SIGHUP`: `kill -HUP <pid>`. An invalid file is logged and ignored.
 
 Set `RUST_LOG=debug` for verbose output. This also enables per-contract idle
 poll logs — the poller emits `"no new transactions"` debug messages with the
@@ -102,17 +105,20 @@ Build the image:
 docker build -t txwatch .
 ```
 
-Run with a config file:
+Run with a config file (the image reads `TXWATCH_CONFIG=/config/txwatch.toml`):
 
 ```bash
-docker run -v $(pwd)/config.toml:/config.toml txwatch --config /config.toml watch
+docker run -v $(pwd)/txwatch.toml:/config/txwatch.toml txwatch watch
 ```
 
 Or validate your config:
 
 ```bash
-docker run -v $(pwd)/config.toml:/config.toml txwatch --config /config.toml validate
+docker run -v $(pwd)/txwatch.toml:/config/txwatch.toml txwatch validate
 ```
+
+To watch contracts on a local standalone network, `docker compose -f docker-compose.local.yml up`
+starts `stellar/quickstart --local` together with TxWatch using [`config/local.toml`](config/local.toml).
 
 For local development with webhook testing, see [Local Development with Docker Compose](#local-development-with-docker-compose) in [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -143,6 +149,29 @@ The generated file is validated before it's written, and an existing file is onl
 `--force`.
 
 `--config` defaults to `config/example.toml`.
+  watch [--once] [--dry-run]     Start the polling engine
+  validate [--format text|json]  Validate the config file and print a summary
+  test-webhook --url <URL>       Send a test payload to a webhook URL and exit
+  replay --contract <label> --tx <hash> [--send]
+                                 Evaluate a contract's rules against one transaction
+```
+
+`replay` fetches a historical transaction and its operations from Horizon, runs the named
+contract's rules against it and prints every matched rule with its webhook payload, so rule authors
+can check "would my rules have fired for transaction X?". Nothing is sent unless `--send` is given.
+
+`validate --format json` prints the parsed config as a single JSON object (webhook secrets are
+redacted to `webhook_secret_set`), or `{"valid": false, "error": "..."}` with exit code 1.
+
+`--config` defaults to `config/example.toml`. `--horizon-url <URL>` overrides the Horizon base URL
+for every contract (for example a private Horizon instance).
+
+`watch --once` runs a single poll cycle, delivers any alerts, saves cursors to `cursor_file` (if
+configured) and exits, for use from cron, CI jobs or serverless schedulers. It exits `1` if any
+contract poll or webhook delivery failed, `0` otherwise. Set `cursor_file` so each run picks up
+where the previous one stopped; without it every run starts from `now`.
+The config path comes from `--config`, else the `TXWATCH_CONFIG` environment variable, else
+`./txwatch.toml`. TxWatch exits with an error if that file does not exist.
 
 ---
 
@@ -262,6 +291,16 @@ TxWatch uses `tracing` spans to correlate work across each poll cycle and webhoo
 - `txwatch-notifier::send_webhook` creates a span with `contract` and `rule` fields before sending the webhook request.
 
 Set `RUST_LOG=info` or a more specific filter to view structured tracing output in the CLI.
+
+Logs are human-readable text by default. For log pipelines (Loki, Datadog, CloudWatch), pass
+`--log-format json` or set `TXWATCH_LOG_FORMAT=json` to emit one JSON object per line. Event
+fields (`contract`, `tx`, `rule`, `attempt`, ...) stay as JSON fields, and each line includes the
+current span and the full span list:
+
+```sh
+txwatch --log-format json watch
+TXWATCH_LOG_FORMAT=json txwatch watch
+```
 
 ### Prometheus metrics (optional)
 
