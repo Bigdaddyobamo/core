@@ -277,13 +277,19 @@ async fn main() -> Result<()> {
                 let cfg = AppConfig::from_file(&required_config(&cli.config)?)?;
                 cfg.contracts.into_iter().find(|c| c.label == *wanted).ok_or_else(|| anyhow::anyhow!("configured contract '{}' not found", wanted))
             }).transpose()?;
-            let (url, network_name, horizon_base_url, secret) = if let Some(c) = configured {
-                (c.webhook_url, c.network.as_str().to_owned(), c.network.horizon_base_url().to_owned(), secret.or(c.webhook_secret))
+            let (url, network, secret) = if let Some(c) = configured {
+                (c.webhook_url, c.network, secret.or(c.webhook_secret))
             } else {
                 let selected = match network.as_str() { "mainnet" => txwatch_config::Network::Mainnet, "testnet" => txwatch_config::Network::Testnet, "futurenet" => txwatch_config::Network::Futurenet, other => return Err(anyhow::anyhow!("unknown network '{}'", other)) };
-                (url.ok_or_else(|| anyhow::anyhow!("--url is required unless --contract is provided"))?, network, selected.horizon_base_url().to_owned(), secret)
+                (url.ok_or_else(|| anyhow::anyhow!("--url is required unless --contract is provided"))?, selected, secret)
             };
-            let payload = test_payload_with_network(&label, &url, &network_name, &horizon_base_url);
+            let payload = test_payload_with_network(
+                &label,
+                &url,
+                network.as_str(),
+                network.horizon_base_url(),
+                network.explorer_base_url(),
+            );
             let client = build_client().context("failed to build HTTP client")?;
 
             info!(url = %url, "sending test webhook");

@@ -176,15 +176,20 @@ pub fn test_payload(label: &str, webhook_url: &str) -> AlertPayload {
         webhook_url,
         "testnet",
         "https://horizon-testnet.stellar.org",
+        Some("https://stellar.expert/explorer/testnet"),
     )
 }
 
-/// Build a synthetic `AlertPayload` with an explicit network name and Horizon base URL.
+/// Build a synthetic `AlertPayload` for a network. Pass the network's own
+/// `Network::as_str()`, `horizon_base_url()` and `explorer_base_url()`: the
+/// explorer path is not the network name (mainnet is `/explorer/public`). A
+/// network without an explorer links to the transaction on Horizon instead.
 pub fn test_payload_with_network(
     label: &str,
     webhook_url: &str,
     network: &str,
     horizon_base_url: &str,
+    explorer_base_url: Option<&str>,
 ) -> AlertPayload {
     let now = Utc::now();
     let tx_hash = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -202,7 +207,10 @@ pub fn test_payload_with_network(
         timestamp: now.timestamp(),
         timestamp_iso: now.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         horizon_link: format!("{}/transactions/{}", horizon_base_url, tx_hash),
-        explorer_link: format!("https://stellar.expert/explorer/{}/tx/{}", network, tx_hash),
+        explorer_link: match explorer_base_url {
+            Some(explorer) => format!("{}/tx/{}", explorer, tx_hash),
+            None => format!("{}/transactions/{}", horizon_base_url, tx_hash),
+        },
     }
     .with_label(format!("{} (test-webhook to {})", label, webhook_url))
 }
@@ -479,16 +487,60 @@ mod tests {
     /// Issue #13: test_payload_with_network derives links from the supplied network config.
     #[test]
     fn test_payload_with_network_derives_links_from_config() {
+        let network = txwatch_config::Network::Mainnet;
         let p = test_payload_with_network(
             "Label",
             "https://example.com/hook",
-            "mainnet",
-            "https://horizon.stellar.org",
+            network.as_str(),
+            network.horizon_base_url(),
+            network.explorer_base_url(),
         );
         assert!(p
             .horizon_link
             .starts_with("https://horizon.stellar.org/transactions/"));
-        assert!(p.explorer_link.contains("/mainnet/"));
+        assert!(
+            p.explorer_link
+                .starts_with("https://stellar.expert/explorer/public/tx/"),
+            "mainnet explorer path is /explorer/public/, got {}",
+            p.explorer_link
+        );
+    }
+
+    #[test]
+    fn test_payload_with_network_uses_futurenet_explorer() {
+        let network = txwatch_config::Network::Futurenet;
+        let p = test_payload_with_network(
+            "Label",
+            "https://example.com/hook",
+            network.as_str(),
+            network.horizon_base_url(),
+            network.explorer_base_url(),
+        );
+        assert_eq!(p.network, "futurenet");
+        assert!(p
+            .horizon_link
+            .starts_with("https://horizon-futurenet.stellar.org/transactions/"));
+        assert!(
+            p.explorer_link
+                .starts_with("https://stellar.expert/explorer/futurenet/tx/"),
+            "got {}",
+            p.explorer_link
+        );
+    }
+
+    #[test]
+    fn test_payload_without_explorer_links_to_horizon() {
+        let p = test_payload_with_network(
+            "Label",
+            "https://example.com/hook",
+            "custom",
+            "http://localhost:8000",
+            None,
+        );
+        assert_eq!(p.explorer_link, p.horizon_link);
+        assert!(p
+            .explorer_link
+            .starts_with("http://localhost:8000/transactions/"));
     }
 
     #[tokio::test]

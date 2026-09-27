@@ -2172,6 +2172,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tracing",
+ "txwatch-config",
  "txwatch-rules",
  "wiremock",
 ]
