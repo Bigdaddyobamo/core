@@ -15,7 +15,7 @@ docker compose up
 ```
 
 This runs:
-- **txwatch** — the main polling service (configured to watch the example contract)
+- **txwatch** — the main polling service, using `config/docker-compose.toml`: it watches the Testnet native XLM contract (always active) and sends every alert to the echo server
 - **webhook** — a local echo server listening on `http://localhost:8080` that logs all incoming POST requests
 
 ### Viewing webhook payloads
@@ -23,7 +23,14 @@ This runs:
 All webhook calls from txwatch are logged by the echo server. Watch the output in your terminal:
 
 ```
-webhook   | {"timestamp":"2025-02-28T...", "method":"POST", "url":"/webhook", "body":{...}}
+webhook   | {"timestamp":"2025-02-28T...", "method":"POST", "url":"/hook", "body":{...}}
+```
+
+To check delivery end to end without waiting for a transaction, send a test
+payload from the txwatch image to the echo server:
+
+```bash
+docker compose run --rm txwatch test-webhook --url http://webhook:8080/hook
 ```
 
 You can also inspect payloads by manually curling the webhook:
