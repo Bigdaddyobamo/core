@@ -6,10 +6,11 @@ pub fn contract(webhook_url: &str, rules: Vec<AlertRule>) -> WatchedContract {
         label: "Integration Test Contract".into(),
         contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
         network: Network::Testnet,
-        rules,
+        rules: rules.into_iter().map(Into::into).collect(),
         webhook_url: webhook_url.to_string(),
         webhook_secret: None,
         poll_interval_seconds: None,
+        soroban_rpc_url: None,
         horizon_base_url_override: None,
     }
 }

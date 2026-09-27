@@ -211,7 +211,11 @@ webhook_url = "https://hooks.example.com/my-webhook"
 | `LargeTransfer` | Payment amount ≥ `threshold_xlm` XLM |
 | `FunctionCalled` | A specific Soroban function is invoked |
 | `AdminFunctionCalled` | Any function in a named list is invoked |
-| `HighFee` | Transaction fee exceeds configured threshold |
+| `HighFee` | Transaction fee is greater than or equal to `threshold_stroops` (or `threshold_xlm`) |
+| `EventEmitted` | The transaction emitted a contract event whose first topic is a given symbol |
+
+Any rule can set `cooldown_seconds` to send at most one alert per window for that rule on that contract;
+suppressed matches are reported in `suppressed_count` on the next alert.
 
 See [docs/alert-rules.md](docs/alert-rules.md) for full details.
 
@@ -234,7 +238,9 @@ See [docs/alert-rules.md](docs/alert-rules.md) for full details.
   "timestamp":        1705316096,
   "timestamp_iso":    "2024-01-15T12:00:00Z",
   "horizon_link":     "https://horizon-testnet.stellar.org/transactions/abc123...",
-  "explorer_link":    "https://stellar.expert/explorer/testnet/tx/abc123..."
+  "explorer_link":    "https://stellar.expert/explorer/testnet/tx/abc123...",
+  "matched_events":   [],
+  "suppressed_count": 0
 }
 ```
 
@@ -250,6 +256,8 @@ See [docs/alert-rules.md](docs/alert-rules.md) for full details.
 - `rule_triggered` — human-readable rule description with parameters (e.g. `"LargeTransfer(>=10000XLM)"`); use this for display
 - `function_name` — the first invoked Soroban function name, or `null` for non-Soroban transactions.
 - `function_names` — all invoked Soroban function names in the transaction (may contain multiple entries for multi-op transactions).
+- `matched_events` — for `EventEmitted` alerts, the matching contract events (`contract_id`, `topics`, `data`, as decoded `ScVal` JSON); empty for other rules.
+- `suppressed_count` — matches of this rule suppressed by its `cooldown_seconds` since the previous alert; `0` otherwise.
 - `horizon_link` — direct Horizon REST API URL for the transaction (e.g. `https://horizon-testnet.stellar.org/transactions/<hash>`); useful for fetching raw XDR or operation details programmatically.
 - `explorer_link` — Stellar Expert web explorer URL for the transaction (e.g. `https://stellar.expert/explorer/testnet/tx/<hash>`); useful for human-readable inspection in a browser.
 

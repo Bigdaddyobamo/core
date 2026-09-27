@@ -54,6 +54,7 @@ Each entry defines one watched Soroban contract. At least one entry is required.
 | `rules`          | array of tables | yes      | The `[[contracts.rules]]` entries (see below). At least one is required. |
 | `webhook_url`    | string          | yes      | `http://` or `https://` URL with a host that receives the alert JSON. |
 | `poll_interval_seconds` | u64      | no       | Polls this contract at its own interval instead of the top-level `poll_interval_seconds`. Same bounds (5–3600). Contracts are scheduled independently; `txwatch validate` prints each contract's effective interval. |
+| `soroban_rpc_url` | string         | no       | Soroban RPC endpoint used to fetch contract events for `EventEmitted` rules. Defaults to `https://soroban-testnet.stellar.org` (testnet), `https://rpc-futurenet.stellar.org` (futurenet) or the custom network's `rpc_url`. Mainnet has no default, so a mainnet contract with an `EventEmitted` rule must set it. |
 | `webhook_secret` | string          | no       | When set, every webhook POST carries `X-TxWatch-Signature: sha256=<hex HMAC-SHA256 of the body>` **and** the raw secret in `X-TxWatch-Secret`. Supports `${ENV_VAR}` interpolation (e.g. `webhook_secret = "${MY_SECRET}"`); an unset variable is a startup error. |
 
 Unknown keys inside a `[[contracts]]` entry are rejected.
@@ -89,6 +90,7 @@ network = { horizon_url = "http://localhost:8000", passphrase = "Standalone Netw
 | `horizon_url`  | yes      | `http://` or `https://` Horizon base URL. |
 | `explorer_url` | no       | Explorer base URL; alert `explorer_link` becomes `<explorer_url>/tx/<hash>`. Without it, `explorer_link` is the transaction's Horizon URL. |
 | `passphrase`   | no       | Network passphrase, for reference. |
+| `rpc_url`      | no       | Soroban RPC URL used for `EventEmitted` rules (e.g. `http://localhost:8000/rpc` for quickstart). |
 
 Alert payloads and logs report such contracts with `network = "custom"`. See `docker-compose.local.yml` and
 `config/local.toml` for a ready-made quickstart + TxWatch setup.
@@ -96,6 +98,17 @@ Alert payloads and logs report such contracts with `network = "custom"`. See `do
 ## `[[contracts.rules]]`
 
 At least one rule is required per contract. All matching rules fire independently.
+
+Every rule accepts an optional `cooldown_seconds` (0–604800). After the rule fires for a contract, further
+matches within that many seconds are suppressed and counted; the next alert that is sent carries the count in
+`suppressed_count`. Unset or `0` disables the cooldown. Cooldown state is kept in memory by `txwatch watch`
+(it resets on restart), so it has no effect across separate `txwatch watch --once` runs.
+
+```toml
+[[contracts.rules]]
+type             = "TransactionFailed"
+cooldown_seconds = 300   # at most one alert every 5 minutes
+```
 
 ### `AnyTransaction`
 Fires on every transaction that appears in the contract's Horizon history.
@@ -143,14 +156,28 @@ function_names = ["set_admin", "upgrade", "initialize"]
 ```
 
 ### `HighFee`
-Fires when the transaction's charged fee is at least the threshold. Set exactly one of
+Fires when the transaction's charged fee is greater than or equal to the threshold. Set exactly one of
 `threshold_stroops` (raw stroops, must be > 0) or `threshold_xlm` (whole XLM, must be > 0;
-converted to stroops during validation). Setting both is rejected.
+converted to stroops during validation). The two are mutually exclusive; setting both is rejected.
 
 ```toml
 [[contracts.rules]]
 type              = "HighFee"
 threshold_stroops = 1000000
+```
+
+### `EventEmitted`
+Fires when the transaction emitted a Soroban contract event whose first topic is exactly the symbol `topic`
+(a valid Soroban symbol, e.g. `transfer`, `mint`, `admin_changed`). `topics` optionally constrains the following
+topics positionally; `"*"` matches any value. Events are fetched from Soroban RPC `getEvents` (see
+`soroban_rpc_url`); events older than the RPC's retention window (about 7 days on public endpoints) cannot be
+fetched, so this rule will not match them.
+
+```toml
+[[contracts.rules]]
+type   = "EventEmitted"
+topic  = "transfer"
+topics = ["*", "GDESTINATION..."]   # optional: topic 1 = any, topic 2 = this address
 ```
 
 ## Webhook payload
@@ -170,7 +197,9 @@ threshold_stroops = 1000000
   "timestamp":           1705316096,
   "timestamp_iso":       "2024-01-15T12:00:00Z",
   "horizon_link":        "https://horizon-testnet.stellar.org/transactions/abc123...",
-  "explorer_link":       "https://stellar.expert/explorer/testnet/tx/abc123..."
+  "explorer_link":       "https://stellar.expert/explorer/testnet/tx/abc123...",
+  "matched_events":      [],
+  "suppressed_count":    0
 }
 ```
 
@@ -184,6 +213,8 @@ This example and the one in the README are checked against `AlertPayload` by
 - `timestamp` / `timestamp_iso` — ledger close time as Unix seconds and as an ISO 8601 string.
 - `function_name` — the first invoked Soroban function name (present for backward compatibility).
 - `function_names` — all Soroban function names invoked in the transaction (one per `invoke_host_function` operation). Most transactions have zero or one entry.
+- `matched_events` — for `EventEmitted` alerts, the events that matched, each with `contract_id`, `topics` and `data` (decoded `ScVal` JSON, e.g. `{"symbol": "transfer"}`); empty for other rules.
+- `suppressed_count` — matches of this rule suppressed by its `cooldown_seconds` since the previous alert was sent; `0` otherwise.
 
 ## Environment variables
 
