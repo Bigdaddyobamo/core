@@ -93,6 +93,11 @@ impl EnrichedTransaction {
 /// The JSON body POSTed to the webhook URL when a rule fires.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AlertPayload {
+    /// Stable identifier of this alert (see [`alert_id`]): the same contract,
+    /// transaction and rule always produce the same ID, so receivers can
+    /// de-duplicate retries. Used as the PagerDuty `dedup_key`.
+    #[serde(default)]
+    pub alert_id: String,
     pub label: String,
     pub contract_id: String,
     pub network: String,
@@ -118,6 +123,21 @@ pub struct AlertPayload {
     pub explorer_link: String,
 }
 
+/// Deterministic alert ID: the first 32 hex characters (128 bits) of
+/// SHA-256 over `contract_id`, `transaction_hash` and `rule_triggered`.
+pub fn alert_id(contract_id: &str, transaction_hash: &str, rule_triggered: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for part in [contract_id, transaction_hash, rule_triggered] {
+        hasher.update(part.as_bytes());
+        // Separator so ("ab", "c") and ("a", "bc") differ.
+        hasher.update([0u8]);
+    }
+    let mut id = hex::encode(hasher.finalize());
+    id.truncate(32);
+    id
+}
+
 // ── Rule evaluation ───────────────────────────────────────────────────────────
 
 /// Evaluate all rules for one contract against one transaction.
@@ -141,6 +161,7 @@ pub fn evaluate(
         .iter()
         .filter_map(|rule| match eval_rule(rule, tx) {
             Ok(true) => Some(AlertPayload {
+                alert_id: alert_id(contract_id, &tx.hash, &rule_label(rule)),
                 label: label.to_string(),
                 contract_id: contract_id.to_string(),
                 network: network.to_string(),
@@ -698,6 +719,7 @@ mod tests {
     #[test]
     fn alert_payload_serialises_to_valid_json_with_all_fields_present() {
         let payload = AlertPayload {
+            alert_id: "0123456789abcdef0123456789abcdef".into(),
             label: "My Contract".into(),
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
             network: "testnet".into(),
@@ -745,5 +767,41 @@ mod tests {
             obj["explorer_link"].as_str(),
             Some("https://stellar.expert/explorer/testnet/tx/abc123")
         );
+    }
+
+    #[test]
+    fn alert_id_is_deterministic_and_distinguishes_inputs() {
+        let id = alert_id("CA", "tx1", "AnyTransaction");
+        assert_eq!(id, alert_id("CA", "tx1", "AnyTransaction"));
+        assert_eq!(id.len(), 32);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(id, alert_id("CA", "tx2", "AnyTransaction"));
+        assert_ne!(id, alert_id("CA", "tx1", "TransactionFailed"));
+        assert_ne!(alert_id("ab", "c", "r"), alert_id("a", "bc", "r"));
+    }
+
+    #[test]
+    fn evaluate_sets_alert_id_per_rule() {
+        let tx = EnrichedTransaction {
+            hash: "deadbeef".into(),
+            timestamp: "2024-01-15T12:00:00Z".parse().unwrap(),
+            successful: false,
+            paging_token: "1".into(),
+            function_names: vec![],
+            amount_stroops: None,
+            fee_charged_stroops: None,
+        };
+        let payloads = evaluate(
+            "L",
+            "CAAA",
+            "testnet",
+            "https://h",
+            "https://e",
+            &[AlertRule::AnyTransaction, AlertRule::TransactionFailed],
+            &tx,
+        );
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads[0].alert_id, alert_id("CAAA", "deadbeef", "AnyTransaction"));
+        assert_ne!(payloads[0].alert_id, payloads[1].alert_id);
     }
 }

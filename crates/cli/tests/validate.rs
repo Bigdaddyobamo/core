@@ -146,8 +146,8 @@ webhook_url = "https://hooks.example.com/test"
         "\n",
         "  [Stellar Testnet] Test Contract\n",
         "    contract_id  : CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
-        "    webhook_url  : https://hooks.example.com/test\n",
-        "    secret       : none\n",
+        "    webhooks     : 1\n",
+        "      - https://hooks.example.com/test (format: txwatch, secret: none)\n",
         "    interval     : 10s\n",
         "    rules        : 2\n",
         "      - AnyTransaction\n",
@@ -319,7 +319,16 @@ webhook_secret = "super-secret-value"
         }
       ],
       "webhook_secret_set": true,
-      "webhook_url": "https://hooks.example.com/test"
+      "webhook_url": "https://hooks.example.com/test",
+      "webhooks": [
+        {
+          "format": "txwatch",
+          "headers": {},
+          "routing_key_set": false,
+          "secret_set": true,
+          "url": "https://hooks.example.com/test"
+        }
+      ]
     }
   ],
   "cursor_file": null,
@@ -360,4 +369,72 @@ fn validate_json_reports_errors() {
         .as_str()
         .unwrap()
         .contains("failed to parse config file"));
+}
+
+const MULTI_DESTINATION_CONFIG: &str = r#"
+[[contracts]]
+label          = "Vault"
+contract_id    = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+network        = "testnet"
+webhook_url    = "https://internal.example.com/hook"
+webhook_headers = { "Authorization" = "Bearer header-secret-value" }
+
+  [[contracts.webhooks]]
+  url    = "https://hooks.slack.com/services/T/B/X"
+  format = "slack"
+
+  [[contracts.webhooks]]
+  url         = "https://events.pagerduty.com/v2/enqueue"
+  format      = "pagerduty"
+  routing_key = "routing-key-secret-value"
+
+  [[contracts.rules]]
+  type = "AnyTransaction"
+"#;
+
+#[test]
+fn validate_lists_every_destination_with_secrets_redacted() {
+    let path = env::temp_dir().join("txwatch_validate_destinations_test.toml");
+    fs::write(&path, MULTI_DESTINATION_CONFIG).unwrap();
+
+    let output = txwatch_bin()
+        .args(["--config", path.to_str().unwrap(), "validate"])
+        .output()
+        .expect("failed to run txwatch");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let expected = concat!(
+        "    webhooks     : 3\n",
+        "      - https://internal.example.com/hook (format: txwatch, secret: none, headers: Authorization: <redacted>)\n",
+        "      - https://hooks.slack.com/services/T/B/X (format: slack, secret: none)\n",
+        "      - https://events.pagerduty.com/v2/enqueue (format: pagerduty, secret: none, routing_key: <redacted>)\n",
+    );
+    assert!(stdout.contains(expected), "got:\n{}", stdout);
+    assert!(!stdout.contains("header-secret-value"), "header value leaked");
+    assert!(!stdout.contains("routing-key-secret-value"), "routing key leaked");
+}
+
+#[test]
+fn validate_json_lists_every_destination_with_secrets_redacted() {
+    let path = env::temp_dir().join("txwatch_validate_destinations_json_test.toml");
+    fs::write(&path, MULTI_DESTINATION_CONFIG).unwrap();
+
+    let output = txwatch_bin()
+        .args(["--config", path.to_str().unwrap(), "validate", "--format", "json"])
+        .output()
+        .expect("failed to run txwatch");
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("header-secret-value"), "header value leaked");
+    assert!(!stdout.contains("routing-key-secret-value"), "routing key leaked");
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let webhooks = json["contracts"][0]["webhooks"].as_array().unwrap();
+    assert_eq!(webhooks.len(), 3);
+    assert_eq!(webhooks[0]["headers"]["Authorization"], "<redacted>");
+    assert_eq!(webhooks[1]["format"], "slack");
+    assert_eq!(webhooks[2]["format"], "pagerduty");
+    assert_eq!(webhooks[2]["routing_key_set"], true);
 }

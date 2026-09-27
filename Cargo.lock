@@ -2183,6 +2183,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "futures",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -2204,8 +2205,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "hex",
  "serde",
  "serde_json",
+ "sha2",
  "tracing",
  "txwatch-config",
 ]

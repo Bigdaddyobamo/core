@@ -7,10 +7,14 @@ pub fn contract(webhook_url: &str, rules: Vec<AlertRule>) -> WatchedContract {
         contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
         network: Network::Testnet,
         rules,
-        webhook_url: webhook_url.to_string(),
+        webhook_url: Some(webhook_url.to_string()),
         webhook_secret: None,
         poll_interval_seconds: None,
         horizon_base_url_override: None,
+        webhook_format: Default::default(),
+        webhook_headers: Default::default(),
+        webhook_routing_key: None,
+        webhooks: Vec::new(),
     }
 }
 

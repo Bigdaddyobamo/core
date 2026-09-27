@@ -11,7 +11,10 @@ use sha2::Sha256;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, span, warn, Level};
+use txwatch_config::{WebhookDestination, WebhookHeaders};
 use txwatch_rules::AlertPayload;
+
+pub mod format;
 
 const MAX_RETRIES: u32 = 3;
 
@@ -60,13 +63,73 @@ pub async fn send_webhook(
     url: &str,
     payload: &AlertPayload,
     secret: Option<&str>,
-    mut shutdown: oneshot::Receiver<()>,
+    shutdown: oneshot::Receiver<()>,
 ) -> Result<DeliveryResult> {
-    let mut shutdown_live = true;
     let span = span!(Level::INFO, "send_webhook", contract = %payload.label, rule = %payload.rule_triggered);
     let _enter = span.enter();
 
     let body = serde_json::to_string(payload)?;
+    deliver(client, url, body, secret, &WebhookHeaders::default(), payload, shutdown).await
+}
+
+/// Deliver `payload` to one configured destination: the body is rendered in
+/// the destination's [`format`](txwatch_config::WebhookFormat), and its
+/// custom headers and secret are applied. Retries as [`send_webhook`] does.
+/// Header values and secrets are never logged.
+pub async fn send_to_destination(
+    client: &Client,
+    destination: &WebhookDestination,
+    payload: &AlertPayload,
+    shutdown: oneshot::Receiver<()>,
+) -> Result<DeliveryResult> {
+    let span = span!(
+        Level::INFO,
+        "send_webhook",
+        contract = %payload.label,
+        rule = %payload.rule_triggered,
+        format = %destination.format
+    );
+    let _enter = span.enter();
+
+    let body = format::render_body(
+        destination.format,
+        payload,
+        destination.routing_key.as_deref(),
+    )?;
+    deliver(
+        client,
+        &destination.url,
+        body,
+        destination.secret.as_deref(),
+        &destination.headers,
+        payload,
+        shutdown,
+    )
+    .await
+}
+
+/// [`send_to_destination`] for callers that have no shutdown signal to honour.
+pub async fn send_to_destination_simple(
+    client: &Client,
+    destination: &WebhookDestination,
+    payload: &AlertPayload,
+) -> Result<DeliveryResult> {
+    let (_tx, rx) = oneshot::channel();
+    send_to_destination(client, destination, payload, rx).await
+}
+
+/// POSTs `body` with retries and exponential backoff. `payload` only labels
+/// log lines.
+async fn deliver(
+    client: &Client,
+    url: &str,
+    body: String,
+    secret: Option<&str>,
+    headers: &WebhookHeaders,
+    payload: &AlertPayload,
+    mut shutdown: oneshot::Receiver<()>,
+) -> Result<DeliveryResult> {
+    let mut shutdown_live = true;
     let mut last_err: Option<anyhow::Error> = None;
 
     for attempt in 1..=MAX_RETRIES {
@@ -75,8 +138,13 @@ pub async fn send_webhook(
             .unwrap_or_else(|_| Duration::from_secs(0))
             .as_secs();
 
-        let mut req = client
-            .post(url)
+        let mut req = client.post(url);
+        // Custom headers first, so the TxWatch headers below always win
+        // (validation already rejects reserved names).
+        for (name, value) in headers.iter() {
+            req = req.header(name, value);
+        }
+        req = req
             .header("Content-Type", "application/json")
             .header("X-TxWatch-Version", env!("CARGO_PKG_VERSION"))
             .body(body.clone());
@@ -169,6 +237,9 @@ pub async fn send_webhook(
     Err(err)
 }
 
+/// Contract ID used by test payloads.
+pub const TEST_CONTRACT_ID: &str = "CTEST000000000000000000000000000000000000000000000000000";
+
 /// Build a synthetic `AlertPayload` suitable for `test-webhook`.
 pub fn test_payload(label: &str, webhook_url: &str) -> AlertPayload {
     test_payload_with_network(
@@ -194,8 +265,14 @@ pub fn test_payload_with_network(
     let now = Utc::now();
     let tx_hash = "0000000000000000000000000000000000000000000000000000000000000000";
     AlertPayload {
+        // Unique per send, so repeated tests are not de-duplicated by receivers.
+        alert_id: txwatch_rules::alert_id(
+            TEST_CONTRACT_ID,
+            tx_hash,
+            &format!("TestWebhook@{}", now.timestamp_nanos_opt().unwrap_or_default()),
+        ),
         label: label.to_string(),
-        contract_id: "CTEST000000000000000000000000000000000000000000000000000".into(),
+        contract_id: TEST_CONTRACT_ID.into(),
         network: network.to_string(),
         rule_type: "TestWebhook".into(),
         rule_triggered: "TestWebhook".into(),
@@ -227,6 +304,7 @@ mod tests {
 
     fn sample_payload() -> AlertPayload {
         AlertPayload {
+            alert_id: "0123456789abcdef0123456789abcdef".into(),
             label: "Test Contract".into(),
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
             network: "testnet".into(),
@@ -577,5 +655,69 @@ mod tests {
         let url = format!("{}/hook", server.uri());
         let result = send_webhook(&client, &url, &sample_payload(), None, dummy_shutdown()).await;
         assert!(result.is_ok());
+    }
+
+    // ── Destinations ─────────────────────────────────────────────────────────
+
+    fn destination(url: String, format: txwatch_config::WebhookFormat) -> WebhookDestination {
+        WebhookDestination {
+            url,
+            secret: None,
+            format,
+            headers: WebhookHeaders::default(),
+            routing_key: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn destination_sends_custom_headers_and_keeps_txwatch_headers() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .and(header("Authorization", "Bearer t0ken"))
+            .and(header("X-Api-Key", "k"))
+            .and(header("Content-Type", "application/json"))
+            .and(header("X-TxWatch-Version", env!("CARGO_PKG_VERSION")))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut dest = destination(
+            format!("{}/hook", server.uri()),
+            txwatch_config::WebhookFormat::Txwatch,
+        );
+        dest.headers.0.insert("Authorization".into(), "Bearer t0ken".into());
+        dest.headers.0.insert("X-Api-Key".into(), "k".into());
+        send_to_destination_simple(&build_client().unwrap(), &dest, &sample_payload())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn destination_renders_its_format_and_signs_the_rendered_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let mut dest = destination(server.uri(), txwatch_config::WebhookFormat::Pagerduty);
+        dest.routing_key = Some("R0UT1NG".into());
+        dest.secret = Some("s3".into());
+        send_to_destination_simple(&build_client().unwrap(), &dest, &sample_payload())
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["routing_key"], "R0UT1NG");
+        assert_eq!(body["event_action"], "trigger");
+        assert_eq!(body["dedup_key"], sample_payload().alert_id);
+
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"s3").unwrap();
+        mac.update(&requests[0].body);
+        let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        assert_eq!(requests[0].headers.get("x-txwatch-signature").unwrap(), &expected);
     }
 }

@@ -5,7 +5,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use schemars::JsonSchema;
-use std::{env, fmt, fs, path::Path};
+use std::{collections::BTreeMap, env, fmt, fs, path::Path};
 use url::Url;
 
 const MAX_LARGE_TRANSFER_THRESHOLD_XLM: u64 = 1_000_000_000;
@@ -332,6 +332,184 @@ impl AlertRule {
     }
 }
 
+// ── Webhook destinations ──────────────────────────────────────────────────────
+
+/// Printed in place of secret values (header values, secrets, routing keys).
+pub const REDACTED: &str = "<redacted>";
+
+/// Body shape sent to a webhook destination.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum WebhookFormat {
+    /// TxWatch's own alert JSON.
+    #[default]
+    Txwatch,
+    /// Slack incoming webhook (`text` plus Block Kit `blocks`).
+    Slack,
+    /// Discord webhook (`content` plus one embed).
+    Discord,
+    /// PagerDuty Events API v2 `trigger` event; requires `routing_key`.
+    Pagerduty,
+}
+
+impl WebhookFormat {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WebhookFormat::Txwatch => "txwatch",
+            WebhookFormat::Slack => "slack",
+            WebhookFormat::Discord => "discord",
+            WebhookFormat::Pagerduty => "pagerduty",
+        }
+    }
+}
+
+impl fmt::Display for WebhookFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Extra HTTP headers sent with every POST to a destination, e.g.
+/// `{ "Authorization" = "Bearer ${TOKEN}" }`. Values often hold credentials,
+/// so `Debug` prints only the header names.
+#[derive(Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(transparent)]
+pub struct WebhookHeaders(pub BTreeMap<String, String>);
+
+impl WebhookHeaders {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.0.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
+    /// `Name: <redacted>` pairs, safe to print.
+    pub fn redacted(&self) -> Vec<String> {
+        self.0.keys().map(|k| format!("{}: {}", k, REDACTED)).collect()
+    }
+}
+
+impl fmt::Debug for WebhookHeaders {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map()
+            .entries(self.0.keys().map(|k| (k, REDACTED)))
+            .finish()
+    }
+}
+
+/// Headers TxWatch sets itself; a destination may not override them.
+fn is_reserved_header(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name == "content-type" || name == "content-length" || name.starts_with("x-txwatch-")
+}
+
+/// RFC 9110 token: the characters allowed in a header name.
+fn is_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
+/// Header values may not contain control characters (CR/LF would allow header
+/// injection); tabs are allowed.
+fn is_header_value(value: &str) -> bool {
+    value.chars().all(|c| c == '\t' || !c.is_control())
+}
+
+/// One place alerts are delivered to: a `[[contracts.webhooks]]` entry, or
+/// the contract's `webhook_*` shorthand.
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookDestination {
+    /// http(s) URL the alert is POSTed to.
+    pub url: String,
+    /// Optional secret: sent as `X-TxWatch-Secret` and used for the
+    /// `X-TxWatch-Signature` HMAC. Supports `${ENV_VAR}` interpolation.
+    #[serde(default)]
+    pub secret: Option<String>,
+    /// Body shape: `txwatch` (default), `slack`, `discord` or `pagerduty`.
+    #[serde(default)]
+    pub format: WebhookFormat,
+    /// Extra HTTP headers. Values support `${ENV_VAR}` interpolation.
+    #[serde(default, skip_serializing_if = "WebhookHeaders::is_empty")]
+    pub headers: WebhookHeaders,
+    /// PagerDuty integration (routing) key; required for `format = "pagerduty"`.
+    /// Supports `${ENV_VAR}` interpolation.
+    #[serde(default)]
+    pub routing_key: Option<String>,
+}
+
+impl fmt::Debug for WebhookDestination {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WebhookDestination")
+            .field("url", &self.url)
+            .field("secret", &self.secret.as_ref().map(|_| REDACTED))
+            .field("format", &self.format)
+            .field("headers", &self.headers)
+            .field("routing_key", &self.routing_key.as_ref().map(|_| REDACTED))
+            .finish()
+    }
+}
+
+impl WebhookDestination {
+    /// Validates a stand-alone destination (e.g. one built from CLI flags).
+    pub fn validate(&self) -> Result<()> {
+        ValidationErrors::into_result(self.problems(&|name| name.to_owned()))
+    }
+
+    /// Every problem with this destination. `field(name)` renders a field's
+    /// config path, e.g. `webhook_url` or `webhooks[1].url`. Header values and
+    /// secrets never appear in the messages.
+    fn problems(&self, field: &dyn Fn(&str) -> String) -> Vec<String> {
+        let mut problems = Vec::new();
+        if let Some(problem) = check_http_url(&self.url) {
+            problems.push(format!("{} {}", field("url"), problem));
+        }
+        for (name, value) in self.headers.iter() {
+            if !is_header_name(name) {
+                problems.push(format!(
+                    "{} {:?} is not a valid HTTP header name",
+                    field("headers"),
+                    name
+                ));
+            } else if is_reserved_header(name) {
+                problems.push(format!(
+                    "{} {:?} is reserved: Content-Type, Content-Length and X-TxWatch-* \
+                     are set by TxWatch",
+                    field("headers"),
+                    name
+                ));
+            }
+            if !is_header_value(value) {
+                problems.push(format!(
+                    "{} value of {:?} contains control characters",
+                    field("headers"),
+                    name
+                ));
+            }
+        }
+        let has_routing_key = self
+            .routing_key
+            .as_deref()
+            .is_some_and(|k| !k.trim().is_empty());
+        match (self.format, has_routing_key) {
+            (WebhookFormat::Pagerduty, false) => problems.push(format!(
+                "{} is required when format is \"pagerduty\"",
+                field("routing_key")
+            )),
+            (format, true) if format != WebhookFormat::Pagerduty => problems.push(format!(
+                "{} is only used when format is \"pagerduty\"",
+                field("routing_key")
+            )),
+            _ => {}
+        }
+        problems
+    }
+}
+
 // ── WatchedContract ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -341,10 +519,27 @@ pub struct WatchedContract {
     pub contract_id: String,
     pub network: Network,
     pub rules: Vec<AlertRule>,
-    pub webhook_url: String,
+    /// Shorthand for a single destination; the `webhook_*` fields below
+    /// describe it. Use `webhooks` for more than one destination. Optional when
+    /// `webhooks` is non-empty.
+    #[serde(default)]
+    pub webhook_url: Option<String>,
     /// Optional secret sent as X-TxWatch-Secret header on every webhook POST.
     /// Supports `${ENV_VAR}` interpolation (e.g. `webhook_secret = "${MY_SECRET}"`).
     pub webhook_secret: Option<String>,
+    /// Body shape for `webhook_url` (default `txwatch`).
+    #[serde(default)]
+    pub webhook_format: WebhookFormat,
+    /// Extra HTTP headers for `webhook_url`, with `${ENV_VAR}` interpolation.
+    #[serde(default, skip_serializing_if = "WebhookHeaders::is_empty")]
+    pub webhook_headers: WebhookHeaders,
+    /// PagerDuty routing key for `webhook_url` when `webhook_format = "pagerduty"`.
+    #[serde(default)]
+    pub webhook_routing_key: Option<String>,
+    /// Additional destinations (`[[contracts.webhooks]]`). Every alert is
+    /// delivered to each destination independently.
+    #[serde(default)]
+    pub webhooks: Vec<WebhookDestination>,
     /// Per-contract polling interval in seconds, overriding the top-level
     /// `poll_interval_seconds`. Same bounds (5–3600).
     #[serde(default)]
@@ -399,6 +594,23 @@ fn check_http_url(value: &str) -> Option<String> {
 }
 
 impl WatchedContract {
+    /// Every webhook destination: the `webhook_*` shorthand (when `webhook_url`
+    /// is set) followed by the `[[contracts.webhooks]]` entries.
+    pub fn destinations(&self) -> Vec<WebhookDestination> {
+        let mut destinations = Vec::with_capacity(self.webhooks.len() + 1);
+        if let Some(url) = &self.webhook_url {
+            destinations.push(WebhookDestination {
+                url: url.clone(),
+                secret: self.webhook_secret.clone(),
+                format: self.webhook_format,
+                headers: self.webhook_headers.clone(),
+                routing_key: self.webhook_routing_key.clone(),
+            });
+        }
+        destinations.extend(self.webhooks.iter().cloned());
+        destinations
+    }
+
     /// The interval this contract is polled at: its own override, or `default`
     /// (the top-level `poll_interval_seconds`).
     pub fn effective_poll_interval(&self, default: u64) -> u64 {
@@ -451,11 +663,45 @@ impl WatchedContract {
             ));
         }
 
-        if let Some(problem) = check_http_url(&self.webhook_url) {
+        if self.webhook_url.is_none() {
+            let stray: Vec<&str> = [
+                ("webhook_secret", self.webhook_secret.is_some()),
+                ("webhook_format", self.webhook_format != WebhookFormat::default()),
+                ("webhook_headers", !self.webhook_headers.is_empty()),
+                ("webhook_routing_key", self.webhook_routing_key.is_some()),
+            ]
+            .into_iter()
+            .filter_map(|(name, set)| set.then_some(name))
+            .collect();
+            if !stray.is_empty() {
+                errors.push(format!(
+                    "contract '{}': {} set without webhook_url (put them in a \
+                     [[contracts.webhooks]] entry instead)",
+                    self.label,
+                    stray.join(", ")
+                ));
+            }
+        }
+        let shorthand = usize::from(self.webhook_url.is_some());
+        let destinations = self.destinations();
+        if destinations.is_empty() {
             errors.push(format!(
-                "contract '{}': webhook_url {}",
-                self.label, problem
+                "contract '{}': no webhook destination; set webhook_url or add a \
+                 [[contracts.webhooks]] entry",
+                self.label
             ));
+        }
+        for (i, destination) in destinations.iter().enumerate() {
+            let field = |name: &str| {
+                if i < shorthand {
+                    format!("webhook_{}", name)
+                } else {
+                    format!("webhooks[{}].{}", i - shorthand, name)
+                }
+            };
+            for problem in destination.problems(&field) {
+                errors.push(format!("contract '{}': {}", self.label, problem));
+            }
         }
 
         if let Network::Custom(custom) = &mut self.network {
@@ -566,21 +812,110 @@ where
 
 // ── Env-var interpolation ─────────────────────────────────────────────────────
 
-/// Resolves a `${VAR_NAME}` reference to the corresponding environment variable.
-/// Values that don't match the `${...}` pattern are returned unchanged.
-fn resolve_env_interpolation(value: &str) -> Result<String> {
-    match value.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
-        Some(var_name) => env::var(var_name)
-            .with_context(|| format!("env var '{}' referenced in config is not set", var_name)),
-        None => Ok(value.to_owned()),
+fn is_env_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Expands environment-variable references anywhere in `value`:
+///
+/// - `${VAR}` is replaced by the value of `VAR`; an unset variable is an error.
+/// - `${VAR:-default}` uses `default` when `VAR` is unset or empty.
+/// - `$${` is an escape for a literal `${`.
+/// - Any other `$` is kept as is.
+///
+/// `lookup` resolves a variable name; errors never include resolved values.
+fn interpolate(value: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Result<String> {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(dollar) = rest.find('$') {
+        out.push_str(&rest[..dollar]);
+        let after = &rest[dollar..];
+        if let Some(tail) = after.strip_prefix("$${") {
+            out.push_str("${");
+            rest = tail;
+        } else if let Some(tail) = after.strip_prefix("${") {
+            let end = tail.find('}').context("unterminated '${'")?;
+            let expr = &tail[..end];
+            let (name, default) = match expr.split_once(":-") {
+                Some((name, default)) => (name, Some(default)),
+                None => (expr, None),
+            };
+            if name.is_empty() {
+                bail!("empty variable name in '${{}}'");
+            }
+            if !is_env_var_name(name) {
+                bail!(
+                    "invalid variable name {:?} (use letters, digits and '_', \
+                     not starting with a digit)",
+                    name
+                );
+            }
+            match (lookup(name), default) {
+                (Some(resolved), Some(default)) if resolved.is_empty() => out.push_str(default),
+                (Some(resolved), _) => out.push_str(&resolved),
+                (None, Some(default)) => out.push_str(default),
+                (None, None) => bail!("env var '{}' referenced in config is not set", name),
+            }
+            rest = &tail[end + 1..];
+        } else {
+            out.push('$');
+            rest = &after[1..];
+        }
     }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// [`interpolate`] against the process environment.
+fn resolve_env_interpolation(value: &str) -> Result<String> {
+    interpolate(value, &|name| env::var(name).ok())
+}
+
+/// Interpolates `value` in place, naming `field` (never the value) in errors.
+fn resolve_field(value: &mut String, field: &str) -> Result<()> {
+    *value = resolve_env_interpolation(value).with_context(|| field.to_owned())?;
+    Ok(())
+}
+
+/// Interpolates a destination's secret-bearing fields.
+fn resolve_destination(
+    secret: &mut Option<String>,
+    headers: &mut WebhookHeaders,
+    routing_key: &mut Option<String>,
+    field: &dyn Fn(&str) -> String,
+) -> Result<()> {
+    if let Some(secret) = secret {
+        resolve_field(secret, &field("secret"))?;
+    }
+    for (name, value) in headers.0.iter_mut() {
+        resolve_field(value, &format!("{}.{}", field("headers"), name))?;
+    }
+    if let Some(key) = routing_key {
+        resolve_field(key, &field("routing_key"))?;
+    }
+    Ok(())
 }
 
 impl AppConfig {
+    /// Expands `${VAR}` references in webhook secrets, header values and
+    /// PagerDuty routing keys.
     fn resolve_env_vars(&mut self) -> Result<()> {
-        for contract in &mut self.contracts {
-            if let Some(secret) = &contract.webhook_secret {
-                contract.webhook_secret = Some(resolve_env_interpolation(secret)?);
+        for (i, contract) in self.contracts.iter_mut().enumerate() {
+            resolve_destination(
+                &mut contract.webhook_secret,
+                &mut contract.webhook_headers,
+                &mut contract.webhook_routing_key,
+                &|name| format!("contracts[{}].webhook_{}", i, name),
+            )?;
+            for (j, webhook) in contract.webhooks.iter_mut().enumerate() {
+                resolve_destination(
+                    &mut webhook.secret,
+                    &mut webhook.headers,
+                    &mut webhook.routing_key,
+                    &|name| format!("contracts[{}].webhooks[{}].{}", i, j, name),
+                )?;
             }
         }
         Ok(())
@@ -656,10 +991,14 @@ mod tests {
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
             network: Network::Testnet,
             rules: vec![AlertRule::AnyTransaction],
-            webhook_url: "https://example.com/hook".into(),
+            webhook_url: Some("https://example.com/hook".into()),
             webhook_secret: None,
             poll_interval_seconds: None,
             horizon_base_url_override: None,
+            webhook_format: Default::default(),
+            webhook_headers: Default::default(),
+            webhook_routing_key: None,
+            webhooks: Vec::new(),
         }
     }
 
@@ -686,49 +1025,49 @@ mod tests {
     #[test]
     fn rejects_bad_webhook_url() {
         let mut c = valid_contract();
-        c.webhook_url = "ftp://bad".into();
+        c.webhook_url = Some("ftp://bad".into());
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn rejects_webhook_url_with_no_host() {
         let mut c = valid_contract();
-        c.webhook_url = "https://".into();
+        c.webhook_url = Some("https://".into());
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn rejects_webhook_url_with_spaces() {
         let mut c = valid_contract();
-        c.webhook_url = "https://example .com/hook".into();
+        c.webhook_url = Some("https://example .com/hook".into());
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn rejects_webhook_url_that_is_not_a_url() {
         let mut c = valid_contract();
-        c.webhook_url = "not-a-url-at-all".into();
+        c.webhook_url = Some("not-a-url-at-all".into());
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn rejects_webhook_url_with_ftp_scheme() {
         let mut c = valid_contract();
-        c.webhook_url = "ftp://files.example.com/hook".into();
+        c.webhook_url = Some("ftp://files.example.com/hook".into());
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn accepts_valid_http_webhook_url() {
         let mut c = valid_contract();
-        c.webhook_url = "http://hooks.example.com/my-webhook".into();
+        c.webhook_url = Some("http://hooks.example.com/my-webhook".into());
         assert!(c.validate().is_ok());
     }
 
     #[test]
     fn accepts_valid_https_webhook_url_with_path_and_query() {
         let mut c = valid_contract();
-        c.webhook_url = "https://hooks.example.com/alerts?token=abc123".into();
+        c.webhook_url = Some("https://hooks.example.com/alerts?token=abc123".into());
         assert!(c.validate().is_ok());
     }
 
@@ -935,7 +1274,7 @@ mod tests {
         let mut bad_id = valid_contract();
         bad_id.label = "A".into();
         bad_id.contract_id = "CSHORT".into();
-        bad_id.webhook_url = "ftp://bad".into();
+        bad_id.webhook_url = Some("ftp://bad".into());
         let mut bad_rule = valid_contract();
         bad_rule.label = "B".into();
         bad_rule.rules = vec![AlertRule::LargeTransfer { threshold_xlm: 0 }];
@@ -1371,5 +1710,302 @@ mod tests {
             "error should name the offending field, got: {}",
             error_msg
         );
+    }
+
+    // ── Webhook destinations, formats and headers ────────────────────────────
+
+    /// Parses and validates `contract_body` as the only `[[contracts]]` entry
+    /// (label "x", one AnyTransaction rule).
+    fn parse_contract(contract_body: &str) -> Result<AppConfig> {
+        let raw = format!(
+            r#"
+            [[contracts]]
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            {}
+            [[contracts.rules]]
+            type = "AnyTransaction"
+            "#,
+            contract_body
+        );
+        AppConfig::parse(&raw, Path::new("webhooks.toml"))
+    }
+
+    fn parse_err(contract_body: &str) -> String {
+        format!("{:#}", parse_contract(contract_body).unwrap_err())
+    }
+
+    #[test]
+    fn webhook_url_shorthand_is_one_txwatch_destination() {
+        let cfg = parse_contract(r#"webhook_url = "https://example.com/hook""#).unwrap();
+        let destinations = cfg.contracts[0].destinations();
+        assert_eq!(destinations.len(), 1);
+        assert_eq!(destinations[0].url, "https://example.com/hook");
+        assert_eq!(destinations[0].format, WebhookFormat::Txwatch);
+        assert!(destinations[0].headers.is_empty());
+    }
+
+    #[test]
+    fn webhooks_array_combines_with_the_shorthand() {
+        let cfg = parse_contract(
+            r#"
+            webhook_url = "https://internal.example.com/hook"
+            [[contracts.webhooks]]
+            url = "https://hooks.slack.com/services/T/B/X"
+            format = "slack"
+            [[contracts.webhooks]]
+            url = "https://events.pagerduty.com/v2/enqueue"
+            format = "pagerduty"
+            routing_key = "R0UT1NG"
+            "#,
+        )
+        .unwrap();
+        let destinations = cfg.contracts[0].destinations();
+        let summary: Vec<(&str, WebhookFormat)> = destinations
+            .iter()
+            .map(|d| (d.url.as_str(), d.format))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("https://internal.example.com/hook", WebhookFormat::Txwatch),
+                ("https://hooks.slack.com/services/T/B/X", WebhookFormat::Slack),
+                ("https://events.pagerduty.com/v2/enqueue", WebhookFormat::Pagerduty),
+            ]
+        );
+    }
+
+    #[test]
+    fn webhooks_array_alone_is_enough() {
+        let cfg = parse_contract(
+            r#"
+            [[contracts.webhooks]]
+            url = "https://discord.com/api/webhooks/1/abc"
+            format = "discord"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.contracts[0].webhook_url, None);
+        assert_eq!(cfg.contracts[0].destinations().len(), 1);
+    }
+
+    #[test]
+    fn a_contract_needs_at_least_one_destination() {
+        let err = parse_err("");
+        assert!(err.contains("no webhook destination"), "got: {}", err);
+    }
+
+    #[test]
+    fn shorthand_fields_without_webhook_url_are_rejected() {
+        let err = parse_err(
+            r#"
+            webhook_format = "slack"
+            [[contracts.webhooks]]
+            url = "https://example.com/hook"
+            "#,
+        );
+        assert!(err.contains("webhook_format set without webhook_url"), "got: {}", err);
+    }
+
+    #[test]
+    fn unknown_format_and_unknown_destination_fields_are_rejected() {
+        let err = parse_err(
+            r#"webhook_url = "https://example.com/hook"
+            webhook_format = "teams""#,
+        );
+        assert!(err.contains("unknown variant `teams`"), "got: {}", err);
+
+        let err = parse_err(
+            r#"
+            [[contracts.webhooks]]
+            url = "https://example.com/hook"
+            secrett = "x"
+            "#,
+        );
+        assert!(err.contains("unknown field `secrett`"), "got: {}", err);
+    }
+
+    #[test]
+    fn destination_errors_name_the_field() {
+        let err = parse_err(
+            r#"
+            [[contracts.webhooks]]
+            url = "https://example.com/ok"
+            [[contracts.webhooks]]
+            url = "ftp://example.com/bad"
+            "#,
+        );
+        assert!(
+            err.contains("contract 'x': webhooks[1].url 'ftp://example.com/bad' must use http or https"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn pagerduty_requires_a_routing_key_and_others_reject_one() {
+        let err = parse_err(
+            r#"webhook_url = "https://events.pagerduty.com/v2/enqueue"
+            webhook_format = "pagerduty""#,
+        );
+        assert!(
+            err.contains("webhook_routing_key is required when format is \"pagerduty\""),
+            "got: {}",
+            err
+        );
+
+        let err = parse_err(
+            r#"
+            [[contracts.webhooks]]
+            url = "https://example.com/hook"
+            routing_key = "R0UT1NG"
+            "#,
+        );
+        assert!(
+            err.contains("webhooks[0].routing_key is only used when format is \"pagerduty\""),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn custom_headers_are_accepted() {
+        let cfg = parse_contract(
+            r#"webhook_url = "https://example.com/hook"
+            webhook_headers = { "Authorization" = "Bearer abc", "X-Api-Key" = "k" }"#,
+        )
+        .unwrap();
+        let headers: Vec<(&str, &str)> = cfg.contracts[0].webhook_headers.iter().collect();
+        assert_eq!(headers, [("Authorization", "Bearer abc"), ("X-Api-Key", "k")]);
+    }
+
+    #[test]
+    fn reserved_headers_are_rejected() {
+        for name in ["Content-Type", "content-length", "X-TxWatch-Secret", "x-txwatch-anything"] {
+            let err = parse_err(&format!(
+                r#"webhook_url = "https://example.com/hook"
+                webhook_headers = {{ "{}" = "v" }}"#,
+                name
+            ));
+            assert!(err.contains("is reserved"), "{}: {}", name, err);
+            assert!(err.contains("webhook_headers"), "{}: {}", name, err);
+        }
+    }
+
+    #[test]
+    fn invalid_header_names_and_values_are_rejected_without_echoing_values() {
+        let err = parse_err(
+            r#"
+            [[contracts.webhooks]]
+            url = "https://example.com/hook"
+            headers = { "Bad Header" = "v", "X-Ok" = "line1\r\nInjected: secret-value" }
+            "#,
+        );
+        assert!(
+            err.contains("webhooks[0].headers \"Bad Header\" is not a valid HTTP header name"),
+            "got: {}",
+            err
+        );
+        assert!(
+            err.contains("webhooks[0].headers value of \"X-Ok\" contains control characters"),
+            "got: {}",
+            err
+        );
+        assert!(!err.contains("secret-value"), "header value leaked: {}", err);
+    }
+
+    #[test]
+    fn debug_output_redacts_header_values_secrets_and_routing_keys() {
+        let destination = WebhookDestination {
+            url: "https://example.com/hook".into(),
+            secret: Some("s3cret".into()),
+            format: WebhookFormat::Pagerduty,
+            headers: WebhookHeaders(BTreeMap::from([(
+                "Authorization".to_owned(),
+                "Bearer t0ken".to_owned(),
+            )])),
+            routing_key: Some("R0UT1NG".into()),
+        };
+        let debug = format!("{:?}", destination);
+        for secret in ["s3cret", "t0ken", "R0UT1NG"] {
+            assert!(!debug.contains(secret), "{} leaked: {}", secret, debug);
+        }
+        assert!(debug.contains("Authorization"), "{}", debug);
+        assert_eq!(
+            destination.headers.redacted(),
+            ["Authorization: <redacted>"]
+        );
+    }
+
+    // ── Env-var interpolation ────────────────────────────────────────────────
+
+    fn lookup(name: &str) -> Option<String> {
+        match name {
+            "TOKEN" => Some("t0ken".into()),
+            "EMPTY" => Some(String::new()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn interpolation_supports_embedded_defaults_and_escapes() {
+        let interp = |v: &str| interpolate(v, &lookup);
+        assert_eq!(interp("${TOKEN}").unwrap(), "t0ken");
+        assert_eq!(interp("Bearer ${TOKEN}").unwrap(), "Bearer t0ken");
+        assert_eq!(interp("${MISSING:-fallback}").unwrap(), "fallback");
+        assert_eq!(interp("${EMPTY:-fallback}").unwrap(), "fallback");
+        assert_eq!(interp("$${TOKEN}").unwrap(), "${TOKEN}");
+        assert_eq!(interp("cost: $5").unwrap(), "cost: $5");
+        assert!(interp("${MISSING}").unwrap_err().to_string().contains("'MISSING'"));
+        assert!(interp("${}").is_err());
+        assert!(interp("${TOKEN").is_err());
+        assert!(interp("${1X}").is_err());
+    }
+
+    /// Serialises tests that mutate the process environment.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn headers_secrets_and_routing_keys_are_interpolated() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("TXWATCH_TEST_BEARER", "t0ken");
+        env::set_var("TXWATCH_TEST_PD_KEY", "R0UT1NG");
+        let cfg = parse_contract(
+            r#"webhook_url = "https://example.com/hook"
+            webhook_headers = { "Authorization" = "Bearer ${TXWATCH_TEST_BEARER}" }
+            [[contracts.webhooks]]
+            url = "https://events.pagerduty.com/v2/enqueue"
+            format = "pagerduty"
+            routing_key = "${TXWATCH_TEST_PD_KEY}"
+            secret = "prefix-${TXWATCH_TEST_BEARER}"
+            "#,
+        );
+        env::remove_var("TXWATCH_TEST_BEARER");
+        env::remove_var("TXWATCH_TEST_PD_KEY");
+        let cfg = cfg.unwrap();
+        let destinations = cfg.contracts[0].destinations();
+        assert_eq!(
+            destinations[0].headers.iter().collect::<Vec<_>>(),
+            [("Authorization", "Bearer t0ken")]
+        );
+        assert_eq!(destinations[1].routing_key.as_deref(), Some("R0UT1NG"));
+        assert_eq!(destinations[1].secret.as_deref(), Some("prefix-t0ken"));
+    }
+
+    #[test]
+    fn missing_header_variable_names_the_header_not_the_value() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        env::remove_var("TXWATCH_TEST_UNSET");
+        let err = parse_err(
+            r#"webhook_url = "https://example.com/hook"
+            webhook_headers = { "Authorization" = "Bearer ${TXWATCH_TEST_UNSET}" }"#,
+        );
+        assert!(
+            err.contains("contracts[0].webhook_headers.Authorization"),
+            "got: {}",
+            err
+        );
+        assert!(err.contains("TXWATCH_TEST_UNSET"), "got: {}", err);
     }
 }
