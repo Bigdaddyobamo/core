@@ -43,7 +43,7 @@ fn write_config(name: &str, webhook_url: &str) -> (PathBuf, PathBuf) {
     let config = format!(
         r#"
 poll_interval_seconds = 10
-cursor_file = "{cursor}"
+cursor_file = '{cursor}'
 
 [[contracts]]
 label       = "Once Contract"

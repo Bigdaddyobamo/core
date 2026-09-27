@@ -1,14 +1,11 @@
-use std::{fs, path::PathBuf, time::Duration};
-
-use anyhow::{Context, Result};
-use clap::{CommandFactory, Parser, Subcommand};
 use std::{
+    fs,
     path::{Path, PathBuf},
     time::Duration,
 };
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use futures::future::join_all;
 use reqwest::{Client, StatusCode};
 use tokio::sync::watch;
@@ -157,6 +154,8 @@ enum Command {
         /// Overwrite the output file if it already exists
         #[arg(long)]
         force: bool,
+    },
+
     /// Evaluate a contract's rules against one historical transaction
     ///
     /// Prints the rules that matched and their webhook payloads. Nothing is sent
@@ -185,7 +184,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Validate { format: OutputFormat::Json, .. } => {
-            match AppConfig::from_file(&required_config(&cli)?) {
+            match AppConfig::from_file(&required_config(&cli.config)?) {
                 Ok(cfg) => println!("{}", serde_json::to_string_pretty(&config_summary_json(&cfg))?),
                 Err(e) => {
                     let error = serde_json::json!({ "valid": false, "error": format!("{:#}", e) });
@@ -196,9 +195,7 @@ async fn main() -> Result<()> {
         }
 
         Command::Validate { check_webhooks, check_horizon, .. } => {
-            let cfg = AppConfig::from_file(&required_config(&cli)?)?;
-        Command::Validate { check_webhooks, check_horizon } => {
-            let cfg = AppConfig::from_file(&required_config(&cli.config)?)?;
+            let cfg = load_config(&cli)?;
             println!("Config is valid.");
             println!("  poll_interval_seconds : {}", cfg.poll_interval_seconds);
             println!("  contracts             : {}", cfg.contracts.len());
@@ -326,6 +323,9 @@ async fn main() -> Result<()> {
                 // The reader (e.g. `| head`) closing early isn't an error.
                 Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
                 other => other.context("failed to render the man page")?,
+            }
+        }
+
         Command::Replay { ref contract, ref tx, send } => {
             let cfg = load_config(&cli)?;
             let contract = cfg
@@ -357,11 +357,11 @@ async fn main() -> Result<()> {
 
         Command::Watch {
             dry_run,
+            once,
             #[cfg(feature = "metrics")]
             metrics_addr,
         } => {
-            let cfg = AppConfig::from_file(&required_config(&cli)?)?;
-        Command::Watch { dry_run, once } => {
+            let config_path = required_config(&cli.config)?;
             let cfg = load_config(&cli)?;
 
             if once {
@@ -383,9 +383,6 @@ async fn main() -> Result<()> {
                 }
                 return Ok(());
             }
-        Command::Watch { dry_run } => {
-            let config_path = required_config(&cli.config)?;
-            let cfg = AppConfig::from_file(&config_path)?;
 
             // Graceful shutdown: allow the current poll cycle to finish before exiting.
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -460,8 +457,6 @@ webhook_url = {webhook_url}
     ))
 }
 
-fn required_config(cli: &Cli) -> Result<PathBuf> {
-    Ok(cli.config.clone().unwrap_or_else(|| PathBuf::from("config/example.toml")))
 /// The config path from `--config`, `TXWATCH_CONFIG` or the `./txwatch.toml`
 /// default, which must exist.
 fn required_config(path: &Path) -> Result<PathBuf> {
@@ -519,7 +514,7 @@ fn reload_config(path: &Path) -> Option<AppConfig> {
 
 /// Load the config and apply `--horizon-url`, if given, to every contract.
 fn load_config(cli: &Cli) -> Result<AppConfig> {
-    let mut cfg = AppConfig::from_file(&required_config(cli)?)?;
+    let mut cfg = AppConfig::from_file(&required_config(&cli.config)?)?;
     if let Some(url) = &cli.horizon_url {
         let url = url.trim_end_matches('/');
         for c in &mut cfg.contracts {
@@ -545,7 +540,7 @@ fn config_summary_json(cfg: &AppConfig) -> serde_json::Value {
                 "webhook_secret_set": c.webhook_secret.is_some(),
                 "rules": c.rules,
                 "horizon_url": c.network.horizon_base_url(),
-                "explorer_url": format!("{}/contract/{}", c.network.explorer_base_url(), c.contract_id),
+                "explorer_url": c.network.explorer_base_url().map(|e| format!("{}/contract/{}", e, c.contract_id)),
             })
         })
         .collect();

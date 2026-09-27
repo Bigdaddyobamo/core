@@ -195,6 +195,26 @@ webhook_url = "ftp://hooks.example.com/alpha"
 
     let path = env::temp_dir().join("txwatch_validate_multi_error_test.toml");
     fs::write(&path, MULTI_ERROR_CONFIG).unwrap();
+
+    let output = txwatch_bin()
+        .args(["--config", path.to_str().unwrap(), "validate"])
+        .output()
+        .expect("failed to run txwatch");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for expected in [
+        "4 configuration errors:",
+        "  - poll_interval_seconds must be >= 5",
+        "  - contract 'Alpha': contract_id 'CSHORT' is not a valid Stellar contract address",
+        "  - contract 'Alpha': webhook_url 'ftp://hooks.example.com/alpha' must use http or https scheme",
+        "  - contract 'Alpha': LargeTransfer threshold_xlm must be > 0",
+    ] {
+        assert!(stderr.contains(expected), "missing {:?} in:\n{}", expected, stderr);
+    }
+}
+
+#[test]
 fn validate_output_shows_effective_poll_interval_per_contract() {
     const OVERRIDE_CONFIG: &str = r#"
 [[contracts]]
@@ -225,17 +245,6 @@ webhook_url = "https://hooks.example.com/default"
         .output()
         .expect("failed to run txwatch");
 
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    for expected in [
-        "4 configuration errors:",
-        "  - poll_interval_seconds must be >= 5",
-        "  - contract 'Alpha': contract_id 'CSHORT' is not a valid Stellar contract address",
-        "  - contract 'Alpha': webhook_url 'ftp://hooks.example.com/alpha' must use http or https scheme",
-        "  - contract 'Alpha': LargeTransfer threshold_xlm must be > 0",
-    ] {
-        assert!(stderr.contains(expected), "missing {:?} in:\n{}", expected, stderr);
-    }
     assert!(
         output.status.success(),
         "expected exit code 0 for valid config"
