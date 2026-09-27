@@ -132,8 +132,8 @@ pub fn evaluate(
     rules: &[AlertRule],
     tx: &EnrichedTransaction,
 ) -> Vec<AlertPayload> {
-    let horizon_link = format!("{}/transactions/{}", horizon_base, tx.hash);
-    let explorer_link = format!("{}/tx/{}", explorer_base, tx.hash);
+    let horizon_link = format!("{}/transactions/{}", horizon_base.trim_end_matches('/'), tx.hash);
+    let explorer_link = format!("{}/tx/{}", explorer_base.trim_end_matches('/'), tx.hash);
     let timestamp = tx.timestamp.timestamp();
     let timestamp_iso = tx.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
