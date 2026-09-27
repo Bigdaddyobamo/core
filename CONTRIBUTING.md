@@ -1,4 +1,4 @@
-# Contributing to stellar-txwatch-core
+# Contributing to TxWatch core
 
 ## Local Development with Docker Compose
 
@@ -58,8 +58,8 @@ docker compose down
 
 | Repo | Description |
 |------|-------------|
-| [stellar-txwatch-web](https://github.com/Veritas-Vaults-Network/stellar-txwatch-web) | Web dashboard for alert history |
-| [stellar-txwatch-contracts](https://github.com/Veritas-Vaults-Network/stellar-txwatch-contracts) | Example Soroban contracts to monitor |
+| [web](https://github.com/Tx-wats/web) | Web dashboard for alert history |
+| [contracts](https://github.com/Tx-wats/contracts) | Example Soroban contracts to monitor |
 
 ---
 
@@ -77,8 +77,8 @@ Requires Rust stable ≥ 1.88 (the `rust-version` declared in the workspace `Car
 ### 2. Clone and build
 
 ```bash
-git clone https://github.com/Veritas-Vaults-Network/stellar-txwatch-core
-cd stellar-txwatch-core
+git clone https://github.com/Tx-wats/core
+cd core
 cargo build
 ```
 
@@ -91,7 +91,7 @@ cargo run -p txwatch -- --config config/example.toml validate
 ### 4. Get a testnet contract to watch
 
 The easiest way is to deploy one of the contracts from
-[stellar-txwatch-contracts](https://github.com/Veritas-Vaults-Network/stellar-txwatch-contracts),
+[Tx-wats/contracts](https://github.com/Tx-wats/contracts),
 or use any existing Soroban contract on Testnet.
 
 You can find active testnet contracts on the
