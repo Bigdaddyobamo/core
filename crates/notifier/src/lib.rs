@@ -13,6 +13,9 @@ use tokio::sync::oneshot;
 use tracing::{debug, error, info, span, warn, Level};
 use txwatch_rules::AlertPayload;
 
+pub mod kyc_auth;
+pub use kyc_auth::{constant_time_compare, verify_kyc_webhook};
+
 const MAX_RETRIES: u32 = 3;
 
 /// Structured result returned by a successful `send_webhook` call.
