@@ -608,6 +608,7 @@ async fn poll_contract(
     let mut tx_count = 0u64;
     let mut alert_count = 0u64;
     let mut webhook_failures = 0u64;
+    let mut delivery_tasks = JoinSet::new();
 
     for record in all_records {
         let paging_token = record.tx.paging_token.clone();
@@ -684,26 +685,49 @@ async fn poll_contract(
             } else {
                 info!(contract = %contract.label, rule = %payload.rule_triggered,
                     tx = %payload.transaction_hash, "rule fired — sending webhook");
-                let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-                #[cfg(feature = "metrics")]
-                let started = std::time::Instant::now();
-                let delivery = send_webhook(
-                    client,
-                    &contract.webhook_url,
-                    &payload,
-                    contract.webhook_secret.as_deref(),
-                    shutdown_rx,
-                )
-                .await;
-                #[cfg(feature = "metrics")]
-                metrics::observe_webhook_delivery(started.elapsed().as_secs_f64());
-                if let Err(e) = delivery {
-                    error!(contract = %contract.label, rule = %payload.rule_triggered,
-                        tx = %payload.transaction_hash, error = %e, "webhook delivery failed");
-                    webhook_failures += 1;
+                let client = client.clone();
+                let webhook_url = contract.webhook_url.clone();
+                let webhook_secret = contract.webhook_secret.clone();
+                let contract_label = contract.label.clone();
+                let network_str = contract.network.as_str().to_string();
+                let payload_clone = payload.clone();
+
+                delivery_tasks.spawn(async move {
+                    let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
                     #[cfg(feature = "metrics")]
-                    metrics::inc_webhook_failures(&contract.label, contract.network.as_str());
+                    let started = std::time::Instant::now();
+                    let delivery = send_webhook(
+                        &client,
+                        &webhook_url,
+                        &payload_clone,
+                        webhook_secret.as_deref(),
+                        shutdown_rx,
+                    )
+                    .await;
+                    #[cfg(feature = "metrics")]
+                    metrics::observe_webhook_delivery(started.elapsed().as_secs_f64());
+                    if let Err(e) = &delivery {
+                        error!(contract = %contract_label, rule = %payload_clone.rule_triggered,
+                            tx = %payload_clone.transaction_hash, error = %e, "webhook delivery failed");
+                        #[cfg(feature = "metrics")]
+                        metrics::inc_webhook_failures(&contract_label, &network_str);
+                    }
+                    delivery.is_err()
+                });
+            }
+        }
+    }
+
+    while let Some(res) = delivery_tasks.join_next().await {
+        match res {
+            Ok(failed) => {
+                if failed {
+                    webhook_failures += 1;
                 }
+            }
+            Err(e) => {
+                error!(contract = %contract.label, error = ?e, "webhook delivery task panicked");
+                webhook_failures += 1;
             }
         }
     }
