@@ -19,6 +19,9 @@ use txwatch_config::{AppConfig, WatchedContract};
 use txwatch_notifier::send_webhook;
 use txwatch_rules::{evaluate, EnrichedTransaction, HorizonTransaction};
 
+pub mod event_stream;
+pub use event_stream::{EventFilter, GetEventsParams, SorobanEvent, SorobanEventStreamer};
+
 // ── Optional Prometheus metrics ───────────────────────────────────────────────
 
 #[cfg(feature = "metrics")]
