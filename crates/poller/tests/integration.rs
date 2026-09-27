@@ -374,6 +374,7 @@ async fn large_transfer_fires_above_threshold() {
         &format!("{}/hook", receiver.uri()),
         vec![AlertRule::LargeTransfer {
             threshold_xlm: 5_000,
+            threshold_stroops: 5_000 * 10_000_000,
         }],
     );
 
@@ -686,6 +687,7 @@ async fn large_transfer_poll_fires_webhook_and_advances_cursor() {
         &format!("{}/hook", receiver.uri()),
         vec![AlertRule::LargeTransfer {
             threshold_xlm: 1000,
+            threshold_stroops: 1000 * 10_000_000,
         }],
     );
     contract.horizon_base_url_override = Some(horizon.uri());

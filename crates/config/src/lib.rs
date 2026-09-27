@@ -211,6 +211,11 @@ pub enum AlertRule {
     TransactionFailed,
     LargeTransfer {
         threshold_xlm: u64,
+        /// Pre-computed stroops value set during validation (`threshold_xlm * 10_000_000`).
+        /// Skipped in serialisation so it does not appear in TOML or JSON config output.
+        #[serde(skip)]
+        #[schemars(skip)]
+        threshold_stroops: u64,
     },
     FunctionCalled {
         function_name: String,
@@ -232,7 +237,10 @@ pub enum AlertRule {
 impl AlertRule {
     pub fn validate(&mut self, contract_label: &str) -> Result<()> {
         match self {
-            AlertRule::LargeTransfer { threshold_xlm } => {
+            AlertRule::LargeTransfer {
+                threshold_xlm,
+                threshold_stroops,
+            } => {
                 if *threshold_xlm == 0 {
                     bail!(
                         "contract '{}': LargeTransfer threshold_xlm must be > 0",
@@ -246,6 +254,11 @@ impl AlertRule {
                         MAX_LARGE_TRANSFER_THRESHOLD_XLM
                     );
                 }
+                // Pre-compute once here; the cap above ensures this cannot overflow
+                // (1_000_000_000 * 10_000_000 = 10^16, well within u64::MAX).
+                *threshold_stroops = threshold_xlm
+                    .checked_mul(10_000_000)
+                    .expect("LargeTransfer stroop conversion overflow — should have been caught by the cap above");
             }
             AlertRule::FunctionCalled { function_name } => {
                 if function_name.trim().is_empty() {
@@ -305,11 +318,14 @@ impl AlertRule {
         }
         Ok(())
     }
+
+    /// Human-readable rule label, e.g. `"LargeTransfer(>=10000XLM)"`.
+    /// Used in CLI `validate` output and in the `rule_triggered` webhook field.
     pub fn label(&self) -> String {
         match self {
             AlertRule::AnyTransaction => "AnyTransaction".into(),
             AlertRule::TransactionFailed => "TransactionFailed".into(),
-            AlertRule::LargeTransfer { threshold_xlm } => {
+            AlertRule::LargeTransfer { threshold_xlm, .. } => {
                 format!("LargeTransfer(>={}XLM)", threshold_xlm)
             }
             AlertRule::FunctionCalled { function_name } => {
@@ -328,6 +344,19 @@ impl AlertRule {
                     format!("HighFee(>={} stroops)", threshold_stroops)
                 }
             }
+        }
+    }
+
+    /// Stable machine-readable rule variant name, e.g. `"LargeTransfer"`.
+    /// Used in the `rule_type` webhook field for programmatic routing.
+    pub fn rule_type(&self) -> &'static str {
+        match self {
+            AlertRule::AnyTransaction => "AnyTransaction",
+            AlertRule::TransactionFailed => "TransactionFailed",
+            AlertRule::LargeTransfer { .. } => "LargeTransfer",
+            AlertRule::FunctionCalled { .. } => "FunctionCalled",
+            AlertRule::AdminFunctionCalled { .. } => "AdminFunctionCalled",
+            AlertRule::HighFee { .. } => "HighFee",
         }
     }
 }
@@ -745,8 +774,30 @@ mod tests {
     #[test]
     fn rejects_zero_threshold() {
         let mut c = valid_contract();
-        c.rules = vec![AlertRule::LargeTransfer { threshold_xlm: 0 }];
+        c.rules = vec![AlertRule::LargeTransfer { threshold_xlm: 0, threshold_stroops: 0 }];
         assert!(c.validate().is_err());
+    }
+
+    /// #43: LargeTransfer::threshold_stroops is pre-computed once during validation.
+    #[test]
+    fn large_transfer_threshold_normalises_to_stroops() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::LargeTransfer {
+            threshold_xlm: 10_000,
+            threshold_stroops: 0,
+        }];
+        c.validate().unwrap();
+        if let AlertRule::LargeTransfer {
+            threshold_stroops, ..
+        } = &c.rules[0]
+        {
+            assert_eq!(
+                *threshold_stroops, 100_000_000_000,
+                "10_000 XLM should become 100_000_000_000 stroops"
+            );
+        } else {
+            panic!("expected LargeTransfer");
+        }
     }
 
     #[test]
@@ -754,6 +805,7 @@ mod tests {
         let mut c = valid_contract();
         c.rules = vec![AlertRule::LargeTransfer {
             threshold_xlm: MAX_LARGE_TRANSFER_THRESHOLD_XLM + 1,
+            threshold_stroops: 0,
         }];
         let err = c.validate().unwrap_err();
         assert!(err
@@ -941,7 +993,7 @@ mod tests {
         bad_id.webhook_url = "ftp://bad".into();
         let mut bad_rule = valid_contract();
         bad_rule.label = "B".into();
-        bad_rule.rules = vec![AlertRule::LargeTransfer { threshold_xlm: 0 }];
+        bad_rule.rules = vec![AlertRule::LargeTransfer { threshold_xlm: 0, threshold_stroops: 0 }];
         let mut cfg = AppConfig {
             poll_interval_seconds: 1,
             contracts: vec![bad_id, bad_rule, valid_contract(), valid_contract()],

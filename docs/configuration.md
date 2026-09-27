@@ -166,6 +166,8 @@ threshold_stroops = 1000000
   "function_name":       "transfer",
   "function_names":      ["transfer"],
   "amount_xlm":          15000,
+  "amount_stroops":      150000000000000,
+  "amount_xlm_decimal":  "15000.0000000",
   "fee_charged_stroops": 50000,
   "timestamp":           1705316096,
   "timestamp_iso":       "2024-01-15T12:00:00Z",
@@ -179,7 +181,9 @@ This example and the one in the README are checked against `AlertPayload` by
 
 - `rule_type` — stable machine-readable rule variant (e.g. `"LargeTransfer"`); use it for routing.
 - `rule_triggered` — human-readable rule description including parameters.
-- `amount_xlm` — whole-XLM transfer amount, or `null` when the transaction has none.
+- `amount_xlm` — whole-XLM transfer amount (truncated integer), or `null` when the transaction has none. Kept for backward compatibility — use `amount_xlm_decimal` for precise accounting.
+- `amount_stroops` — raw transfer amount in stroops (1 XLM = 10,000,000 stroops), or `null` when the transaction has none.
+- `amount_xlm_decimal` — transfer amount as a decimal string with 7 fractional digits (e.g. `"9999.9900000"`), or `null` when the transaction has none. Use this instead of `amount_xlm` when precision matters.
 - `fee_charged_stroops` — fee charged for the transaction in stroops, or `null` if unknown.
 - `timestamp` / `timestamp_iso` — ledger close time as Unix seconds and as an ISO 8601 string.
 - `function_name` — the first invoked Soroban function name (present for backward compatibility).
