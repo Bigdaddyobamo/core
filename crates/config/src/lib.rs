@@ -204,6 +204,42 @@ impl fmt::Display for Network {
 
 // ── AlertRule ─────────────────────────────────────────────────────────────────
 
+/// Maximum nesting depth for composite rules (All / Any / Not).
+pub const MAX_COMPOSITE_DEPTH: usize = 5;
+
+/// Allowed severity levels for alert rules.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    Info,
+    Warning,
+    Critical,
+}
+
+impl fmt::Display for Severity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Severity::Info => f.write_str("info"),
+            Severity::Warning => f.write_str("warning"),
+            Severity::Critical => f.write_str("critical"),
+        }
+    }
+}
+
+/// A validated Stellar G-address (56 chars, starts with 'G').
+fn validate_stellar_address(addr: &str, field: &str, contract_label: &str) -> Result<()> {
+    if addr.len() != 56 || !addr.starts_with('G') || !addr.chars().all(|c| c.is_ascii_alphanumeric()) {
+        bail!(
+            "contract '{}': {} '{}' is not a valid Stellar account address \
+             (must start with 'G' and be 56 alphanumeric characters)",
+            contract_label,
+            field,
+            addr
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(tag = "type")]
 pub enum AlertRule {
@@ -227,10 +263,61 @@ pub enum AlertRule {
         #[serde(default)]
         threshold_xlm: Option<u64>,
     },
+    /// Fires when the transaction source account is in (or not in) a list of G-addresses.
+    SourceAccount {
+        /// If set, only fire when `source_account` is one of these addresses.
+        #[serde(default)]
+        allow: Vec<String>,
+        /// If set, fire when `source_account` is one of these addresses.
+        #[serde(default)]
+        deny: Vec<String>,
+    },
+    /// Fires when **all** nested rules match.
+    All {
+        rules: Vec<RuleEntry>,
+    },
+    /// Fires when **any** nested rule matches.
+    Any {
+        rules: Vec<RuleEntry>,
+    },
+    /// Fires when the nested rule does **not** match.
+    Not {
+        rule: Box<RuleEntry>,
+    },
+}
+
+/// A rule entry with optional per-rule overrides.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct RuleEntry {
+    /// Set `enabled = false` to silence a rule without removing it.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Override the webhook URL for this rule (falls back to the contract's URL).
+    #[serde(default)]
+    pub webhook_url: Option<String>,
+    /// Override the webhook secret for this rule.
+    #[serde(default)]
+    pub webhook_secret: Option<String>,
+    /// Optional severity level included in the alert payload.
+    #[serde(default)]
+    pub severity: Option<Severity>,
+    #[serde(flatten)]
+    pub rule: AlertRule,
 }
 
 impl AlertRule {
     pub fn validate(&mut self, contract_label: &str) -> Result<()> {
+        self.validate_at_depth(contract_label, 0)
+    }
+
+    fn validate_at_depth(&mut self, contract_label: &str, depth: usize) -> Result<()> {
+        if depth > MAX_COMPOSITE_DEPTH {
+            bail!(
+                "contract '{}': composite rule nesting exceeds maximum depth ({})",
+                contract_label,
+                MAX_COMPOSITE_DEPTH
+            );
+        }
         match self {
             AlertRule::LargeTransfer { threshold_xlm } => {
                 if *threshold_xlm == 0 {
@@ -302,9 +389,49 @@ impl AlertRule {
                 }
                 _ => {}
             },
+            AlertRule::SourceAccount { allow, deny } => {
+                if allow.is_empty() && deny.is_empty() {
+                    bail!(
+                        "contract '{}': SourceAccount: at least one of 'allow' or 'deny' must be non-empty",
+                        contract_label
+                    );
+                }
+                for addr in allow.iter() {
+                    validate_stellar_address(addr, "SourceAccount allow entry", contract_label)?;
+                }
+                for addr in deny.iter() {
+                    validate_stellar_address(addr, "SourceAccount deny entry", contract_label)?;
+                }
+            }
+            AlertRule::All { rules } => {
+                if rules.is_empty() {
+                    bail!(
+                        "contract '{}': All: rules list must not be empty",
+                        contract_label
+                    );
+                }
+                for entry in rules.iter_mut() {
+                    entry.validate_at_depth(contract_label, depth + 1)?;
+                }
+            }
+            AlertRule::Any { rules } => {
+                if rules.is_empty() {
+                    bail!(
+                        "contract '{}': Any: rules list must not be empty",
+                        contract_label
+                    );
+                }
+                for entry in rules.iter_mut() {
+                    entry.validate_at_depth(contract_label, depth + 1)?;
+                }
+            }
+            AlertRule::Not { rule } => {
+                rule.validate_at_depth(contract_label, depth + 1)?;
+            }
         }
         Ok(())
     }
+
     pub fn label(&self) -> String {
         match self {
             AlertRule::AnyTransaction => "AnyTransaction".into(),
@@ -328,7 +455,52 @@ impl AlertRule {
                     format!("HighFee(>={} stroops)", threshold_stroops)
                 }
             }
+            AlertRule::SourceAccount { allow, deny } => {
+                let mut parts = Vec::new();
+                if !allow.is_empty() {
+                    parts.push(format!("allow=[{}]", allow.join(", ")));
+                }
+                if !deny.is_empty() {
+                    parts.push(format!("deny=[{}]", deny.join(", ")));
+                }
+                format!("SourceAccount({})", parts.join(", "))
+            }
+            AlertRule::All { rules } => {
+                let inner: Vec<String> = rules.iter().map(|e| e.rule.label()).collect();
+                format!("All({})", inner.join(", "))
+            }
+            AlertRule::Any { rules } => {
+                let inner: Vec<String> = rules.iter().map(|e| e.rule.label()).collect();
+                format!("Any({})", inner.join(", "))
+            }
+            AlertRule::Not { rule } => {
+                format!("Not({})", rule.rule.label())
+            }
         }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl RuleEntry {
+    pub fn validate(&mut self, contract_label: &str) -> Result<()> {
+        self.validate_at_depth(contract_label, 0)
+    }
+
+    fn validate_at_depth(&mut self, contract_label: &str, depth: usize) -> Result<()> {
+        if let Some(url) = &self.webhook_url {
+            if let Some(problem) = check_http_url(url) {
+                bail!(
+                    "contract '{}': rule webhook_url {}",
+                    contract_label,
+                    problem
+                );
+            }
+        }
+        self.rule.validate_at_depth(contract_label, depth)?;
+        Ok(())
     }
 }
 
@@ -340,7 +512,7 @@ pub struct WatchedContract {
     pub label: String,
     pub contract_id: String,
     pub network: Network,
-    pub rules: Vec<AlertRule>,
+    pub rules: Vec<RuleEntry>,
     pub webhook_url: String,
     /// Optional secret sent as X-TxWatch-Secret header on every webhook POST.
     /// Supports `${ENV_VAR}` interpolation (e.g. `webhook_secret = "${MY_SECRET}"`).
@@ -349,6 +521,9 @@ pub struct WatchedContract {
     /// `poll_interval_seconds`. Same bounds (5–3600).
     #[serde(default)]
     pub poll_interval_seconds: Option<u64>,
+    /// Set `enabled = false` to pause monitoring this contract without removing it.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     /// Override the Horizon base URL; never read from TOML — set programmatically in tests.
     #[serde(skip, default)]
     #[schemars(skip)]
@@ -414,32 +589,29 @@ impl WatchedContract {
     fn collect_errors(&mut self) -> Vec<String> {
         let mut errors = Vec::new();
 
-        if self.label.trim().is_empty() {
-            errors.push("a contract has an empty label".to_owned());
         self.label = self.label.trim().to_owned();
         if self.label.is_empty() {
-            bail!("a contract has an empty label");
-        }
-        // Labels end up in log lines and CLI output; `{:?}` escapes the
-        // offending characters so the error itself cannot inject them.
-        if self.label.chars().any(char::is_control) {
-            bail!(
+            errors.push("a contract has an empty label".to_owned());
+        } else if self.label.chars().any(char::is_control) {
+            errors.push(format!(
                 "contract label {:?} must not contain control characters",
                 self.label
-            );
-        }
-        if self.label.chars().count() > MAX_LABEL_LEN {
-            bail!(
+            ));
+        } else if self.label.chars().count() > MAX_LABEL_LEN {
+            errors.push(format!(
                 "contract label '{}…' is longer than {} characters",
                 self.label.chars().take(32).collect::<String>(),
                 MAX_LABEL_LEN
-            );
+            ));
         }
+
         if let Some(interval) = self.poll_interval_seconds {
-            validate_poll_interval(
+            if let Err(e) = validate_poll_interval(
                 interval,
                 &format!("contract '{}': poll_interval_seconds", self.label),
-            )?;
+            ) {
+                errors.push(e.to_string());
+            }
         }
 
         // Stellar contract addresses start with 'C' and are 56 chars (base32)
@@ -582,6 +754,11 @@ impl AppConfig {
             if let Some(secret) = &contract.webhook_secret {
                 contract.webhook_secret = Some(resolve_env_interpolation(secret)?);
             }
+            for entry in &mut contract.rules {
+                if let Some(secret) = &entry.webhook_secret {
+                    entry.webhook_secret = Some(resolve_env_interpolation(secret)?);
+                }
+            }
         }
         Ok(())
     }
@@ -605,43 +782,46 @@ impl AppConfig {
     /// Validates the whole config and reports every error found, not just the first.
     pub fn validate(&mut self) -> Result<()> {
         let mut errors = Vec::new();
-        if self.poll_interval_seconds < 5 {
-            errors.push("poll_interval_seconds must be >= 5".to_owned());
+
+        if let Err(e) = validate_poll_interval(self.poll_interval_seconds, "poll_interval_seconds") {
+            errors.push(e.to_string());
         }
-        if self.poll_interval_seconds > 3600 {
-            errors.push("poll_interval_seconds must be <= 3600 (1 hour)".to_owned());
-        validate_poll_interval(self.poll_interval_seconds, "poll_interval_seconds")?;
+
         if self.http_pool_max_idle_per_host == 0
             || self.http_pool_max_idle_per_host > MAX_HTTP_POOL_MAX_IDLE_PER_HOST
         {
-            bail!(
+            errors.push(format!(
                 "http_pool_max_idle_per_host must be between 1 and {}",
                 MAX_HTTP_POOL_MAX_IDLE_PER_HOST
-            );
+            ));
         }
+
         if self.http_tcp_keepalive_secs > MAX_HTTP_TCP_KEEPALIVE_SECS {
-            bail!(
+            errors.push(format!(
                 "http_tcp_keepalive_secs must be <= {} (0 disables keepalive)",
                 MAX_HTTP_TCP_KEEPALIVE_SECS
-            );
+            ));
         }
+
         if self.contracts.is_empty() {
             errors.push("at least one [[contracts]] entry is required".to_owned());
         }
+
         for contract in &mut self.contracts {
             errors.extend(contract.collect_errors());
         }
-        // Labels are already trimmed by `WatchedContract::validate`; compare
+
+        // Labels are already trimmed by `collect_errors`; compare
         // case-insensitively so "Vault" and "vault" count as duplicates.
         let mut seen = std::collections::HashSet::new();
         let mut reported = std::collections::HashSet::new();
         for contract in &self.contracts {
-            if !seen.insert(&contract.label) && reported.insert(&contract.label) {
+            let key = contract.label.to_lowercase();
+            if !seen.insert(key) && reported.insert(contract.label.clone()) {
                 errors.push(format!("duplicate contract label '{}'", contract.label));
-            if !seen.insert(contract.label.to_lowercase()) {
-                bail!("duplicate contract label '{}'", contract.label);
             }
         }
+
         ValidationErrors::into_result(errors)
     }
 }
@@ -653,15 +833,26 @@ impl AppConfig {
 mod tests {
     use super::*;
 
+    fn rule(r: AlertRule) -> RuleEntry {
+        RuleEntry {
+            enabled: true,
+            webhook_url: None,
+            webhook_secret: None,
+            severity: None,
+            rule: r,
+        }
+    }
+
     fn valid_contract() -> WatchedContract {
         WatchedContract {
             label: "Test".into(),
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
             network: Network::Testnet,
-            rules: vec![AlertRule::AnyTransaction],
+            rules: vec![rule(AlertRule::AnyTransaction)],
             webhook_url: "https://example.com/hook".into(),
             webhook_secret: None,
             poll_interval_seconds: None,
+            enabled: true,
             horizon_base_url_override: None,
         }
     }
@@ -745,16 +936,16 @@ mod tests {
     #[test]
     fn rejects_zero_threshold() {
         let mut c = valid_contract();
-        c.rules = vec![AlertRule::LargeTransfer { threshold_xlm: 0 }];
+        c.rules = vec![rule(AlertRule::LargeTransfer { threshold_xlm: 0 })];
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn rejects_too_large_large_transfer_threshold() {
         let mut c = valid_contract();
-        c.rules = vec![AlertRule::LargeTransfer {
+        c.rules = vec![rule(AlertRule::LargeTransfer {
             threshold_xlm: MAX_LARGE_TRANSFER_THRESHOLD_XLM + 1,
-        }];
+        })];
         let err = c.validate().unwrap_err();
         assert!(err
             .to_string()
@@ -764,18 +955,18 @@ mod tests {
     #[test]
     fn rejects_empty_function_name() {
         let mut c = valid_contract();
-        c.rules = vec![AlertRule::FunctionCalled {
+        c.rules = vec![rule(AlertRule::FunctionCalled {
             function_name: "  ".into(),
-        }];
+        })];
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn rejects_empty_admin_function_names() {
         let mut c = valid_contract();
-        c.rules = vec![AlertRule::AdminFunctionCalled {
+        c.rules = vec![rule(AlertRule::AdminFunctionCalled {
             function_names: vec![],
-        }];
+        })];
         assert!(c.validate().is_err());
     }
 
@@ -783,9 +974,9 @@ mod tests {
     #[test]
     fn rejects_blank_entry_in_admin_function_names() {
         let mut c = valid_contract();
-        c.rules = vec![AlertRule::AdminFunctionCalled {
+        c.rules = vec![rule(AlertRule::AdminFunctionCalled {
             function_names: vec!["set_admin".into(), " ".into()],
-        }];
+        })];
         let err = c.validate().unwrap_err();
         assert!(
             err.to_string().contains("blank"),
@@ -798,20 +989,20 @@ mod tests {
     #[test]
     fn accepts_single_valid_admin_function_name() {
         let mut c = valid_contract();
-        c.rules = vec![AlertRule::AdminFunctionCalled {
+        c.rules = vec![rule(AlertRule::AdminFunctionCalled {
             function_names: vec!["set_admin".into()],
-        }];
+        })];
         assert!(c.validate().is_ok());
     }
 
     #[test]
     fn admin_function_names_normalised_to_lowercase() {
         let mut c = valid_contract();
-        c.rules = vec![AlertRule::AdminFunctionCalled {
+        c.rules = vec![rule(AlertRule::AdminFunctionCalled {
             function_names: vec!["Set_Admin".into(), "UPGRADE".into()],
-        }];
+        })];
         c.validate().unwrap();
-        if let AlertRule::AdminFunctionCalled { function_names } = &c.rules[0] {
+        if let AlertRule::AdminFunctionCalled { function_names } = &c.rules[0].rule {
             assert_eq!(function_names, &["set_admin", "upgrade"]);
         } else {
             panic!("expected AdminFunctionCalled");
@@ -941,12 +1132,12 @@ mod tests {
         bad_id.webhook_url = "ftp://bad".into();
         let mut bad_rule = valid_contract();
         bad_rule.label = "B".into();
-        bad_rule.rules = vec![AlertRule::LargeTransfer { threshold_xlm: 0 }];
+        bad_rule.rules = vec![rule(AlertRule::LargeTransfer { threshold_xlm: 0 })];
         let mut cfg = AppConfig {
             poll_interval_seconds: 1,
             contracts: vec![bad_id, bad_rule, valid_contract(), valid_contract()],
-            http_pool_max_idle_per_host: None,
-            http_tcp_keepalive_secs: None,
+            http_pool_max_idle_per_host: DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST,
+            http_tcp_keepalive_secs: DEFAULT_HTTP_TCP_KEEPALIVE_SECS,
             http_connection_verbose: None,
             cursor_file: None,
         };
@@ -1008,14 +1199,14 @@ mod tests {
     #[test]
     fn high_fee_threshold_xlm_normalises_to_stroops() {
         let mut c = valid_contract();
-        c.rules = vec![AlertRule::HighFee {
+        c.rules = vec![rule(AlertRule::HighFee {
             threshold_stroops: 0,
             threshold_xlm: Some(1),
-        }];
+        })];
         c.validate().unwrap();
         if let AlertRule::HighFee {
             threshold_stroops, ..
-        } = &c.rules[0]
+        } = &c.rules[0].rule
         {
             assert_eq!(
                 *threshold_stroops, 10_000_000,
@@ -1029,20 +1220,20 @@ mod tests {
     #[test]
     fn high_fee_threshold_xlm_zero_is_rejected() {
         let mut c = valid_contract();
-        c.rules = vec![AlertRule::HighFee {
+        c.rules = vec![rule(AlertRule::HighFee {
             threshold_stroops: 0,
             threshold_xlm: Some(0),
-        }];
+        })];
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn high_fee_both_thresholds_is_rejected() {
         let mut c = valid_contract();
-        c.rules = vec![AlertRule::HighFee {
+        c.rules = vec![rule(AlertRule::HighFee {
             threshold_stroops: 100,
             threshold_xlm: Some(1),
-        }];
+        })];
         let err = c.validate().unwrap_err();
         assert!(err.to_string().contains("not both"));
     }
@@ -1050,10 +1241,10 @@ mod tests {
     #[test]
     fn high_fee_neither_threshold_is_rejected() {
         let mut c = valid_contract();
-        c.rules = vec![AlertRule::HighFee {
+        c.rules = vec![rule(AlertRule::HighFee {
             threshold_stroops: 0,
             threshold_xlm: None,
-        }];
+        })];
         assert!(c.validate().is_err());
     }
 
@@ -1277,9 +1468,9 @@ mod tests {
     #[test]
     fn rejects_function_name_longer_than_32_chars() {
         let mut c = valid_contract();
-        c.rules = vec![AlertRule::FunctionCalled {
+        c.rules = vec![rule(AlertRule::FunctionCalled {
             function_name: "a".repeat(33),
-        }];
+        })];
         let err = c.validate().unwrap_err().to_string();
         assert!(err.contains("contract 'Test'"), "got: {}", err);
         assert!(err.contains("FunctionCalled"), "got: {}", err);
@@ -1293,9 +1484,9 @@ mod tests {
     #[test]
     fn accepts_function_name_of_32_chars() {
         let mut c = valid_contract();
-        c.rules = vec![AlertRule::FunctionCalled {
+        c.rules = vec![rule(AlertRule::FunctionCalled {
             function_name: "a".repeat(32),
-        }];
+        })];
         assert!(c.validate().is_ok());
     }
 
@@ -1303,9 +1494,9 @@ mod tests {
     fn rejects_function_name_with_invalid_characters() {
         for name in ["with-draw", "with draw", "withdraw()", "wïthdraw"] {
             let mut c = valid_contract();
-            c.rules = vec![AlertRule::FunctionCalled {
+            c.rules = vec![rule(AlertRule::FunctionCalled {
                 function_name: name.into(),
-            }];
+            })];
             let err = c.validate().unwrap_err().to_string();
             assert!(
                 err.contains("not a valid Soroban symbol"),
@@ -1319,9 +1510,9 @@ mod tests {
     #[test]
     fn rejects_function_name_with_surrounding_whitespace() {
         let mut c = valid_contract();
-        c.rules = vec![AlertRule::FunctionCalled {
+        c.rules = vec![rule(AlertRule::FunctionCalled {
             function_name: "withdraw ".into(),
-        }];
+        })];
         let err = c.validate().unwrap_err().to_string();
         assert!(err.contains("\"withdraw \""), "got: {}", err);
     }
@@ -1329,9 +1520,9 @@ mod tests {
     #[test]
     fn rejects_invalid_admin_function_name() {
         let mut c = valid_contract();
-        c.rules = vec![AlertRule::AdminFunctionCalled {
+        c.rules = vec![rule(AlertRule::AdminFunctionCalled {
             function_names: vec!["set_admin".into(), " upgrade".into()],
-        }];
+        })];
         let err = c.validate().unwrap_err().to_string();
         assert!(err.contains("AdminFunctionCalled"), "got: {}", err);
         assert!(err.contains("not a valid Soroban symbol"), "got: {}", err);
@@ -1374,5 +1565,227 @@ mod tests {
             "error should name the offending field, got: {}",
             error_msg
         );
+    }
+
+    // ── #54: enabled flag ────────────────────────────────────────────────────
+
+    #[test]
+    fn disabled_contract_parses() {
+        let raw = r#"
+            poll_interval_seconds = 10
+            [[contracts]]
+            label       = "Off"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network     = "testnet"
+            webhook_url = "https://example.com/hook"
+            enabled     = false
+            [[contracts.rules]]
+            type = "AnyTransaction"
+        "#;
+        let mut cfg: AppConfig = toml::from_str(raw).unwrap();
+        cfg.validate().unwrap();
+        assert!(!cfg.contracts[0].enabled);
+    }
+
+    #[test]
+    fn disabled_rule_parses() {
+        let raw = r#"
+            poll_interval_seconds = 10
+            [[contracts]]
+            label       = "C"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network     = "testnet"
+            webhook_url = "https://example.com/hook"
+            [[contracts.rules]]
+            type    = "AnyTransaction"
+            enabled = false
+        "#;
+        let mut cfg: AppConfig = toml::from_str(raw).unwrap();
+        cfg.validate().unwrap();
+        assert!(!cfg.contracts[0].rules[0].enabled);
+    }
+
+    #[test]
+    fn enabled_defaults_to_true() {
+        let mut c = valid_contract();
+        c.validate().unwrap();
+        assert!(c.enabled);
+        assert!(c.rules[0].enabled);
+    }
+
+    // ── #53: per-rule webhook_url, webhook_secret, severity ─────────────────
+
+    #[test]
+    fn per_rule_webhook_url_accepted() {
+        let raw = r#"
+            poll_interval_seconds = 10
+            [[contracts]]
+            label       = "C"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network     = "testnet"
+            webhook_url = "https://example.com/hook"
+            [[contracts.rules]]
+            type        = "AnyTransaction"
+            webhook_url = "https://pagerduty.example.com/alert"
+            severity    = "critical"
+        "#;
+        let mut cfg: AppConfig = toml::from_str(raw).unwrap();
+        cfg.validate().unwrap();
+        let entry = &cfg.contracts[0].rules[0];
+        assert_eq!(
+            entry.webhook_url.as_deref(),
+            Some("https://pagerduty.example.com/alert")
+        );
+        assert_eq!(entry.severity, Some(Severity::Critical));
+    }
+
+    #[test]
+    fn per_rule_webhook_url_invalid_is_rejected() {
+        let raw = r#"
+            poll_interval_seconds = 10
+            [[contracts]]
+            label       = "C"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network     = "testnet"
+            webhook_url = "https://example.com/hook"
+            [[contracts.rules]]
+            type        = "AnyTransaction"
+            webhook_url = "ftp://bad"
+        "#;
+        let mut cfg: AppConfig = toml::from_str(raw).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("rule webhook_url"), "got: {}", err);
+    }
+
+    // ── #52: composite rules ─────────────────────────────────────────────────
+
+    #[test]
+    fn all_rule_parses_and_validates() {
+        let raw = r#"
+            poll_interval_seconds = 10
+            [[contracts]]
+            label       = "C"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network     = "testnet"
+            webhook_url = "https://example.com/hook"
+            [[contracts.rules]]
+            type = "All"
+            [[contracts.rules.rules]]
+            type          = "LargeTransfer"
+            threshold_xlm = 1000
+            [[contracts.rules.rules]]
+            type = "TransactionFailed"
+        "#;
+        let mut cfg: AppConfig = toml::from_str(raw).unwrap();
+        cfg.validate().unwrap();
+        if let AlertRule::All { rules } = &cfg.contracts[0].rules[0].rule {
+            assert_eq!(rules.len(), 2);
+        } else {
+            panic!("expected All rule");
+        }
+    }
+
+    #[test]
+    fn not_rule_parses_and_validates() {
+        let raw = r#"
+            poll_interval_seconds = 10
+            [[contracts]]
+            label       = "C"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network     = "testnet"
+            webhook_url = "https://example.com/hook"
+            [[contracts.rules]]
+            type = "Not"
+            [contracts.rules.rule]
+            type = "TransactionFailed"
+        "#;
+        let mut cfg: AppConfig = toml::from_str(raw).unwrap();
+        cfg.validate().unwrap();
+        assert!(matches!(
+            cfg.contracts[0].rules[0].rule,
+            AlertRule::Not { .. }
+        ));
+    }
+
+    #[test]
+    fn all_rule_empty_is_rejected() {
+        let mut c = valid_contract();
+        c.rules = vec![rule(AlertRule::All { rules: vec![] })];
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("All: rules list must not be empty"), "got: {}", err);
+    }
+
+    #[test]
+    fn composite_rule_label_is_readable() {
+        let r = AlertRule::All {
+            rules: vec![
+                RuleEntry {
+                    enabled: true,
+                    webhook_url: None,
+                    webhook_secret: None,
+                    severity: None,
+                    rule: AlertRule::FunctionCalled {
+                        function_name: "withdraw".into(),
+                    },
+                },
+                RuleEntry {
+                    enabled: true,
+                    webhook_url: None,
+                    webhook_secret: None,
+                    severity: None,
+                    rule: AlertRule::LargeTransfer {
+                        threshold_xlm: 10_000,
+                    },
+                },
+            ],
+        };
+        assert_eq!(
+            r.label(),
+            "All(FunctionCalled(withdraw), LargeTransfer(>=10000XLM))"
+        );
+    }
+
+    // ── #51: SourceAccount rule ───────────────────────────────────────────────
+
+    #[test]
+    fn source_account_allow_validates() {
+        let mut c = valid_contract();
+        c.rules = vec![rule(AlertRule::SourceAccount {
+            allow: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into()],
+            deny: vec![],
+        })];
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn source_account_deny_validates() {
+        let mut c = valid_contract();
+        c.rules = vec![rule(AlertRule::SourceAccount {
+            allow: vec![],
+            deny: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into()],
+        })];
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn source_account_empty_both_is_rejected() {
+        let mut c = valid_contract();
+        c.rules = vec![rule(AlertRule::SourceAccount {
+            allow: vec![],
+            deny: vec![],
+        })];
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("at least one of 'allow' or 'deny'"), "got: {}", err);
+    }
+
+    #[test]
+    fn source_account_invalid_address_is_rejected() {
+        let mut c = valid_contract();
+        c.rules = vec![rule(AlertRule::SourceAccount {
+            allow: vec!["NOT_A_STELLAR_ADDR".into()],
+            deny: vec![],
+        })];
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("not a valid Stellar account address"), "got: {}", err);
     }
 }

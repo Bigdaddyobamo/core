@@ -205,9 +205,10 @@ async fn main() -> Result<()> {
             println!();
             for c in &cfg.contracts {
                 println!(
-                    "  [{network}] {label}",
+                    "  [{network}] {label}{disabled}",
                     network = c.network.display_name(),
-                    label = c.label
+                    label = c.label,
+                    disabled = if c.enabled { "" } else { " (disabled)" }
                 );
                 println!("    contract_id  : {}", c.contract_id);
                 println!("    webhook_url  : {}", c.webhook_url);
@@ -229,8 +230,12 @@ async fn main() -> Result<()> {
                     }
                 );
                 println!("    rules        : {}", c.rules.len());
-                for rule in &c.rules {
-                    println!("      - {}", rule.label());
+                for entry in &c.rules {
+                    if entry.enabled {
+                        println!("      - {}", entry.rule.label());
+                    } else {
+                        println!("      - {} (disabled)", entry.rule.label());
+                    }
                 }
                 println!("    horizon      : {}", c.network.horizon_base_url());
                 match c.network.explorer_base_url() {
@@ -536,16 +541,30 @@ fn config_summary_json(cfg: &AppConfig) -> serde_json::Value {
         .contracts
         .iter()
         .map(|c| {
+            let rules: Vec<_> = c.rules.iter().map(|entry| {
+                let mut obj = serde_json::to_value(&entry.rule)
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                let map = obj.as_object_mut().unwrap();
+                map.insert("enabled".to_string(), serde_json::json!(entry.enabled));
+                if let Some(url) = &entry.webhook_url {
+                    map.insert("webhook_url".to_string(), serde_json::json!(url));
+                }
+                if let Some(sev) = &entry.severity {
+                    map.insert("severity".to_string(), serde_json::json!(sev.to_string()));
+                }
+                serde_json::Value::Object(map.clone())
+            }).collect();
             serde_json::json!({
                 "label": c.label,
                 "contract_id": c.contract_id,
                 "network": c.network.as_str(),
+                "enabled": c.enabled,
                 "poll_interval_seconds": c.effective_poll_interval(cfg.poll_interval_seconds),
                 "webhook_url": c.webhook_url,
                 "webhook_secret_set": c.webhook_secret.is_some(),
-                "rules": c.rules,
+                "rules": rules,
                 "horizon_url": c.network.horizon_base_url(),
-                "explorer_url": format!("{}/contract/{}", c.network.explorer_base_url(), c.contract_id),
+                "explorer_url": format!("{}/contract/{}", c.network.explorer_base_url().unwrap_or(""), c.contract_id),
             })
         })
         .collect();
