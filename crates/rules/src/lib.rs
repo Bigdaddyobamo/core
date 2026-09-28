@@ -9,6 +9,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use txwatch_config::AlertRule;
 
+pub mod yield_calculator;
+pub use yield_calculator::{PoolYield, YieldCalculator};
+
 // ── Constants ──────────────────────────────────────────────────────────────────
 
 /// Maximum XLM supply in stroops: 50 billion XLM × 10^7 stroops/XLM.
