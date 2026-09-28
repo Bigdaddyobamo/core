@@ -405,6 +405,11 @@ pub struct WatchedContract {
     /// `poll_interval_seconds`. Same bounds (5–3600).
     #[serde(default)]
     pub poll_interval_seconds: Option<u64>,
+    /// Deliver all alerts from one poll cycle as a single `{"alerts": [...]}`
+    /// POST (split into batches of at most 50) instead of one POST per alert.
+    /// Default: false.
+    #[serde(default)]
+    pub batch_alerts: bool,
     /// Override the Horizon base URL; never read from TOML — set programmatically in tests.
     #[serde(skip, default)]
     #[schemars(skip)]
@@ -665,10 +670,15 @@ impl WatchedContract {
 
 // ── AppConfig ─────────────────────────────────────────────────────────────────
 
-/// Maximum number of watched contracts allowed in a single configuration.
-/// Exceeding this limit would create too many concurrent Horizon polling tasks,
-/// potentially exhausting memory or file descriptors.
+/// Default maximum number of watched contracts in a single configuration.
+/// Every contract is polled by its own task, so an unbounded list could
+/// exhaust memory, file descriptors or the Horizon rate limit. Raise it with
+/// the top-level `max_contracts` setting.
 pub const MAX_CONTRACTS: usize = 100;
+
+/// Upper bound for the `max_contracts` override, for operators running their
+/// own Horizon instance.
+pub const MAX_CONTRACTS_CEILING: usize = 10_000;
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -699,6 +709,11 @@ pub struct AppConfig {
     /// Default: false.
     #[serde(default)]
     pub http_connection_verbose: Option<bool>,
+    /// Maximum number of `[[contracts]]` entries (1–10000). Default: 100.
+    /// Raise it only when the Horizon instance (typically your own) can take
+    /// the extra polling load.
+    #[serde(default)]
+    pub max_contracts: Option<usize>,
 }
 
 fn default_poll_interval_seconds() -> u64 {
@@ -844,6 +859,11 @@ impl AppConfig {
         Ok(cfg)
     }
 
+    /// The contract limit in force: `max_contracts`, else [`MAX_CONTRACTS`].
+    pub fn effective_max_contracts(&self) -> usize {
+        self.max_contracts.unwrap_or(MAX_CONTRACTS)
+    }
+
     /// Validates the whole config and reports every error found, not just the first.
     pub fn validate(&mut self) -> Result<()> {
         let mut errors = Vec::new();
@@ -867,6 +887,26 @@ impl AppConfig {
         }
         if self.contracts.is_empty() {
             errors.push("at least one [[contracts]] entry is required".to_owned());
+        }
+        match self.max_contracts {
+            Some(max) if max == 0 || max > MAX_CONTRACTS_CEILING => errors.push(format!(
+                "max_contracts must be between 1 and {}",
+                MAX_CONTRACTS_CEILING
+            )),
+            _ => {
+                let max = self.effective_max_contracts();
+                if self.contracts.len() > max {
+                    errors.push(format!(
+                        "{} contracts configured, more than the limit of {}; each contract is \
+                         polled by its own task. Split the config across several TxWatch \
+                         instances, or raise max_contracts (up to {}) if your Horizon can \
+                         handle the load",
+                        self.contracts.len(),
+                        max,
+                        MAX_CONTRACTS_CEILING
+                    ));
+                }
+            }
         }
         for contract in &mut self.contracts {
             errors.extend(contract.collect_errors());
@@ -902,6 +942,7 @@ mod tests {
             webhook_secret: None,
             poll_interval_seconds: None,
             horizon_base_url_override: None,
+            batch_alerts: false,
         }
     }
 
@@ -1187,6 +1228,7 @@ mod tests {
             http_pool_max_idle_per_host: DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST,
             http_tcp_keepalive_secs: DEFAULT_HTTP_TCP_KEEPALIVE_SECS,
             http_connection_verbose: None,
+            max_contracts: None,
             cursor_file: None,
         };
         let err = cfg.validate().unwrap_err();
@@ -1220,6 +1262,7 @@ mod tests {
             http_pool_max_idle_per_host: DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST,
             http_tcp_keepalive_secs: DEFAULT_HTTP_TCP_KEEPALIVE_SECS,
             http_connection_verbose: None,
+            max_contracts: None,
             cursor_file: None,
         };
         let err = cfg.validate().unwrap_err();
@@ -1234,6 +1277,7 @@ mod tests {
             http_pool_max_idle_per_host: DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST,
             http_tcp_keepalive_secs: DEFAULT_HTTP_TCP_KEEPALIVE_SECS,
             http_connection_verbose: None,
+            max_contracts: None,
             cursor_file: None,
         };
         let err = cfg.validate().unwrap_err();
@@ -1305,6 +1349,7 @@ mod tests {
                 http_pool_max_idle_per_host: DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST,
                 http_tcp_keepalive_secs: DEFAULT_HTTP_TCP_KEEPALIVE_SECS,
                 http_connection_verbose: None,
+                max_contracts: None,
                 cursor_file: None,
             };
             let err = cfg.validate().unwrap_err();
@@ -1341,6 +1386,7 @@ mod tests {
             http_pool_max_idle_per_host: DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST,
             http_tcp_keepalive_secs: DEFAULT_HTTP_TCP_KEEPALIVE_SECS,
             http_connection_verbose: None,
+            max_contracts: None,
             cursor_file: None,
         }
     }
@@ -1615,6 +1661,72 @@ mod tests {
         );
     }
 
+    // ── Contract limit ───────────────────────────────────────────────────────
+
+    /// `n` contracts with unique labels.
+    fn contracts(n: usize) -> Vec<WatchedContract> {
+        (0..n)
+            .map(|i| {
+                let mut c = valid_contract();
+                c.label = format!("c{}", i);
+                c
+            })
+            .collect()
+    }
+
+    #[test]
+    fn accepts_exactly_max_contracts() {
+        let mut cfg = config_with(contracts(MAX_CONTRACTS));
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_more_than_max_contracts() {
+        let mut cfg = config_with(contracts(MAX_CONTRACTS + 1));
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("101 contracts configured, more than the limit of 100"),
+            "got: {}",
+            err
+        );
+        assert!(err.contains("max_contracts"), "got: {}", err);
+    }
+
+    #[test]
+    fn max_contracts_override_raises_and_lowers_the_limit() {
+        let mut cfg = config_with(contracts(150));
+        cfg.max_contracts = Some(150);
+        cfg.validate().unwrap();
+
+        let mut cfg = config_with(contracts(3));
+        cfg.max_contracts = Some(2);
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("more than the limit of 2"), "got: {}", err);
+    }
+
+    #[test]
+    fn max_contracts_override_must_be_in_range() {
+        for max in [0, MAX_CONTRACTS_CEILING + 1] {
+            let mut cfg = config_with(contracts(1));
+            cfg.max_contracts = Some(max);
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("max_contracts must be between 1 and 10000"),
+                "max={}: {}",
+                max,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn max_contracts_parses_from_toml() {
+        let mut cfg: AppConfig =
+            toml::from_str(&format!("max_contracts = 500\n{}", MINIMAL_TOML)).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.effective_max_contracts(), 500);
+        let default: AppConfig = toml::from_str(MINIMAL_TOML).unwrap();
+        assert_eq!(default.effective_max_contracts(), MAX_CONTRACTS);
     // ── Unknown fields in rules ──────────────────────────────────────────────
 
     fn parse_rule(rule_toml: &str) -> Result<AppConfig> {
@@ -1677,6 +1789,8 @@ mod tests {
 
     // ── Contract StrKey ──────────────────────────────────────────────────────
 
+    #[test]
+    fn validate_contract_id_accepts_real_contract_ids() {
     const VALID_ID: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
 
     #[test]
@@ -1685,6 +1799,43 @@ mod tests {
         for id in [
             "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
             "CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA",
+        ] {
+            assert!(validate_contract_id(id).is_ok(), "{}", id);
+        }
+    }
+
+    #[test]
+    fn validate_contract_id_reports_each_failure_distinctly() {
+        let valid = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+        assert_eq!(
+            validate_contract_id(&valid[..55]),
+            Err(ContractIdError::Length(55))
+        );
+        assert_eq!(
+            validate_contract_id("CTEST000000000000000000000000000000000000000000000000000"),
+            Err(ContractIdError::Alphabet { position: 5, found: '0' })
+        );
+        assert_eq!(
+            validate_contract_id("GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"),
+            Err(ContractIdError::VersionByte(6 << 3))
+        );
+        let mistyped = valid.replacen("LZ", "LY", 1);
+        assert!(matches!(
+            validate_contract_id(&mistyped),
+            Err(ContractIdError::Checksum { .. })
+        ));
+    }
+
+    #[test]
+    fn batch_alerts_defaults_to_false_and_parses() {
+        let cfg: AppConfig = toml::from_str(MINIMAL_TOML).unwrap();
+        assert!(!cfg.contracts[0].batch_alerts);
+        let raw = MINIMAL_TOML.replace(
+            "network = \"testnet\"",
+            "network = \"testnet\"\n        batch_alerts = true",
+        );
+        let cfg: AppConfig = toml::from_str(&raw).unwrap();
+        assert!(cfg.contracts[0].batch_alerts);
             VALID_ID,
         ] {
             assert!(validate_contract_id(id).is_ok(), "{}", id);

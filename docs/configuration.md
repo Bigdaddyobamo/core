@@ -30,6 +30,7 @@ The schema is also available from the CLI with `txwatch schema`. CI verifies tha
 | `http_pool_max_idle_per_host` | usize           | no       | `10`    | Maximum idle connections kept per host in the HTTP pool. Must be 1–100. Lower values use less memory; higher values help with many contracts. |
 | `http_tcp_keepalive_secs`     | u64             | no       | `30`    | TCP keepalive interval (seconds) for pooled HTTP connections. Must be ≤ 7200; `0` disables keepalive. |
 | `http_connection_verbose`     | bool            | no       | `false` | Reserved for HTTP connection-pool debug output. Accepted by the parser but currently has no effect. |
+| `max_contracts`               | usize           | no       | `100`   | Maximum number of `[[contracts]]` entries. Must be 1–10000. Raise it only when your Horizon instance (typically your own) can take the extra polling load. |
 
 Unknown top-level keys are rejected.
 
@@ -40,7 +41,7 @@ Unknown top-level keys are rejected.
 > higher is advised. TxWatch logs a startup warning when more than 5 contracts are polled at an effective
 > interval below 10 seconds.
 
-> **Contract limit:** `txwatch-config` declares `MAX_CONTRACTS = 100` as the supported upper bound for `[[contracts]]` entries. It is not yet enforced during validation, so keep configurations at or below 100 contracts to avoid exhausting memory or file descriptors with too many concurrent Horizon polling tasks.
+> **Contract limit:** a configuration may hold at most `max_contracts` (default `100`, `MAX_CONTRACTS` in `txwatch-config`) `[[contracts]]` entries; more is rejected at startup. Every contract is polled by its own task, so very large lists can exhaust memory, file descriptors or the public Horizon rate limit. Split large deployments across several TxWatch instances, or raise `max_contracts` (up to 10000) when polling your own Horizon.
 
 ## `[[contracts]]`
 
@@ -54,6 +55,8 @@ Each entry defines one watched Soroban contract. At least one entry is required.
 | `rules`          | array of tables | yes      | The `[[contracts.rules]]` entries (see below). At least one is required. |
 | `webhook_url`    | string          | yes      | `http://` or `https://` URL with a host that receives the alert JSON. Supports [environment interpolation](#environment-variable-interpolation). |
 | `poll_interval_seconds` | u64      | no       | Polls this contract at its own interval instead of the top-level `poll_interval_seconds`. Same bounds (5–3600). Contracts are scheduled independently; `txwatch validate` prints each contract's effective interval. |
+| `webhook_secret` | string          | no       | When set, every webhook POST carries `X-TxWatch-Signature: sha256=<hex HMAC-SHA256 of the body>` **and** the raw secret in `X-TxWatch-Secret`. Supports `${ENV_VAR}` interpolation (e.g. `webhook_secret = "${MY_SECRET}"`); an unset variable is a startup error. |
+| `batch_alerts`   | bool            | no       | Default `false`. When `true`, all alerts from one poll cycle are sent as a single `{"alerts": [...]}` POST (at most 50 per request, larger bursts are split). Useful for digest receivers and rate-limited targets such as Slack. See [Batched payload](#batched-payload). |
 | `webhook_secret` | string          | no       | When set, every webhook POST carries `X-TxWatch-Signature: sha256=<hex HMAC-SHA256 of the body>` **and** the raw secret in `X-TxWatch-Secret`. Supports [environment interpolation](#environment-variable-interpolation). |
 
 Unknown keys inside a `[[contracts]]` entry are rejected.
@@ -188,6 +191,32 @@ This example and the one in the README are checked against `AlertPayload` by
 - `timestamp` / `timestamp_iso` — ledger close time as Unix seconds and as an ISO 8601 string.
 - `function_name` — the first invoked Soroban function name (present for backward compatibility).
 - `function_names` — all Soroban function names invoked in the transaction (one per `invoke_host_function` operation). Most transactions have zero or one entry.
+- `test` — present and `true` only on payloads sent by `txwatch test-webhook`, which also use
+  `rule_type = "TestWebhook"`, the label exactly as given, and the synthetic but valid contract ID
+  `CATXWATCHTESTCONTRACTAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA5UI`. Real alerts omit the field. The
+  webhook URL is never included in a payload, since URLs often embed tokens.
+
+### Batched payload
+
+With `batch_alerts = true`, the alerts a contract fires during one poll cycle are
+delivered together instead of one POST per alert. The body wraps the usual payloads
+in an `alerts` array:
+
+```json
+{
+  "alerts": [
+    { "label": "My Escrow Contract", "rule_type": "LargeTransfer", "transaction_hash": "abc123...", "...": "..." },
+    { "label": "My Escrow Contract", "rule_type": "FunctionCalled", "transaction_hash": "def456...", "...": "..." }
+  ]
+}
+```
+
+- Each element has exactly the single-alert shape above.
+- A batch holds at most 50 alerts; a larger burst is split into several POSTs
+  (e.g. 120 alerts → 50, 50, 20). Cycles without alerts send nothing.
+- Retries, `X-TxWatch-Version`, and the `X-TxWatch-Secret` / `X-TxWatch-Signature`
+  headers work as for single alerts; the signature covers the whole batch body.
+- A batch that still fails after all retries counts as one failed webhook delivery.
 
 ## Environment variables
 

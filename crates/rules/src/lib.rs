@@ -116,6 +116,10 @@ pub struct AlertPayload {
     pub horizon_link: String,
     /// Stellar Expert explorer link for the transaction.
     pub explorer_link: String,
+    /// `true` only for synthetic payloads sent by `txwatch test-webhook`;
+    /// omitted from the JSON otherwise.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub test: bool,
 }
 
 // ── Rule evaluation ───────────────────────────────────────────────────────────
@@ -132,8 +136,8 @@ pub fn evaluate(
     rules: &[AlertRule],
     tx: &EnrichedTransaction,
 ) -> Vec<AlertPayload> {
-    let horizon_link = format!("{}/transactions/{}", horizon_base, tx.hash);
-    let explorer_link = format!("{}/tx/{}", explorer_base, tx.hash);
+    let horizon_link = format!("{}/transactions/{}", horizon_base.trim_end_matches('/'), tx.hash);
+    let explorer_link = format!("{}/tx/{}", explorer_base.trim_end_matches('/'), tx.hash);
     let timestamp = tx.timestamp.timestamp();
     let timestamp_iso = tx.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
@@ -155,6 +159,7 @@ pub fn evaluate(
                 timestamp_iso: timestamp_iso.clone(),
                 horizon_link: horizon_link.clone(),
                 explorer_link: explorer_link.clone(),
+                test: false,
             }),
             Ok(false) => None,
             Err(e) => {
@@ -712,6 +717,7 @@ mod tests {
             timestamp_iso: "2024-01-15T12:00:00Z".into(),
             horizon_link: "https://horizon-testnet.stellar.org/transactions/abc123".into(),
             explorer_link: "https://stellar.expert/explorer/testnet/tx/abc123".into(),
+            test: false,
         };
 
         let json = serde_json::to_value(payload).expect("serialize AlertPayload to JSON");
@@ -744,6 +750,10 @@ mod tests {
         assert_eq!(
             obj["explorer_link"].as_str(),
             Some("https://stellar.expert/explorer/testnet/tx/abc123")
+        );
+        assert!(
+            !obj.contains_key("test"),
+            "real alerts must not carry the test marker"
         );
     }
 }

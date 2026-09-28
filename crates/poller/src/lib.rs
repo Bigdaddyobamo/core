@@ -16,7 +16,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 use txwatch_config::{AppConfig, WatchedContract};
-use txwatch_notifier::send_webhook;
+use txwatch_notifier::{send_webhook, send_webhook_batch, MAX_BATCH_SIZE};
 use txwatch_rules::{evaluate, EnrichedTransaction, HorizonTransaction};
 
 // ── Optional Prometheus metrics ───────────────────────────────────────────────
@@ -549,6 +549,8 @@ async fn poll_contract(
     let mut tx_count = 0u64;
     let mut alert_count = 0u64;
     let mut webhook_failures = 0u64;
+    // With `batch_alerts`, alerts are collected here and sent after the loop.
+    let mut batch: Vec<txwatch_rules::AlertPayload> = Vec::new();
 
     for record in all_records {
         let paging_token = record.tx.paging_token.clone();
@@ -607,6 +609,8 @@ async fn poll_contract(
             if dry_run {
                 info!(contract = %contract.label, rule = %payload.rule_triggered,
                     tx = %payload.transaction_hash, "dry-run enabled: not sending webhook");
+            } else if contract.batch_alerts {
+                batch.push(payload);
             } else {
                 info!(contract = %contract.label, rule = %payload.rule_triggered,
                     tx = %payload.transaction_hash, "rule fired — sending webhook");
@@ -631,6 +635,32 @@ async fn poll_contract(
                     metrics::inc_webhook_failures(&contract.label, contract.network.as_str());
                 }
             }
+        }
+    }
+
+    // One POST per chunk of at most MAX_BATCH_SIZE alerts; each failed chunk
+    // counts as one webhook failure.
+    for chunk in batch.chunks(MAX_BATCH_SIZE) {
+        info!(contract = %contract.label, alerts = chunk.len(), "sending batched webhook");
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        #[cfg(feature = "metrics")]
+        let started = std::time::Instant::now();
+        let delivery = send_webhook_batch(
+            client,
+            &contract.webhook_url,
+            chunk,
+            contract.webhook_secret.as_deref(),
+            shutdown_rx,
+        )
+        .await;
+        #[cfg(feature = "metrics")]
+        metrics::observe_webhook_delivery(started.elapsed().as_secs_f64());
+        if let Err(e) = delivery {
+            error!(contract = %contract.label, alerts = chunk.len(), error = %e,
+                "batched webhook delivery failed");
+            webhook_failures += 1;
+            #[cfg(feature = "metrics")]
+            metrics::inc_webhook_failures(&contract.label, contract.network.as_str());
         }
     }
 
@@ -886,6 +916,7 @@ mod tests {
             webhook_secret: None,
             poll_interval_seconds: None,
             horizon_base_url_override: Some(server.uri()),
+            batch_alerts: false,
         };
         let mut cursors: HashMap<String, String> = HashMap::new();
         cursors.insert(contract.contract_id.clone(), "now".to_string());
@@ -1007,6 +1038,7 @@ mod tests {
             webhook_secret: None,
             poll_interval_seconds: None,
             horizon_base_url_override: Some(server.uri()),
+            batch_alerts: false,
         };
 
         // 429 is handled with a back-off and returns Ok((0,0,0)), not an error
@@ -1038,6 +1070,7 @@ mod tests {
             webhook_secret: None,
             poll_interval_seconds: None,
             horizon_base_url_override: Some(server.uri()),
+            batch_alerts: false,
         };
 
         let err = poll_contract(&client, &contract, &mut cursors, false)
@@ -1073,6 +1106,7 @@ mod tests {
             webhook_secret: None,
             poll_interval_seconds: None,
             horizon_base_url_override: Some(server.uri()),
+            batch_alerts: false,
         };
 
         let result = poll_contract(&client, &contract, &mut cursors, false).await;
@@ -1091,6 +1125,7 @@ mod tests {
             http_pool_max_idle_per_host: 10,
             http_tcp_keepalive_secs: 30,
             http_connection_verbose: None,
+            max_contracts: None,
             cursor_file: None,
             contracts: vec![
                 WatchedContract {
@@ -1102,6 +1137,7 @@ mod tests {
                     webhook_secret: None,
                     poll_interval_seconds: None,
                     horizon_base_url_override: None,
+                    batch_alerts: false,
                 },
                 WatchedContract {
                     label: "Contract B".into(),
@@ -1112,6 +1148,7 @@ mod tests {
                     webhook_secret: None,
                     poll_interval_seconds: None,
                     horizon_base_url_override: None,
+                    batch_alerts: false,
                 },
                 WatchedContract {
                     label: "Contract C".into(),
@@ -1122,6 +1159,7 @@ mod tests {
                     webhook_secret: None,
                     poll_interval_seconds: None,
                     horizon_base_url_override: None,
+                    batch_alerts: false,
                 },
             ],
         };
@@ -1277,6 +1315,7 @@ mod tests {
             webhook_secret: None,
             poll_interval_seconds: None,
             horizon_base_url_override: Some(server.uri()),
+            batch_alerts: false,
         };
         let mut cursors: HashMap<String, String> = HashMap::new();
         cursors.insert(contract.contract_id.clone(), "now".to_string());
@@ -1286,5 +1325,105 @@ mod tests {
             .unwrap();
         assert_eq!(txs, 201);
         assert_eq!(alerts, 201);
+    }
+
+    // ── Batched delivery ─────────────────────────────────────────────────────
+
+    /// Mounts a Horizon returning `n` transactions (one page) on `server`, and
+    /// returns a contract that batches its alerts to `receiver`.
+    async fn batching_contract(server: &MockServer, receiver: &MockServer, n: u64) -> WatchedContract {
+        let records: Vec<_> = (1..=n)
+            .map(|i| {
+                serde_json::json!({
+                    "hash": format!("tx{}", i),
+                    "created_at": "2020-01-01T00:00:00Z",
+                    "successful": true,
+                    "paging_token": i.to_string(),
+                    "operations": [{ "type": "invoke_host_function", "function": "withdraw" }],
+                })
+            })
+            .collect();
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "_embedded": { "records": records } })),
+            )
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(receiver)
+            .await;
+
+        WatchedContract {
+            label: "batch".into(),
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            network: Network::Testnet,
+            rules: vec![AlertRule::AnyTransaction],
+            webhook_url: format!("{}/hook", receiver.uri()),
+            webhook_secret: None,
+            poll_interval_seconds: None,
+            batch_alerts: true,
+            horizon_base_url_override: Some(server.uri()),
+        }
+    }
+
+    async fn batch_sizes(receiver: &MockServer) -> Vec<usize> {
+        receiver
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| {
+                let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+                body["alerts"].as_array().expect("batched body").len()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn batch_alerts_sends_one_post_per_cycle() {
+        let (server, receiver) = (MockServer::start().await, MockServer::start().await);
+        let contract = batching_contract(&server, &receiver, 3).await;
+        let mut cursors = HashMap::from([(contract.contract_id.clone(), "now".to_string())]);
+
+        let (txs, alerts, failures) = poll_contract(&Client::new(), &contract, &mut cursors, false)
+            .await
+            .unwrap();
+        assert_eq!((txs, alerts, failures), (3, 3, 0));
+        assert_eq!(batch_sizes(&receiver).await, vec![3]);
+    }
+
+    #[tokio::test]
+    async fn batch_alerts_splits_large_batches() {
+        let (server, receiver) = (MockServer::start().await, MockServer::start().await);
+        let contract = batching_contract(&server, &receiver, 120).await;
+        let mut cursors = HashMap::from([(contract.contract_id.clone(), "now".to_string())]);
+
+        let (_, alerts, _) = poll_contract(&Client::new(), &contract, &mut cursors, false)
+            .await
+            .unwrap();
+        assert_eq!(alerts, 120);
+        assert_eq!(batch_sizes(&receiver).await, vec![50, 50, 20]);
+    }
+
+    #[tokio::test]
+    async fn batch_alerts_sends_nothing_in_dry_run_or_without_alerts() {
+        let (server, receiver) = (MockServer::start().await, MockServer::start().await);
+        let contract = batching_contract(&server, &receiver, 3).await;
+        let mut cursors = HashMap::from([(contract.contract_id.clone(), "now".to_string())]);
+        poll_contract(&Client::new(), &contract, &mut cursors, true)
+            .await
+            .unwrap();
+        assert!(receiver.received_requests().await.unwrap().is_empty());
+
+        let (server, receiver) = (MockServer::start().await, MockServer::start().await);
+        let contract = batching_contract(&server, &receiver, 0).await;
+        let mut cursors = HashMap::from([(contract.contract_id.clone(), "now".to_string())]);
+        poll_contract(&Client::new(), &contract, &mut cursors, false)
+            .await
+            .unwrap();
+        assert!(receiver.received_requests().await.unwrap().is_empty());
     }
 }
