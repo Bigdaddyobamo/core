@@ -9,7 +9,7 @@ poll_interval_seconds = 10
 
 [[contracts]]
 label       = "From Env"
-contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
 network     = "testnet"
 webhook_url = "https://hooks.example.com/test"
 

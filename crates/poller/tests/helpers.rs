@@ -14,14 +14,23 @@ pub fn rule(r: AlertRule) -> RuleEntry {
 pub fn contract(webhook_url: &str, rules: Vec<AlertRule>) -> WatchedContract {
     WatchedContract {
         label: "Integration Test Contract".into(),
-        contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+        contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
         network: Network::Testnet,
         rules: rules.into_iter().map(rule).collect(),
+        rules: rules.into_iter().map(Into::into).collect(),
         webhook_url: webhook_url.to_string(),
+        rules,
+        webhook_url: Some(webhook_url.to_string()),
         webhook_secret: None,
         poll_interval_seconds: None,
         enabled: true,
+        soroban_rpc_url: None,
         horizon_base_url_override: None,
+        webhook_format: Default::default(),
+        webhook_headers: Default::default(),
+        webhook_routing_key: None,
+        webhooks: Vec::new(),
+        batch_alerts: false,
     }
 }
 

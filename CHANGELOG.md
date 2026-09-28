@@ -9,7 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- HMAC-SHA256 webhook signatures: `X-TxWatch-Signature: sha256=<hex>` over the request body when `webhook_secret` is set
+- `NoActivity { minutes }` alert rule: fires once when a contract goes quiet longer than the configured threshold, and again (with `resolved = true`) when activity resumes. Evaluated per poll cycle, not per transaction. Null transaction hash and synthetic Horizon/Explorer links are used for the alert payload (#62).
+- `EvalContext` struct replaces the five positional `&str` parameters of `evaluate()`, preventing argument-order bugs at compile time; `EvalContext::from_contract` derives all fields from a `WatchedContract` (#59).
+- `WarningSuppressor`: repeated rule evaluation errors for the same rule are logged on the first occurrence and every 100th recurrence thereafter, preventing log flooding from structurally broken rules (#60).
+- Property-based tests for `LargeTransfer` and `HighFee` rule thresholds using `proptest`, covering the full u64 range and verifying `evaluate` never panics (#61).
+- `resolved` field added to `AlertPayload` JSON (`false` for incident alerts, `true` for recovery alerts); docs/configuration.md and README updated accordingly.
+
+### Changed
+
+- `evaluate()` now accepts `&EvalContext` and an optional `&WarningSuppressor` instead of five positional string arguments and no suppressor (#59, #60).
+- `WatchedContract::collect_errors` and `AppConfig::validate` now collect all validation errors before returning instead of stopping at the first failure (#60).
+- Rule evaluation errors are rate-limited: only the first occurrence and every 100th recurrence are logged (#60).
+
+
 - `X-TxWatch-Version` header on every webhook request
 - `${ENV_VAR}` interpolation for `webhook_secret`
 - Graceful shutdown on Ctrl-C: the in-flight poll cycle finishes before exit
@@ -25,8 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `TXWATCH_CONFIG` environment variable for the config path
 - `SIGHUP` reloads the config without restarting; cursors of remaining contracts are kept and an invalid file is ignored
 - Per-contract `poll_interval_seconds` override; each contract is polled on its own schedule and `txwatch validate` shows the effective interval
+- `EventEmitted` rule matching Soroban contract events by topic (symbol on topic 0, optional positional topics with `*` wildcard); events are fetched from Soroban RPC `getEvents` and included in the new `matched_events` payload field. New `soroban_rpc_url` contract setting and `rpc_url` custom-network setting
+- Optional per-rule `cooldown_seconds`: matches of the same (contract, rule) inside the window are suppressed and reported in the new `suppressed_count` payload field of the next alert
 
 ### Changed
+
+- Parsed transfer amounts and fees above the total XLM supply (`MAX_XLM_SUPPLY_STROOPS`, 5 × 10^17 stroops) are discarded as malformed
+- `HighFee` docs now say the rule fires when the fee is greater than or equal to the threshold (matching the behaviour), name the `fee_charged_stroops` payload field correctly and document `threshold_xlm`
 
 - `poll_interval_seconds` is bounded to 5–3600 seconds
 - `txwatch test-webhook` exits with code 1 when delivery fails

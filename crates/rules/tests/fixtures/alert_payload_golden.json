@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "alert_id": "a3f1bc20e94d77c1a3f1bc20e94d77c1",
+  "label": "My Escrow Contract",
+  "contract_id": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  "network": "testnet",
+  "rule_type": "LargeTransfer",
+  "rule_triggered": "LargeTransfer(>=10000XLM)",
+  "transaction_hash": "abc123deadbeef",
+  "function_name": "transfer",
+  "function_names": ["transfer"],
+  "amount_xlm": 15000,
+  "fee_charged_stroops": 50000,
+  "timestamp": 1705316096,
+  "timestamp_iso": "2024-01-15T12:00:00Z",
+  "horizon_link": "https://horizon-testnet.stellar.org/transactions/abc123deadbeef",
+  "explorer_link": "https://stellar.expert/explorer/testnet/tx/abc123deadbeef"
+}
