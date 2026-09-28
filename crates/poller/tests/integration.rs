@@ -72,6 +72,7 @@ async fn run_polls_once_and_fires_webhook() {
         http_pool_max_idle_per_host: 10,
         http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
+        max_contracts: None,
     };
 
     // Drive the loop for one full poll cycle (slightly more than the interval).
@@ -101,6 +102,14 @@ async fn poll_includes_fee_charged_and_fires_high_fee_rule() {
                 }]
             }
         })))
+        .up_to_n_times(1)
+        .mount(&horizon)
+        .await;
+
+    // All subsequent transaction requests return an empty page.
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
         .mount(&horizon)
         .await;
 
@@ -134,6 +143,7 @@ async fn poll_includes_fee_charged_and_fires_high_fee_rule() {
         http_pool_max_idle_per_host: 10,
         http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
+        max_contracts: None,
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -178,6 +188,7 @@ async fn cursor_file_is_loaded_and_used_for_initial_cursor() {
         http_pool_max_idle_per_host: 10,
         http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
+        max_contracts: None,
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -260,7 +271,7 @@ async fn any_transaction_fires_webhook() {
         assert_eq!(payloads.len(), 1);
 
         for payload in &payloads {
-            txwatch_notifier::send_webhook_simple(&client, &contract.webhook_url, payload, None)
+            txwatch_notifier::send_webhook_simple(&client, contract.webhook_url.as_deref().unwrap(), payload, None)
                 .await
                 .unwrap();
         }
@@ -351,7 +362,7 @@ async fn transaction_failed_rule_fires_only_on_failure() {
             tx,
         );
         for p in &payloads {
-            txwatch_notifier::send_webhook_simple(&client, &contract.webhook_url, p, None)
+            txwatch_notifier::send_webhook_simple(&client, contract.webhook_url.as_deref().unwrap(), p, None)
                 .await
                 .unwrap();
         }
@@ -405,7 +416,7 @@ async fn large_transfer_fires_above_threshold() {
     assert_eq!(payloads.len(), 1);
     assert_eq!(payloads[0].amount_xlm, Some(10_000));
 
-    txwatch_notifier::send_webhook_simple(&client, &contract.webhook_url, &payloads[0], None)
+    txwatch_notifier::send_webhook_simple(&client, contract.webhook_url.as_deref().unwrap(), &payloads[0], None)
         .await
         .unwrap();
 }
@@ -473,7 +484,7 @@ async fn function_called_rule_fires_on_exact_match() {
             tx,
         );
         for p in &payloads {
-            txwatch_notifier::send_webhook_simple(&client, &contract.webhook_url, p, None)
+            txwatch_notifier::send_webhook_simple(&client, contract.webhook_url.as_deref().unwrap(), p, None)
                 .await
                 .unwrap();
         }
@@ -486,7 +497,7 @@ async fn cursor_advances_after_each_transaction() {
     use std::collections::HashMap;
 
     let mut cursors: HashMap<String, String> = HashMap::new();
-    let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
     cursors.insert(contract_id.to_string(), "now".to_string());
 
     for token in &["100", "200", "300"] {
@@ -574,7 +585,7 @@ async fn high_fee_rule_fires_on_fee_charged() {
     assert!(payloads[0].rule_triggered.contains("HighFee"));
     assert_eq!(payloads[0].fee_charged_stroops, Some(50_000));
 
-    txwatch_notifier::send_webhook_simple(&client, &contract.webhook_url, &payloads[0], None)
+    txwatch_notifier::send_webhook_simple(&client, contract.webhook_url.as_deref().unwrap(), &payloads[0], None)
         .await
         .unwrap();
 }
@@ -634,6 +645,7 @@ async fn run_polls_once_and_skips_webhook_in_dry_run() {
         http_pool_max_idle_per_host: 10,
         http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
+        max_contracts: None,
     };
 
     // Drive the loop for one full poll cycle (slightly more than the interval).
@@ -697,6 +709,7 @@ async fn large_transfer_poll_fires_webhook_and_advances_cursor() {
         http_pool_max_idle_per_host: 10,
         http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
+        max_contracts: None,
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -773,6 +786,7 @@ async fn horizon_link_uses_canonical_url_not_mock_server() {
         http_pool_max_idle_per_host: 10,
         http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
+        max_contracts: None,
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -852,9 +866,9 @@ async fn contracts_polled_concurrently() {
         );
         c.label = label.to_string();
         c.contract_id = if label == "A" {
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string()
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".to_string()
         } else {
-            "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".to_string()
+            "CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526".to_string()
         };
         c.horizon_base_url_override = Some(horizon_uri.to_string());
         c
@@ -869,12 +883,20 @@ async fn contracts_polled_concurrently() {
         http_pool_max_idle_per_host: 10,
         http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
+        max_contracts: None,
         cursor_file: None,
     };
 
+    // `run` never returns, so time how long it takes until both webhooks arrive.
     let start = std::time::Instant::now();
-    let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
+    let run = tokio::spawn(txwatch_poller::run(cfg));
+    while receiver.received_requests().await.unwrap().len() < 2
+        && start.elapsed() < Duration::from_secs(5)
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let elapsed = start.elapsed();
+    run.abort();
 
     // Sequential polling would take ≥ 2 × DELAY_MS. Concurrent polling takes ≈ DELAY_MS.
     // We allow generous headroom (1.8×) to avoid flakiness on slow CI.
@@ -900,15 +922,6 @@ async fn reload_keeps_existing_cursors_and_starts_new_contracts() {
         .mount(&horizon_a)
         .await;
     for horizon in [&horizon_a, &horizon_b] {
-/// A per-contract `poll_interval_seconds` override is scheduled independently:
-/// the fast contract is polled several times while the slow one (global
-/// interval) is polled only once. Closes #97.
-#[tokio::test]
-async fn per_contract_poll_interval_is_scheduled_independently() {
-    let fast_horizon = MockServer::start().await;
-    let slow_horizon = MockServer::start().await;
-
-    for horizon in [&fast_horizon, &slow_horizon] {
         Mock::given(method("GET"))
             .and(path_regex("/accounts/.*/transactions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
@@ -932,7 +945,7 @@ async fn per_contract_poll_interval_is_scheduled_independently() {
         vec![AlertRule::AnyTransaction],
     );
     b.label = "B".into();
-    b.contract_id = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into();
+    b.contract_id = "CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526".into();
     b.horizon_base_url_override = Some(horizon_b.uri());
 
     let config = |contracts| AppConfig {
@@ -940,9 +953,10 @@ async fn per_contract_poll_interval_is_scheduled_independently() {
         poll_interval_seconds: 3600,
         contracts,
         cursor_file: None,
-        http_pool_max_idle_per_host: None,
-        http_tcp_keepalive_secs: None,
+        http_pool_max_idle_per_host: 10,
+        http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
+        max_contracts: None,
     };
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -985,6 +999,28 @@ async fn per_contract_poll_interval_is_scheduled_independently() {
         cursors(horizon_b.received_requests().await.unwrap()),
         vec!["now"],
         "B is new and must start from 'now'"
+    );
+}
+
+/// A per-contract `poll_interval_seconds` override is scheduled independently:
+/// the fast contract is polled several times while the slow one (global
+/// interval) is polled only once. Closes #97.
+#[tokio::test]
+async fn per_contract_poll_interval_is_scheduled_independently() {
+    let fast_horizon = MockServer::start().await;
+    let slow_horizon = MockServer::start().await;
+
+    for horizon in [&fast_horizon, &slow_horizon] {
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+            .mount(horizon)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("/transactions/.*/operations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+            .mount(horizon)
+            .await;
     }
 
     let mut fast = helpers::contract(
@@ -1000,7 +1036,7 @@ async fn per_contract_poll_interval_is_scheduled_independently() {
         vec![AlertRule::AnyTransaction],
     );
     slow.label = "slow".into();
-    slow.contract_id = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into();
+    slow.contract_id = "CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526".into();
     slow.horizon_base_url_override = Some(slow_horizon.uri());
 
     let cfg = AppConfig {
@@ -1010,6 +1046,7 @@ async fn per_contract_poll_interval_is_scheduled_independently() {
         http_pool_max_idle_per_host: 10,
         http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
+        max_contracts: None,
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(2500), txwatch_poller::run(cfg)).await;

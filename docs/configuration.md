@@ -30,6 +30,7 @@ The schema is also available from the CLI with `txwatch schema`. CI verifies tha
 | `http_pool_max_idle_per_host` | usize           | no       | `10`    | Maximum idle connections kept per host in the HTTP pool. Must be 1–100. Lower values use less memory; higher values help with many contracts. |
 | `http_tcp_keepalive_secs`     | u64             | no       | `30`    | TCP keepalive interval (seconds) for pooled HTTP connections. Must be ≤ 7200; `0` disables keepalive. |
 | `http_connection_verbose`     | bool            | no       | `false` | Reserved for HTTP connection-pool debug output. Accepted by the parser but currently has no effect. |
+| `max_contracts`               | usize           | no       | `100`   | Maximum number of `[[contracts]]` entries. Must be 1–10000. Raise it only when your Horizon instance (typically your own) can take the extra polling load. |
 
 Unknown top-level keys are rejected.
 
@@ -40,7 +41,7 @@ Unknown top-level keys are rejected.
 > higher is advised. TxWatch logs a startup warning when more than 5 contracts are polled at an effective
 > interval below 10 seconds.
 
-> **Contract limit:** `txwatch-config` declares `MAX_CONTRACTS = 100` as the supported upper bound for `[[contracts]]` entries. It is not yet enforced during validation, so keep configurations at or below 100 contracts to avoid exhausting memory or file descriptors with too many concurrent Horizon polling tasks.
+> **Contract limit:** a configuration may hold at most `max_contracts` (default `100`, `MAX_CONTRACTS` in `txwatch-config`) `[[contracts]]` entries; more is rejected at startup. Every contract is polled by its own task, so very large lists can exhaust memory, file descriptors or the public Horizon rate limit. Split large deployments across several TxWatch instances, or raise `max_contracts` (up to 10000) when polling your own Horizon.
 
 ## `[[contracts]]`
 
@@ -49,14 +50,161 @@ Each entry defines one watched Soroban contract. At least one entry is required.
 | Field            | Type            | Required | Description |
 |------------------|-----------------|----------|-------------|
 | `label`          | string          | yes      | Human-readable name shown in logs and alert payloads. Surrounding whitespace is trimmed. Must not be blank, contain control characters (newlines, ANSI escapes, …) or exceed 128 characters; must be unique across contracts, ignoring case. |
-| `contract_id`    | string          | yes      | Stellar C-address (56 chars, starts with `C`). |
+| `contract_id`    | string          | yes      | Stellar contract StrKey (`C…`, 56 characters). The address is fully decoded: characters outside `A–Z2–7` (lowercase, `0`, `1`, `8`, `9`), a non-contract version byte (e.g. a `G…` account) and a bad checksum are each reported as a distinct error. |
 | `network`        | string or table | yes      | `mainnet`, `testnet`, `futurenet`, or a custom network table (see below). |
 | `rules`          | array of tables | yes      | The `[[contracts.rules]]` entries (see below). At least one is required. |
-| `webhook_url`    | string          | yes      | `http://` or `https://` URL with a host that receives the alert JSON. |
+| `webhook_url`    | string          | see below | `http://` or `https://` URL with a host that receives alerts. Shorthand for one destination, described by the `webhook_*` fields below. Required unless `webhooks` has at least one entry. |
+| `poll_interval_seconds` | u64      | no       | Polls this contract at its own interval instead of the top-level `poll_interval_seconds`. Same bounds (5–3600). Contracts are scheduled independently; `txwatch validate` prints each contract's effective interval. |
+| `webhook_secret` | string          | no       | When set, every webhook POST carries `X-TxWatch-Signature: sha256=<hex HMAC-SHA256 of the body>` **and** the raw secret in `X-TxWatch-Secret`. Supports [environment interpolation](#environment-variable-interpolation). |
+| `webhook_format` | string          | no       | Body shape for `webhook_url`: `txwatch` (default), `slack`, `discord` or `pagerduty`. See [Webhook formats](#webhook-formats). |
+| `webhook_headers` | table          | no       | Extra HTTP headers for `webhook_url`, e.g. `{ "Authorization" = "Bearer ${TOKEN}" }`. See [Custom headers](#custom-headers). |
+| `webhook_routing_key` | string     | no       | PagerDuty integration key; required when `webhook_format = "pagerduty"`, rejected otherwise. Supports interpolation. |
+| `webhooks`       | array of tables | no       | Additional destinations (`[[contracts.webhooks]]`), each with `url`, optional `secret`, `format`, `headers` and `routing_key` (same meaning as the `webhook_*` fields). See [Multiple destinations](#multiple-destinations). |
+| `webhook_url`    | string          | yes      | `http://` or `https://` URL with a host that receives the alert JSON. Supports [environment interpolation](#environment-variable-interpolation). |
 | `poll_interval_seconds` | u64      | no       | Polls this contract at its own interval instead of the top-level `poll_interval_seconds`. Same bounds (5–3600). Contracts are scheduled independently; `txwatch validate` prints each contract's effective interval. |
 | `webhook_secret` | string          | no       | When set, every webhook POST carries `X-TxWatch-Signature: sha256=<hex HMAC-SHA256 of the body>` **and** the raw secret in `X-TxWatch-Secret`. Supports `${ENV_VAR}` interpolation (e.g. `webhook_secret = "${MY_SECRET}"`); an unset variable is a startup error. |
+| `batch_alerts`   | bool            | no       | Default `false`. When `true`, all alerts from one poll cycle are sent as a single `{"alerts": [...]}` POST (at most 50 per request, larger bursts are split). Useful for digest receivers and rate-limited targets such as Slack. See [Batched payload](#batched-payload). |
+| `webhook_secret` | string          | no       | When set, every webhook POST carries `X-TxWatch-Signature: sha256=<hex HMAC-SHA256 of the body>` **and** the raw secret in `X-TxWatch-Secret`. Supports [environment interpolation](#environment-variable-interpolation). |
 
-Unknown keys inside a `[[contracts]]` entry are rejected.
+Unknown keys inside a `[[contracts]]` entry (or a `[[contracts.webhooks]]` entry) are rejected. The
+`webhook_*` fields other than `webhook_url` may only be set together with `webhook_url`.
+
+### Multiple destinations
+
+Every alert is delivered to each destination: the `webhook_url` shorthand (if set) and every
+`[[contracts.webhooks]]` entry. Destinations are delivered to concurrently and retried
+independently, so a slow or failing receiver never delays or blocks the others. Each destination
+that still fails after its retries counts as one failed webhook delivery. Polling happens once per
+contract no matter how many destinations it has, so there is no need to duplicate a contract block.
+
+```toml
+[[contracts]]
+label       = "Treasury"
+contract_id = "CAAA..."
+network     = "mainnet"
+webhook_url = "https://internal.example.com/txwatch"   # txwatch JSON, as before
+
+  [[contracts.webhooks]]
+  url    = "https://hooks.slack.com/services/T000/B000/XXXX"
+  format = "slack"
+
+  [[contracts.webhooks]]
+  url         = "https://events.pagerduty.com/v2/enqueue"
+  format      = "pagerduty"
+  routing_key = "${PAGERDUTY_ROUTING_KEY}"
+
+  [[contracts.rules]]
+  type = "AdminFunctionCalled"
+  function_names = ["upgrade", "set_admin"]
+```
+
+`txwatch validate` lists every destination with its format; secrets and routing keys are shown only
+as set, and header values as `<redacted>`. `validate --check-webhooks` probes every destination,
+and `txwatch test-webhook --contract <label>` sends a test alert to each of them.
+
+> Only secrets, header values and routing keys are interpolated; `url` is used as written.
+
+### Webhook formats
+
+| Format      | Receiver | Body |
+|-------------|----------|------|
+| `txwatch`   | Any HTTP endpoint (default) | The [webhook payload](#webhook-payload) below. |
+| `slack`     | [Slack incoming webhook](https://api.slack.com/messaging/webhooks) | `text` fallback plus Block Kit `blocks`: rule, label and network; contract, transaction link, amount, fee, functions and time; explorer, Horizon and alert ID. |
+| `discord`   | [Discord webhook](https://discord.com/developers/docs/resources/webhook) | `content` plus one embed (title = rule, linked to the explorer; fields for contract, transaction, amount, fee, functions, Horizon). Mentions are disabled, so a label can never ping `@everyone`. Red for `TransactionFailed` / `AdminFunctionCalled`, blue otherwise. |
+| `pagerduty` | [PagerDuty Events API v2](https://developer.pagerduty.com/docs/events-api-v2/trigger-events/) (`https://events.pagerduty.com/v2/enqueue`) | A `trigger` event with the destination's `routing_key` and `dedup_key` = the alert's `alert_id`, so redelivering the same alert updates one incident instead of opening a new one. Severity: `error` for `TransactionFailed`, `critical` for `AdminFunctionCalled`, `warning` otherwise. The full alert is attached as `payload.custom_details`. |
+
+Example Slack body:
+
+```json
+{
+  "text": "TxWatch alert: LargeTransfer(&gt;=10000XLM) on Treasury (mainnet)",
+  "blocks": [
+    { "type": "section", "text": { "type": "mrkdwn", "text": "*LargeTransfer(&gt;=10000XLM)* on *Treasury* (mainnet)" } },
+    { "type": "section", "fields": [
+      { "type": "mrkdwn", "text": "*Contract*\n`CAAA...`" },
+      { "type": "mrkdwn", "text": "*Transaction*\n<https://stellar.expert/explorer/public/tx/abc123|abc123>" },
+      { "type": "mrkdwn", "text": "*Amount*\n15000 XLM" },
+      { "type": "mrkdwn", "text": "*Time*\n2024-01-15T12:00:00Z" }
+    ] },
+    { "type": "context", "elements": [
+      { "type": "mrkdwn", "text": "<https://stellar.expert/explorer/public/tx/abc123|Explorer> · <https://horizon.stellar.org/transactions/abc123|Horizon> · alert `3f2b9c1d8e7a6b5c4d3e2f1a0b9c8d7e`" }
+    ] }
+  ]
+}
+```
+
+Example Discord body:
+
+```json
+{
+  "username": "TxWatch",
+  "content": "TxWatch alert: LargeTransfer(>=10000XLM) on Treasury (mainnet)",
+  "allowed_mentions": { "parse": [] },
+  "embeds": [{
+    "title": "LargeTransfer(>=10000XLM)",
+    "url": "https://stellar.expert/explorer/public/tx/abc123",
+    "description": "Treasury (mainnet)",
+    "color": 3447003,
+    "timestamp": "2024-01-15T12:00:00Z",
+    "fields": [
+      { "name": "Contract", "value": "`CAAA...`", "inline": false },
+      { "name": "Transaction", "value": "[abc123](https://stellar.expert/explorer/public/tx/abc123)", "inline": false },
+      { "name": "Amount", "value": "15000 XLM", "inline": true },
+      { "name": "Horizon", "value": "[transaction](https://horizon.stellar.org/transactions/abc123)", "inline": true }
+    ],
+    "footer": { "text": "TxWatch · alert 3f2b9c1d8e7a6b5c4d3e2f1a0b9c8d7e" }
+  }]
+}
+```
+
+Example PagerDuty body:
+
+```json
+{
+  "routing_key": "<your integration key>",
+  "event_action": "trigger",
+  "dedup_key": "3f2b9c1d8e7a6b5c4d3e2f1a0b9c8d7e",
+  "client": "TxWatch",
+  "client_url": "https://stellar.expert/explorer/public/tx/abc123",
+  "links": [
+    { "href": "https://stellar.expert/explorer/public/tx/abc123", "text": "View transaction" },
+    { "href": "https://horizon.stellar.org/transactions/abc123", "text": "Horizon" }
+  ],
+  "payload": {
+    "summary": "TxWatch alert: LargeTransfer(>=10000XLM) on Treasury (mainnet) — tx abc123",
+    "source": "CAAA...",
+    "severity": "warning",
+    "timestamp": "2024-01-15T12:00:00Z",
+    "component": "Treasury",
+    "group": "mainnet",
+    "class": "LargeTransfer",
+    "custom_details": { "alert_id": "3f2b9c1d8e7a6b5c4d3e2f1a0b9c8d7e", "...": "the full alert" }
+  }
+}
+```
+
+The exact bodies are pinned by snapshot tests in `crates/notifier/src/format.rs`.
+
+### Custom headers
+
+Receivers that authenticate with a bearer token or an API-key header, rather than the HMAC
+signature, can get extra headers on every POST:
+
+```toml
+webhook_url     = "https://api.example.com/alerts"
+webhook_headers = { "Authorization" = "Bearer ${ALERTS_API_TOKEN}", "X-Api-Key" = "${ALERTS_API_KEY}" }
+
+  [[contracts.webhooks]]
+  url     = "https://other.example.com/hook"
+  headers = { "Authorization" = "Bearer ${OTHER_TOKEN}" }
+```
+
+- Header values support [environment interpolation](#environment-variable-interpolation), which
+  keeps tokens out of the config file and out of the URL (where they would end up in logs).
+- `Content-Type`, `Content-Length` and any `X-TxWatch-*` header are reserved and rejected, as are
+  names that are not valid HTTP header names and values containing control characters.
+- Header values are never logged, and `txwatch validate` (text and JSON) prints them as
+  `<redacted>`. Validation errors name the header, never its value.
 
 ### Network field values
 
@@ -96,6 +244,10 @@ Alert payloads and logs report such contracts with `network = "custom"`. See `do
 ## `[[contracts.rules]]`
 
 At least one rule is required per contract. All matching rules fire independently.
+
+Keys that a rule type does not define are rejected, and the error names the rule
+(e.g. ``unknown field `threshold_xml`, expected `threshold_stroops` or `threshold_xlm` (field: contracts[0].rules[1] …)``),
+so a typo is never silently ignored.
 
 ### `AnyTransaction`
 Fires on every transaction that appears in the contract's Horizon history.
@@ -157,6 +309,7 @@ threshold_stroops = 1000000
 
 ```json
 {
+  "alert_id":            "3f2b9c1d8e7a6b5c4d3e2f1a0b9c8d7e",
   "label":               "My Escrow Contract",
   "contract_id":         "CAAA...",
   "network":             "testnet",
@@ -177,6 +330,9 @@ threshold_stroops = 1000000
 This example and the one in the README are checked against `AlertPayload` by
 `crates/rules/tests/docs_payload.rs`, so they cannot drift from the code.
 
+- `alert_id` — stable 32-character hex ID derived from the contract, transaction and rule; the same
+  alert always has the same ID, so receivers can de-duplicate redeliveries. PagerDuty uses it as the
+  `dedup_key`.
 - `rule_type` — stable machine-readable rule variant (e.g. `"LargeTransfer"`); use it for routing.
 - `rule_triggered` — human-readable rule description including parameters.
 - `amount_xlm` — whole-XLM transfer amount, or `null` when the transaction has none.
@@ -184,12 +340,74 @@ This example and the one in the README are checked against `AlertPayload` by
 - `timestamp` / `timestamp_iso` — ledger close time as Unix seconds and as an ISO 8601 string.
 - `function_name` — the first invoked Soroban function name (present for backward compatibility).
 - `function_names` — all Soroban function names invoked in the transaction (one per `invoke_host_function` operation). Most transactions have zero or one entry.
+- `test` — present and `true` only on payloads sent by `txwatch test-webhook`, which also use
+  `rule_type = "TestWebhook"`, the label exactly as given, and the synthetic but valid contract ID
+  `CATXWATCHTESTCONTRACTAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA5UI`. Real alerts omit the field. The
+  webhook URL is never included in a payload, since URLs often embed tokens.
+
+### Batched payload
+
+With `batch_alerts = true`, the alerts a contract fires during one poll cycle are
+delivered together instead of one POST per alert. The body wraps the usual payloads
+in an `alerts` array:
+
+```json
+{
+  "alerts": [
+    { "label": "My Escrow Contract", "rule_type": "LargeTransfer", "transaction_hash": "abc123...", "...": "..." },
+    { "label": "My Escrow Contract", "rule_type": "FunctionCalled", "transaction_hash": "def456...", "...": "..." }
+  ]
+}
+```
+
+- Each element has exactly the single-alert shape above.
+- A batch holds at most 50 alerts; a larger burst is split into several POSTs
+  (e.g. 120 alerts → 50, 50, 20). Cycles without alerts send nothing.
+- Retries, `X-TxWatch-Version`, and the `X-TxWatch-Secret` / `X-TxWatch-Signature`
+  headers work as for single alerts; the signature covers the whole batch body.
+- A batch that still fails after all retries counts as one failed webhook delivery.
 
 ## Environment variables
 
 | Variable   | Default | Description                                      |
 |------------|---------|--------------------------------------------------|
 | `RUST_LOG` | `info`  | Log level: `error`, `warn`, `info`, `debug`, `trace` |
+
+### Environment variable interpolation
+
+Webhook secrets (`webhook_secret`, `webhooks[].secret`), header values (`webhook_headers`,
+`webhooks[].headers`) and PagerDuty routing keys (`webhook_routing_key`, `webhooks[].routing_key`)
+may reference environment variables anywhere in the value:
+
+| Syntax            | Result |
+|-------------------|--------|
+| `${VAR}`          | Value of `VAR`. An unset variable is a startup error that names the field (never its value). |
+| `${VAR:-default}` | Value of `VAR`, or `default` when `VAR` is unset or empty. |
+| `$${`             | A literal `${`. |
+
+For example `webhook_headers = { "Authorization" = "Bearer ${TOKEN}" }`. Variable names use letters,
+digits and `_` and must not start with a digit.
+These fields may reference environment variables anywhere in the value, so secrets
+such as webhook tokens stay out of the config file:
+
+- `webhook_url`, `webhook_secret`
+- custom network `horizon_url`, `explorer_url`, `passphrase`
+- `cursor_file`
+
+| Syntax              | Result |
+|---------------------|--------|
+| `${VAR}`            | Value of `VAR`. An unset variable is a startup error naming the field. |
+| `${VAR:-default}`   | Value of `VAR`, or `default` when `VAR` is unset or empty. |
+| `$${`               | A literal `${` (escape). |
+
+```toml
+webhook_url    = "https://hooks.slack.com/services/${SLACK_WEBHOOK_PATH}"
+webhook_secret = "Bearer ${TXWATCH_SECRET}"
+network        = { horizon_url = "${HORIZON_URL:-http://localhost:8000}" }
+```
+
+Variable names use letters, digits and `_` and must not start with a digit; `${}` and an
+unterminated `${` are errors.
 
 ## Pre-flight checks
 
@@ -208,7 +426,7 @@ poll_interval_seconds = 10
 
 [[contracts]]
 label       = "My Escrow Contract"
-contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
 network     = "testnet"
 webhook_url = "https://hooks.example.com/my-webhook"
 
