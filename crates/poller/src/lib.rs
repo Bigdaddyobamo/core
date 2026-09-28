@@ -930,6 +930,7 @@ mod tests {
             network: Network::Testnet,
             rules: vec![AlertRule::FunctionCalled {
                 function_name: "withdraw".into(),
+                match_mode: Default::default(),
             }],
             webhook_url: format!("{}/hook", receiver.uri()),
             webhook_secret: None,

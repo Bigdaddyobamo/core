@@ -204,6 +204,21 @@ impl fmt::Display for Network {
 
 // ── AlertRule ─────────────────────────────────────────────────────────────────
 
+/// Match mode for the `FunctionCalled` rule (issue #55).
+///
+/// - `Exact`  — the invoked name must equal `function_name` exactly (default, pre-existing behaviour).
+/// - `Prefix` — the invoked name must start with `function_name`.
+/// - `Glob`   — the invoked name must match the glob pattern in `function_name`
+///              (`*` matches any sequence of characters, `?` matches exactly one character).
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FunctionMatchMode {
+    #[default]
+    Exact,
+    Prefix,
+    Glob,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(tag = "type")]
 pub enum AlertRule {
@@ -214,6 +229,11 @@ pub enum AlertRule {
     },
     FunctionCalled {
         function_name: String,
+        /// How `function_name` is matched against the invoked Soroban function.
+        /// Defaults to `"exact"` for backward compatibility.
+        #[serde(default)]
+        #[schemars(default)]
+        match_mode: FunctionMatchMode,
     },
     AdminFunctionCalled {
         function_names: Vec<String>,
@@ -247,14 +267,45 @@ impl AlertRule {
                     );
                 }
             }
-            AlertRule::FunctionCalled { function_name } => {
+            AlertRule::FunctionCalled {
+                function_name,
+                match_mode,
+            } => {
                 if function_name.trim().is_empty() {
                     bail!(
                         "contract '{}': FunctionCalled function_name must not be empty",
                         contract_label
                     );
                 }
-                validate_function_name(function_name, "FunctionCalled", contract_label)?;
+                match match_mode {
+                    FunctionMatchMode::Exact | FunctionMatchMode::Prefix => {
+                        // Exact and prefix must be valid Soroban symbols.
+                        validate_function_name(function_name, "FunctionCalled", contract_label)?;
+                    }
+                    FunctionMatchMode::Glob => {
+                        // Glob patterns may contain `*` and `?`; everything else must be a
+                        // valid Soroban symbol character.
+                        for ch in function_name.chars() {
+                            if ch != '*' && ch != '?' && !(ch.is_ascii_alphanumeric() || ch == '_')
+                            {
+                                bail!(
+                                    "contract '{}': FunctionCalled glob pattern {:?} contains \
+                                     invalid character {:?} — only [a-zA-Z0-9_*?] are allowed",
+                                    contract_label,
+                                    function_name,
+                                    ch
+                                );
+                            }
+                        }
+                        if function_name.len() > 64 {
+                            bail!(
+                                "contract '{}': FunctionCalled glob pattern must be \
+                                 at most 64 characters",
+                                contract_label
+                            );
+                        }
+                    }
+                }
             }
             AlertRule::AdminFunctionCalled { function_names } => {
                 if function_names.is_empty() {
@@ -312,9 +363,16 @@ impl AlertRule {
             AlertRule::LargeTransfer { threshold_xlm } => {
                 format!("LargeTransfer(>={}XLM)", threshold_xlm)
             }
-            AlertRule::FunctionCalled { function_name } => {
-                format!("FunctionCalled({})", function_name)
-            }
+            AlertRule::FunctionCalled {
+                function_name,
+                match_mode,
+            } => match match_mode {
+                FunctionMatchMode::Exact => format!("FunctionCalled({})", function_name),
+                FunctionMatchMode::Prefix => {
+                    format!("FunctionCalled(prefix:{})", function_name)
+                }
+                FunctionMatchMode::Glob => format!("FunctionCalled(glob:{})", function_name),
+            },
             AlertRule::AdminFunctionCalled { function_names } => {
                 format!("AdminFunctionCalled([{}])", function_names.join(", "))
             }

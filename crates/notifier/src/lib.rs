@@ -79,6 +79,7 @@ pub async fn send_webhook(
             .post(url)
             .header("Content-Type", "application/json")
             .header("X-TxWatch-Version", env!("CARGO_PKG_VERSION"))
+            .header("X-TxWatch-Alert-Id", &payload.alert_id)
             .body(body.clone());
         if let Some(s) = secret {
             let mut mac =
@@ -188,12 +189,30 @@ pub fn test_payload_with_network(
 ) -> AlertPayload {
     let now = Utc::now();
     let tx_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+    let rule_type = "TestWebhook";
+    let rule_triggered = "TestWebhook";
+    let alert_id = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(network.as_bytes());
+        h.update(b"\x00");
+        h.update("CTEST000000000000000000000000000000000000000000000000000".as_bytes());
+        h.update(b"\x00");
+        h.update(tx_hash.as_bytes());
+        h.update(b"\x00");
+        h.update(rule_type.as_bytes());
+        h.update(b"\x00");
+        h.update(rule_triggered.as_bytes());
+        hex::encode(&h.finalize()[..16])
+    };
     AlertPayload {
+        schema_version: 1,
+        alert_id,
         label: label.to_string(),
         contract_id: "CTEST000000000000000000000000000000000000000000000000000".into(),
         network: network.to_string(),
-        rule_type: "TestWebhook".into(),
-        rule_triggered: "TestWebhook".into(),
+        rule_type: rule_type.into(),
+        rule_triggered: rule_triggered.into(),
         transaction_hash: tx_hash.into(),
         function_name: Some("test".into()),
         function_names: vec!["test".into()],
@@ -203,6 +222,11 @@ pub fn test_payload_with_network(
         timestamp_iso: now.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         horizon_link: format!("{}/transactions/{}", horizon_base_url, tx_hash),
         explorer_link: format!("https://stellar.expert/explorer/{}/tx/{}", network, tx_hash),
+        ledger: None,
+        source_account: None,
+        memo: None,
+        memo_type: None,
+        operation_count: None,
     }
     .with_label(format!("{} (test-webhook to {})", label, webhook_url))
 }
@@ -219,6 +243,8 @@ mod tests {
 
     fn sample_payload() -> AlertPayload {
         AlertPayload {
+            schema_version: 1,
+            alert_id: "deadbeefcafe0000deadbeefcafe0000".into(),
             label: "Test Contract".into(),
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
             network: "testnet".into(),
@@ -233,6 +259,11 @@ mod tests {
             timestamp_iso: "2023-11-15T03:13:20Z".into(),
             horizon_link: "https://horizon-testnet.stellar.org/transactions/abc123".into(),
             explorer_link: "https://stellar.expert/explorer/testnet/tx/abc123".into(),
+            ledger: None,
+            source_account: None,
+            memo: None,
+            memo_type: None,
+            operation_count: None,
         }
     }
 

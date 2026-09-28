@@ -221,6 +221,8 @@ See [docs/alert-rules.md](docs/alert-rules.md) for full details.
 
 ```json
 {
+  "schema_version":     1,
+  "alert_id":           "a3f1bc20e94d77c1a3f1bc20e94d77c1",
   "label":            "My Escrow Contract",
   "contract_id":      "CAAA...",
   "network":          "testnet",
@@ -242,10 +244,13 @@ See [docs/alert-rules.md](docs/alert-rules.md) for full details.
 - `Content-Type: application/json`
 - `Content-Length: <length of JSON body in bytes>`
 - `X-TxWatch-Version: <package version>`
+- `X-TxWatch-Alert-Id: <alert_id>` (same value as the `alert_id` body field — usable for deduplication without parsing the body)
 - `X-TxWatch-Signature: sha256=<hmac>` (optional, only when `webhook_secret` is configured — HMAC-SHA256 of the request body)
 - `X-TxWatch-Secret: <webhook_secret>` (optional, only when `webhook_secret` is configured — the raw secret; verify the signature instead where possible)
 
 **Fields:**
+- `schema_version` — integer version of this payload shape (currently `1`). Additive changes (new optional fields) keep the same version; breaking changes (field removals or renames) bump it. Receivers should use this to detect incompatible changes.
+- `alert_id` — stable, deterministic identifier derived from `(network, contract_id, tx_hash, rule_type, rule_triggered)` via SHA-256 prefix (32 hex chars). Identical for every retry of the same alert. Receivers should deduplicate on this value.
 - `rule_type` — stable machine-readable rule variant (e.g. `"LargeTransfer"`, `"HighFee"`); use this for programmatic routing
 - `rule_triggered` — human-readable rule description with parameters (e.g. `"LargeTransfer(>=10000XLM)"`); use this for display
 - `function_name` — the first invoked Soroban function name, or `null` for non-Soroban transactions.
