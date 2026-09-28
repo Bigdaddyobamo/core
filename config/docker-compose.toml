@@ -1,0 +1,15 @@
+# Config for the docker-compose dev stack (see CONTRIBUTING.md).
+# Alerts go to the bundled `webhook` echo service, which logs every POST.
+
+poll_interval_seconds = 10
+
+[[contracts]]
+label       = "Testnet XLM (native asset contract)"
+# The native XLM Stellar Asset Contract on Testnet: always active, so the
+# dev stack sees real transactions without deploying anything.
+contract_id = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+network     = "testnet"
+webhook_url = "http://webhook:8080/hook"
+
+  [[contracts.rules]]
+  type = "AnyTransaction"

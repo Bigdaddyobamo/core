@@ -76,12 +76,16 @@ function_names = ["set_admin", "upgrade", "initialize"]
 
 ### `HighFee`
 
-| Field                | Type | Required | Description                           |
-|----------------------|------|----------|---------------------------------------|
-| `threshold_stroops`  | u64  | yes      | Fee threshold in stroops (> 0)        |
+| Field                | Type | Required        | Description                                   |
+|----------------------|------|-----------------|-----------------------------------------------|
+| `threshold_stroops`  | u64  | one of the two  | Fee threshold in stroops (> 0)                |
+| `threshold_xlm`      | u64  | one of the two  | Fee threshold in whole XLM (> 0)              |
 
-Matches when the transaction's total fee exceeds `threshold_stroops`.
-The `fee_charged` field in the webhook payload contains the actual fee paid in stroops.
+Matches when the transaction's total fee is greater than or equal to the threshold.
+The `fee_charged_stroops` field in the webhook payload contains the actual fee paid in stroops.
+
+Set exactly one of `threshold_stroops` or `threshold_xlm`; they are mutually exclusive and
+setting both is a validation error. `threshold_xlm` is converted to stroops during validation.
 
 **Note:** Stroops are the smallest unit of XLM (1 XLM = 10,000,000 stroops).
 
@@ -89,7 +93,65 @@ The `fee_charged` field in the webhook payload contains the actual fee paid in s
 [[contracts.rules]]
 type               = "HighFee"
 threshold_stroops  = 100000
+
+# or, equivalently for a 1 XLM threshold:
+[[contracts.rules]]
+type          = "HighFee"
+threshold_xlm = 1
 ```
+
+### `EventEmitted`
+
+| Field    | Type     | Required | Description                                                         |
+|----------|----------|----------|---------------------------------------------------------------------|
+| `topic`  | string   | yes      | Symbol that event topic 0 must equal exactly (valid Soroban symbol) |
+| `topics` | [string] | no       | Patterns for topics 1, 2, … in order; `"*"` matches any value       |
+
+Matches when the transaction emitted a contract event whose first topic is the symbol `topic`
+and whose following topics match `topics` positionally. A topic value matches a pattern when:
+
+- it is a single-key scalar `ScVal` (`{"symbol": "x"}`, `{"address": "G…"}`, `{"u32": 5}`,
+  `{"i128": "-1"}`, …) and the inner value's text equals the pattern, or
+- otherwise, its compact JSON equals the pattern.
+
+The matching events (topics and data, as decoded `ScVal` JSON) are included in the
+`matched_events` payload field.
+
+**Use case:** react to what a contract reports it did — `transfer`, `mint`, `admin_changed`, …
+
+**Note:** Events come from Soroban RPC `getEvents` (Horizon does not expose them), so the
+contract needs a Soroban RPC endpoint: `soroban_rpc_url` on the contract, the custom network's
+`rpc_url`, or the testnet/futurenet default. Mainnet has no default endpoint. Events older than
+the RPC retention window (about 7 days on public endpoints) cannot be fetched and will not match.
+Events are only fetched for contracts that have at least one `EventEmitted` rule.
+
+```toml
+[[contracts.rules]]
+type   = "EventEmitted"
+topic  = "transfer"
+
+[[contracts.rules]]
+type   = "EventEmitted"
+topic  = "transfer"
+topics = ["*", "GDESTINATION..."]   # any sender, to this address
+```
+
+## Cooldowns
+
+Every rule accepts an optional `cooldown_seconds` (0–604800):
+
+```toml
+[[contracts.rules]]
+type             = "TransactionFailed"
+cooldown_seconds = 300
+```
+
+After the rule fires for a contract, further matches of the same (contract, rule) within
+`cooldown_seconds` are suppressed and counted. The next alert that is sent for that rule carries
+the number of suppressed matches in `suppressed_count`. Unset or `0` disables the cooldown.
+
+Cooldown state is kept in memory for the life of `txwatch watch`; it resets on restart and does
+not carry over between `txwatch watch --once` runs.
 
 ## Evaluation order
 
@@ -112,6 +174,9 @@ All matching rules fire; there is no short-circuit.
 | `timestamp`        | i64         | yes            | Unix timestamp (seconds) of transaction  |
 | `horizon_link`     | string      | yes            | Direct link to transaction on Horizon    |
 | `explorer_link`    | string      | yes            | Stellar Expert explorer link for the transaction |
+| `fee_charged_stroops` | u64/null | no             | Fee charged for the transaction in stroops |
+| `matched_events`   | array       | yes            | Events that matched an `EventEmitted` rule (`contract_id`, `topics`, `data`); empty for other rules |
+| `suppressed_count` | u64         | yes            | Matches suppressed by this rule's `cooldown_seconds` since the previous alert; `0` otherwise |
 
 > `horizon_link` and `explorer_link` are always present in every alert payload, even when `function_name` is `null` for a non-Soroban transaction.
 
@@ -134,6 +199,7 @@ The webhook payload includes two rule-related fields:
 | `FunctionCalled` | `"FunctionCalled"` |
 | `AdminFunctionCalled` | `"AdminFunctionCalled"` |
 | `HighFee` | `"HighFee"` |
+| `EventEmitted` | `"EventEmitted"` |
 
 ## Adding a new rule type
 
