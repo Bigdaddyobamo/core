@@ -14,19 +14,48 @@
   },
   "definitions": {
     "WatchedContract": {
-      "type": "object", "required": ["label", "contract_id", "network", "rules", "webhook_url"], "additionalProperties": false,
+      "type": "object", "required": ["label", "contract_id", "network", "rules"], "additionalProperties": false,
+      "anyOf": [
+        { "required": ["webhook_url"] },
+        { "required": ["webhooks"], "properties": { "webhooks": { "minItems": 1 } } }
+      ],
       "properties": {
         "label": { "type": "string", "maxLength": 128 }, "contract_id": { "type": "string", "pattern": "^C[A-Z2-7]{55}$" },
         "network": { "oneOf": [
           { "enum": ["mainnet", "testnet", "futurenet"] },
           { "type": "object", "required": ["horizon_url"], "additionalProperties": false,
             "properties": { "horizon_url": { "type": "string", "format": "uri" }, "explorer_url": { "type": ["string", "null"], "format": "uri" }, "passphrase": { "type": ["string", "null"] } } }
+        ] },
+        "webhook_url": { "type": "string", "format": "uri", "description": "Shorthand for a single destination; described by the webhook_* fields." },
         ] }, "webhook_url": { "type": "string", "format": "uri" },
         "webhook_secret": { "type": ["string", "null"] },
+        "webhook_format": { "$ref": "#/definitions/WebhookFormat" },
+        "webhook_headers": { "$ref": "#/definitions/WebhookHeaders" },
+        "webhook_routing_key": { "type": ["string", "null"], "description": "PagerDuty routing key; required when webhook_format = \"pagerduty\"." },
+        "webhooks": { "type": "array", "items": { "$ref": "#/definitions/WebhookDestination" } },
         "poll_interval_seconds": { "type": ["integer", "null"], "minimum": 5, "maximum": 3600 },
         "batch_alerts": { "type": "boolean", "default": false, "description": "Deliver each poll cycle's alerts as one {\"alerts\": [...]} POST (split into batches of at most 50)." },
         "rules": { "type": "array", "items": { "$ref": "#/definitions/AlertRule" }, "minItems": 1 }
       }
+    },
+    "WebhookFormat": { "enum": ["txwatch", "slack", "discord", "pagerduty"], "default": "txwatch" },
+    "WebhookHeaders": {
+      "type": "object",
+      "description": "Extra HTTP headers; values support ${ENV_VAR}. Content-Type, Content-Length and X-TxWatch-* are reserved.",
+      "propertyNames": { "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$" },
+      "additionalProperties": { "type": "string" }
+    },
+    "WebhookDestination": {
+      "type": "object", "required": ["url"], "additionalProperties": false,
+      "properties": {
+        "url": { "type": "string", "format": "uri" },
+        "secret": { "type": ["string", "null"] },
+        "format": { "$ref": "#/definitions/WebhookFormat" },
+        "headers": { "$ref": "#/definitions/WebhookHeaders" },
+        "routing_key": { "type": ["string", "null"], "description": "PagerDuty routing key; required when format = \"pagerduty\"." }
+      },
+      "if": { "properties": { "format": { "const": "pagerduty" } }, "required": ["format"] },
+      "then": { "required": ["routing_key"] }
     },
     "AlertRule": {
       "oneOf": [

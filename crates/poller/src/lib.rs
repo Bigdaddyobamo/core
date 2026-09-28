@@ -16,6 +16,8 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 use txwatch_config::{AppConfig, WatchedContract};
+use txwatch_config::WebhookDestination;
+use txwatch_notifier::send_to_destination;
 use txwatch_notifier::{send_webhook, send_webhook_batch, MAX_BATCH_SIZE};
 use txwatch_rules::{evaluate, EnrichedTransaction, HorizonTransaction};
 
@@ -554,6 +556,7 @@ async fn poll_contract(
     let mut tx_count = 0u64;
     let mut alert_count = 0u64;
     let mut webhook_failures = 0u64;
+    let destinations = contract.destinations();
     let mut delivery_tasks = JoinSet::new();
     // With `batch_alerts`, alerts are collected here and sent after the loop.
     let mut batch: Vec<txwatch_rules::AlertPayload> = Vec::new();
@@ -619,6 +622,9 @@ async fn poll_contract(
                 batch.push(payload);
             } else {
                 info!(contract = %contract.label, rule = %payload.rule_triggered,
+                    tx = %payload.transaction_hash, destinations = destinations.len(),
+                    "rule fired — sending webhook");
+                webhook_failures += deliver_to_all(client, contract, &destinations, &payload).await;
                     tx = %payload.transaction_hash, "rule fired — sending webhook");
                 let client = client.clone();
                 let webhook_url = contract.webhook_url.clone();
@@ -699,6 +705,39 @@ async fn poll_contract(
     }
 
     Ok((tx_count, alert_count, webhook_failures))
+}
+
+/// Delivers `payload` to every destination concurrently; each destination has
+/// its own retries, so a slow or failing receiver never blocks the others.
+/// Returns the number of destinations that could not be reached.
+async fn deliver_to_all(
+    client: &Client,
+    contract: &WatchedContract,
+    destinations: &[WebhookDestination],
+    payload: &txwatch_rules::AlertPayload,
+) -> u64 {
+    let deliveries = destinations.iter().map(|destination| async move {
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        #[cfg(feature = "metrics")]
+        let started = std::time::Instant::now();
+        let delivery = send_to_destination(client, destination, payload, shutdown_rx).await;
+        #[cfg(feature = "metrics")]
+        metrics::observe_webhook_delivery(started.elapsed().as_secs_f64());
+        (destination, delivery)
+    });
+
+    let mut failures = 0;
+    for (destination, delivery) in futures::future::join_all(deliveries).await {
+        if let Err(e) = delivery {
+            error!(contract = %contract.label, rule = %payload.rule_triggered,
+                tx = %payload.transaction_hash, url = %destination.url,
+                format = %destination.format, error = %e, "webhook delivery failed");
+            failures += 1;
+            #[cfg(feature = "metrics")]
+            metrics::inc_webhook_failures(&contract.label, contract.network.as_str());
+        }
+    }
+    failures
 }
 
 // ── Replay ────────────────────────────────────────────────────────────────────
@@ -941,10 +980,14 @@ mod tests {
             rules: vec![AlertRule::FunctionCalled {
                 function_name: "withdraw".into(),
             }],
-            webhook_url: format!("{}/hook", receiver.uri()),
+            webhook_url: Some(format!("{}/hook", receiver.uri())),
             webhook_secret: None,
             poll_interval_seconds: None,
             horizon_base_url_override: Some(server.uri()),
+            webhook_format: Default::default(),
+            webhook_headers: Default::default(),
+            webhook_routing_key: None,
+            webhooks: Vec::new(),
             batch_alerts: false,
         };
         let mut cursors: HashMap<String, String> = HashMap::new();
@@ -1063,10 +1106,14 @@ mod tests {
             contract_id: contract_id.into(),
             network: Network::Testnet,
             rules: vec![txwatch_config::AlertRule::AnyTransaction],
-            webhook_url: "https://hooks.example.com/test".into(),
+            webhook_url: Some("https://hooks.example.com/test".into()),
             webhook_secret: None,
             poll_interval_seconds: None,
             horizon_base_url_override: Some(server.uri()),
+            webhook_format: Default::default(),
+            webhook_headers: Default::default(),
+            webhook_routing_key: None,
+            webhooks: Vec::new(),
             batch_alerts: false,
         };
 
@@ -1095,10 +1142,14 @@ mod tests {
             contract_id: contract_id.into(),
             network: Network::Testnet,
             rules: vec![txwatch_config::AlertRule::AnyTransaction],
-            webhook_url: "https://hooks.example.com/test".into(),
+            webhook_url: Some("https://hooks.example.com/test".into()),
             webhook_secret: None,
             poll_interval_seconds: None,
             horizon_base_url_override: Some(server.uri()),
+            webhook_format: Default::default(),
+            webhook_headers: Default::default(),
+            webhook_routing_key: None,
+            webhooks: Vec::new(),
             batch_alerts: false,
         };
 
@@ -1131,10 +1182,14 @@ mod tests {
             contract_id: contract_id.into(),
             network: Network::Testnet,
             rules: vec![AlertRule::AnyTransaction],
-            webhook_url: "https://hooks.example.com/test".into(),
+            webhook_url: Some("https://hooks.example.com/test".into()),
             webhook_secret: None,
             poll_interval_seconds: None,
             horizon_base_url_override: Some(server.uri()),
+            webhook_format: Default::default(),
+            webhook_headers: Default::default(),
+            webhook_routing_key: None,
+            webhooks: Vec::new(),
             batch_alerts: false,
         };
 
@@ -1162,10 +1217,14 @@ mod tests {
                     contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
                     network: txwatch_config::Network::Testnet,
                     rules: vec![txwatch_config::AlertRule::AnyTransaction],
-                    webhook_url: "https://hooks.example.com/a".into(),
+                    webhook_url: Some("https://hooks.example.com/a".into()),
                     webhook_secret: None,
                     poll_interval_seconds: None,
                     horizon_base_url_override: None,
+                    webhook_format: Default::default(),
+                    webhook_headers: Default::default(),
+                    webhook_routing_key: None,
+                    webhooks: Vec::new(),
                     batch_alerts: false,
                 },
                 WatchedContract {
@@ -1173,10 +1232,14 @@ mod tests {
                     contract_id: "CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526".into(),
                     network: txwatch_config::Network::Mainnet,
                     rules: vec![txwatch_config::AlertRule::AnyTransaction],
-                    webhook_url: "https://hooks.example.com/b".into(),
+                    webhook_url: Some("https://hooks.example.com/b".into()),
                     webhook_secret: None,
                     poll_interval_seconds: None,
                     horizon_base_url_override: None,
+                    webhook_format: Default::default(),
+                    webhook_headers: Default::default(),
+                    webhook_routing_key: None,
+                    webhooks: Vec::new(),
                     batch_alerts: false,
                 },
                 WatchedContract {
@@ -1184,10 +1247,14 @@ mod tests {
                     contract_id: "CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ".into(),
                     network: txwatch_config::Network::Mainnet,
                     rules: vec![txwatch_config::AlertRule::AnyTransaction],
-                    webhook_url: "https://hooks.example.com/c".into(),
+                    webhook_url: Some("https://hooks.example.com/c".into()),
                     webhook_secret: None,
                     poll_interval_seconds: None,
                     horizon_base_url_override: None,
+                    webhook_format: Default::default(),
+                    webhook_headers: Default::default(),
+                    webhook_routing_key: None,
+                    webhooks: Vec::new(),
                     batch_alerts: false,
                 },
             ],
@@ -1340,10 +1407,14 @@ mod tests {
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
             network: Network::Testnet,
             rules: vec![AlertRule::AnyTransaction],
-            webhook_url: format!("{}/hooks", server.uri()),
+            webhook_url: Some(format!("{}/hooks", server.uri())),
             webhook_secret: None,
             poll_interval_seconds: None,
             horizon_base_url_override: Some(server.uri()),
+            webhook_format: Default::default(),
+            webhook_headers: Default::default(),
+            webhook_routing_key: None,
+            webhooks: Vec::new(),
             batch_alerts: false,
         };
         let mut cursors: HashMap<String, String> = HashMap::new();
@@ -1356,6 +1427,73 @@ mod tests {
         assert_eq!(alerts, 201);
     }
 
+    // ── Multiple destinations ────────────────────────────────────────────────
+
+    /// One alert goes to every destination; a destination that keeps failing
+    /// is counted as one failure and does not stop delivery to the others.
+    #[tokio::test]
+    async fn alerts_go_to_every_destination_independently() {
+        let horizon = MockServer::start().await;
+        let tx_page = serde_json::json!({
+            "_embedded": { "records": [{
+                "hash": "multi1",
+                "created_at": "2024-06-01T10:00:00Z",
+                "successful": true,
+                "paging_token": "1",
+                "operations": [{ "type": "invoke_host_function", "function": "withdraw" }]
+            }] }
+        });
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(tx_page))
+            .mount(&horizon)
+            .await;
+
+        let good = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&good)
+            .await;
+        let slack = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&slack)
+            .await;
+        let broken = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&broken)
+            .await;
+
+        let contract = WatchedContract {
+            label: "multi".into(),
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            network: Network::Testnet,
+            rules: vec![AlertRule::AnyTransaction],
+            webhook_url: Some(good.uri()),
+            webhook_secret: None,
+            poll_interval_seconds: None,
+            horizon_base_url_override: Some(horizon.uri()),
+            webhook_format: Default::default(),
+            webhook_headers: Default::default(),
+            webhook_routing_key: None,
+            webhooks: vec![
+                WebhookDestination {
+                    url: broken.uri(),
+                    secret: None,
+                    format: txwatch_config::WebhookFormat::Txwatch,
+                    headers: Default::default(),
+                    routing_key: None,
+                },
+                WebhookDestination {
+                    url: slack.uri(),
+                    secret: None,
+                    format: txwatch_config::WebhookFormat::Slack,
+                    headers: Default::default(),
+                    routing_key: None,
+                },
+            ],
+        };
     // ── Batched delivery ─────────────────────────────────────────────────────
 
     /// Mounts a Horizon returning `n` transactions (one page) on `server`, and
@@ -1420,6 +1558,20 @@ mod tests {
         let (txs, alerts, failures) = poll_contract(&Client::new(), &contract, &mut cursors, false)
             .await
             .unwrap();
+        assert_eq!((txs, alerts, failures), (1, 1, 1));
+
+        let good_requests = good.received_requests().await.unwrap();
+        assert_eq!(good_requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&good_requests[0].body).unwrap();
+        assert_eq!(body["transaction_hash"], "multi1");
+
+        let slack_requests = slack.received_requests().await.unwrap();
+        assert_eq!(slack_requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&slack_requests[0].body).unwrap();
+        assert!(body["blocks"].is_array(), "slack destination gets Slack format");
+
+        // The failing destination was retried on its own.
+        assert_eq!(broken.received_requests().await.unwrap().len(), 3);
         assert_eq!((txs, alerts, failures), (3, 3, 0));
         assert_eq!(batch_sizes(&receiver).await, vec![3]);
     }
