@@ -19,6 +19,8 @@ use txwatch_config::{AppConfig, WatchedContract};
 use txwatch_notifier::{send_webhook, send_webhook_batch, MAX_BATCH_SIZE};
 use txwatch_rules::{evaluate, EnrichedTransaction, HorizonTransaction};
 
+pub mod event_stream;
+pub use event_stream::{EventFilter, GetEventsParams, SorobanEvent, SorobanEventStreamer};
 pub mod plan_cache;
 pub use plan_cache::{PlanCache, PlanStatistics};
 
