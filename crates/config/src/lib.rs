@@ -10,6 +10,12 @@ use url::Url;
 
 const MAX_LARGE_TRANSFER_THRESHOLD_XLM: u64 = 1_000_000_000;
 
+/// Upper bound for a rule's `cooldown_seconds` (one week).
+const MAX_COOLDOWN_SECONDS: u64 = 7 * 24 * 3600;
+
+/// Wildcard accepted in `EventEmitted.topics` to match any value at that position.
+pub const EVENT_TOPIC_WILDCARD: &str = "*";
+
 /// Soroban function names are symbols: at most 32 characters from `[a-zA-Z0-9_]`.
 const MAX_SOROBAN_SYMBOL_LEN: usize = 32;
 
@@ -28,9 +34,7 @@ const MAX_HTTP_TCP_KEEPALIVE_SECS: u64 = 7200;
 /// Rejects names that can never match a Soroban function: blank, longer than
 /// 32 characters, or containing anything outside `[a-zA-Z0-9_]`.
 fn validate_function_name(name: &str, rule: &str, contract_label: &str) -> Result<()> {
-    if name.len() > MAX_SOROBAN_SYMBOL_LEN
-        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
+    if !is_soroban_symbol(name) {
         bail!(
             "contract '{}': {} function name {:?} is not a valid Soroban symbol \
              (at most {} characters from [a-zA-Z0-9_])",
@@ -41,6 +45,12 @@ fn validate_function_name(name: &str, rule: &str, contract_label: &str) -> Resul
         );
     }
     Ok(())
+}
+
+/// At most 32 characters from `[a-zA-Z0-9_]`.
+fn is_soroban_symbol(name: &str) -> bool {
+    name.len() <= MAX_SOROBAN_SYMBOL_LEN
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 fn validate_poll_interval(value: u64, field: &str) -> Result<()> {
@@ -83,6 +93,10 @@ pub struct CustomNetwork {
     /// Optional network passphrase, e.g. `Standalone Network ; February 2017`.
     #[serde(default)]
     pub passphrase: Option<String>,
+    /// Optional Soroban RPC URL, e.g. `http://localhost:8000/rpc` for stellar/quickstart.
+    /// Used to fetch contract events for `EventEmitted` rules.
+    #[serde(default)]
+    pub rpc_url: Option<String>,
 }
 
 const NAMED_NETWORKS: &[&str] = &["mainnet", "testnet", "futurenet"];
@@ -164,6 +178,18 @@ impl Network {
         }
     }
 
+    /// Default Soroban RPC URL for this network. SDF runs public endpoints for
+    /// testnet and futurenet only, so mainnet (and a custom network without
+    /// `rpc_url`) returns `None` and needs an explicit `soroban_rpc_url`.
+    pub fn soroban_rpc_url(&self) -> Option<&str> {
+        match self {
+            Network::Mainnet => None,
+            Network::Testnet => Some("https://soroban-testnet.stellar.org"),
+            Network::Futurenet => Some("https://rpc-futurenet.stellar.org"),
+            Network::Custom(custom) => custom.rpc_url.as_deref(),
+        }
+    }
+
     /// Network name used in logs and the `network` field of alert payloads.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -220,7 +246,7 @@ pub enum AlertRule {
     AdminFunctionCalled {
         function_names: Vec<String>,
     },
-    /// Fires when the transaction's fee exceeds the threshold.
+    /// Fires when the transaction's fee is greater than or equal to the threshold.
     /// Specify either `threshold_stroops` (raw stroops) or `threshold_xlm` (whole XLM,
     /// converted to stroops during validation); the two are mutually exclusive.
     HighFee {
@@ -228,6 +254,15 @@ pub enum AlertRule {
         threshold_stroops: u64,
         #[serde(default)]
         threshold_xlm: Option<u64>,
+    },
+    /// Fires when the transaction emitted a Soroban contract event whose first
+    /// topic is the symbol `topic` (e.g. `transfer`, `mint`, `admin_changed`).
+    /// `topics` optionally constrains the following topics positionally
+    /// (`topics[0]` matches event topic 1, and so on); `"*"` matches anything.
+    EventEmitted {
+        topic: String,
+        #[serde(default)]
+        topics: Vec<String>,
     },
 }
 
@@ -354,9 +389,44 @@ impl AlertRule {
                 }
                 _ => {}
             },
+            AlertRule::EventEmitted { topic, topics } => {
+                *topic = topic.trim().to_owned();
+                if topic.is_empty() {
+                    bail!(
+                        "contract '{}': EventEmitted topic must not be empty",
+                        contract_label
+                    );
+                }
+                if !is_soroban_symbol(topic) {
+                    bail!(
+                        "contract '{}': EventEmitted topic {:?} is not a valid Soroban symbol \
+                         (at most {} characters from [a-zA-Z0-9_])",
+                        contract_label,
+                        topic,
+                        MAX_SOROBAN_SYMBOL_LEN
+                    );
+                }
+                for t in topics.iter_mut() {
+                    *t = t.trim().to_owned();
+                    if t.is_empty() {
+                        bail!(
+                            "contract '{}': EventEmitted topics must not contain blank entries \
+                             (use \"{}\" to match any value)",
+                            contract_label,
+                            EVENT_TOPIC_WILDCARD
+                        );
+                    }
+                }
+            }
         }
         Ok(())
     }
+
+    /// True for rules that need the transaction's contract events (fetched from Soroban RPC).
+    pub fn needs_events(&self) -> bool {
+        matches!(self, AlertRule::EventEmitted { .. })
+    }
+
     pub fn label(&self) -> String {
         match self {
             AlertRule::AnyTransaction => "AnyTransaction".into(),
@@ -380,10 +450,76 @@ impl AlertRule {
                     format!("HighFee(>={} stroops)", threshold_stroops)
                 }
             }
+            AlertRule::EventEmitted { topic, topics } => event_emitted_label(topic, topics),
         }
     }
 }
 
+/// Label for an `EventEmitted` rule, e.g. `EventEmitted(transfer)` or
+/// `EventEmitted(transfer, *, GABC…)`.
+pub fn event_emitted_label(topic: &str, topics: &[String]) -> String {
+    if topics.is_empty() {
+        format!("EventEmitted({})", topic)
+    } else {
+        format!("EventEmitted({}, {})", topic, topics.join(", "))
+    }
+}
+
+// ── RuleConfig ────────────────────────────────────────────────────────────────
+
+/// One `[[contracts.rules]]` entry: the rule itself plus per-rule delivery
+/// settings that apply to every rule type.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct RuleConfig {
+    #[serde(flatten)]
+    pub rule: AlertRule,
+    /// Minimum number of seconds between two alerts for this rule on this
+    /// contract. Matches inside the window are suppressed and counted; the next
+    /// alert that fires reports them in `suppressed_count`. Unset or 0 disables
+    /// the cooldown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_seconds: Option<u64>,
+}
+
+impl RuleConfig {
+    pub fn validate(&mut self, contract_label: &str) -> Result<()> {
+        self.rule.validate(contract_label)?;
+        if let Some(cooldown) = self.cooldown_seconds {
+            if cooldown > MAX_COOLDOWN_SECONDS {
+                bail!(
+                    "contract '{}': {} cooldown_seconds must be <= {}",
+                    contract_label,
+                    self.rule.label(),
+                    MAX_COOLDOWN_SECONDS
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn label(&self) -> String {
+        self.rule.label()
+    }
+}
+
+impl From<AlertRule> for RuleConfig {
+    fn from(rule: AlertRule) -> Self {
+        Self {
+            rule,
+            cooldown_seconds: None,
+        }
+    }
+}
+
+impl AsRef<AlertRule> for RuleConfig {
+    fn as_ref(&self) -> &AlertRule {
+        &self.rule
+    }
+}
+
+impl AsRef<AlertRule> for AlertRule {
+    fn as_ref(&self) -> &AlertRule {
+        self
 // ── Webhook destinations ──────────────────────────────────────────────────────
 
 /// Printed in place of secret values (header values, secrets, routing keys).
@@ -570,6 +706,8 @@ pub struct WatchedContract {
     pub label: String,
     pub contract_id: String,
     pub network: Network,
+    pub rules: Vec<RuleConfig>,
+    pub webhook_url: String,
     pub rules: Vec<AlertRule>,
     /// Shorthand for a single destination; the `webhook_*` fields below
     /// describe it. Use `webhooks` for more than one destination. Optional when
@@ -600,6 +738,11 @@ pub struct WatchedContract {
     /// `poll_interval_seconds`. Same bounds (5–3600).
     #[serde(default)]
     pub poll_interval_seconds: Option<u64>,
+    /// Soroban RPC endpoint used to fetch contract events for `EventEmitted`
+    /// rules. Defaults to the network's RPC URL (see [`Network::soroban_rpc_url`]);
+    /// required for mainnet, which has no default.
+    #[serde(default)]
+    pub soroban_rpc_url: Option<String>,
     /// Deliver all alerts from one poll cycle as a single `{"alerts": [...]}`
     /// POST (split into batches of at most 50) instead of one POST per alert.
     /// Default: false.
@@ -791,6 +934,19 @@ impl WatchedContract {
         self.poll_interval_seconds.unwrap_or(default)
     }
 
+    /// The Soroban RPC endpoint for this contract: its own `soroban_rpc_url`,
+    /// else the network default.
+    pub fn effective_soroban_rpc_url(&self) -> Option<&str> {
+        self.soroban_rpc_url
+            .as_deref()
+            .or_else(|| self.network.soroban_rpc_url())
+    }
+
+    /// True when any configured rule needs contract events.
+    pub fn needs_events(&self) -> bool {
+        self.rules.iter().any(|r| r.rule.needs_events())
+    }
+
     pub fn validate(&mut self) -> Result<()> {
         ValidationErrors::into_result(self.collect_errors())
     }
@@ -894,6 +1050,15 @@ impl WatchedContract {
                     ));
                 }
             }
+            if let Some(rpc_url) = &mut custom.rpc_url {
+                *rpc_url = rpc_url.trim_end_matches('/').to_owned();
+                if let Some(problem) = check_http_url(rpc_url) {
+                    errors.push(format!(
+                        "contract '{}': network rpc_url {}",
+                        self.label, problem
+                    ));
+                }
+            }
         }
 
         if self.rules.is_empty() {
@@ -908,6 +1073,24 @@ impl WatchedContract {
             if let Err(e) = rule.validate(&label) {
                 errors.push(e.to_string());
             }
+        }
+
+        if let Some(rpc_url) = &mut self.soroban_rpc_url {
+            *rpc_url = rpc_url.trim_end_matches('/').to_owned();
+            if let Some(problem) = check_http_url(rpc_url) {
+                errors.push(format!(
+                    "contract '{}': soroban_rpc_url {}",
+                    self.label, problem
+                ));
+            }
+        }
+        if self.needs_events() && self.effective_soroban_rpc_url().is_none() {
+            errors.push(format!(
+                "contract '{}': EventEmitted rules need a Soroban RPC endpoint; \
+                 set soroban_rpc_url (network '{}' has no default)",
+                self.label,
+                self.network.as_str()
+            ));
         }
 
         errors
@@ -1234,10 +1417,13 @@ mod tests {
             label: "Test".into(),
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
             network: Network::Testnet,
+            rules: vec![AlertRule::AnyTransaction].into_iter().map(Into::into).collect(),
+            webhook_url: "https://example.com/hook".into(),
             rules: vec![AlertRule::AnyTransaction],
             webhook_url: Some("https://example.com/hook".into()),
             webhook_secret: None,
             poll_interval_seconds: None,
+            soroban_rpc_url: None,
             horizon_base_url_override: None,
             webhook_format: Default::default(),
             webhook_headers: Default::default(),
@@ -1326,7 +1512,10 @@ mod tests {
     #[test]
     fn rejects_zero_threshold() {
         let mut c = valid_contract();
-        c.rules = vec![AlertRule::LargeTransfer { threshold_xlm: 0 }];
+        c.rules = vec![AlertRule::LargeTransfer { threshold_xlm: 0 }]
+            .into_iter()
+            .map(Into::into)
+            .collect();
         assert!(c.validate().is_err());
     }
 
@@ -1335,7 +1524,10 @@ mod tests {
         let mut c = valid_contract();
         c.rules = vec![AlertRule::LargeTransfer {
             threshold_xlm: MAX_LARGE_TRANSFER_THRESHOLD_XLM + 1,
-        }];
+        }]
+        .into_iter()
+        .map(Into::into)
+        .collect();
         let err = c.validate().unwrap_err();
         assert!(err
             .to_string()
@@ -1347,7 +1539,10 @@ mod tests {
         let mut c = valid_contract();
         c.rules = vec![AlertRule::FunctionCalled {
             function_name: "  ".into(),
-        }];
+        }]
+        .into_iter()
+        .map(Into::into)
+        .collect();
         assert!(c.validate().is_err());
     }
 
@@ -1356,7 +1551,10 @@ mod tests {
         let mut c = valid_contract();
         c.rules = vec![AlertRule::AdminFunctionCalled {
             function_names: vec![],
-        }];
+        }]
+        .into_iter()
+        .map(Into::into)
+        .collect();
         assert!(c.validate().is_err());
     }
 
@@ -1366,7 +1564,10 @@ mod tests {
         let mut c = valid_contract();
         c.rules = vec![AlertRule::AdminFunctionCalled {
             function_names: vec!["set_admin".into(), " ".into()],
-        }];
+        }]
+        .into_iter()
+        .map(Into::into)
+        .collect();
         let err = c.validate().unwrap_err();
         assert!(
             err.to_string().contains("blank"),
@@ -1381,7 +1582,10 @@ mod tests {
         let mut c = valid_contract();
         c.rules = vec![AlertRule::AdminFunctionCalled {
             function_names: vec!["set_admin".into()],
-        }];
+        }]
+        .into_iter()
+        .map(Into::into)
+        .collect();
         assert!(c.validate().is_ok());
     }
 
@@ -1390,9 +1594,12 @@ mod tests {
         let mut c = valid_contract();
         c.rules = vec![AlertRule::AdminFunctionCalled {
             function_names: vec!["Set_Admin".into(), "UPGRADE".into()],
-        }];
+        }]
+        .into_iter()
+        .map(Into::into)
+        .collect();
         c.validate().unwrap();
-        if let AlertRule::AdminFunctionCalled { function_names } = &c.rules[0] {
+        if let AlertRule::AdminFunctionCalled { function_names } = &c.rules[0].rule {
             assert_eq!(function_names, &["set_admin", "upgrade"]);
         } else {
             panic!("expected AdminFunctionCalled");
@@ -1454,6 +1661,7 @@ mod tests {
                 horizon_url: "http://localhost:8000".into(),
                 explorer_url: None,
                 passphrase: Some("Standalone Network ; February 2017".into()),
+                rpc_url: None,
             })
         );
         assert_eq!(network.horizon_base_url(), "http://localhost:8000");
@@ -1522,7 +1730,10 @@ mod tests {
         bad_id.webhook_url = Some("ftp://bad".into());
         let mut bad_rule = valid_contract();
         bad_rule.label = "B".into();
-        bad_rule.rules = vec![AlertRule::LargeTransfer { threshold_xlm: 0 }];
+        bad_rule.rules = vec![AlertRule::LargeTransfer { threshold_xlm: 0 }]
+            .into_iter()
+            .map(Into::into)
+            .collect();
         let mut cfg = AppConfig {
             poll_interval_seconds: 1,
             contracts: vec![bad_id, bad_rule, valid_contract(), valid_contract()],
@@ -1595,11 +1806,14 @@ mod tests {
         c.rules = vec![AlertRule::HighFee {
             threshold_stroops: 0,
             threshold_xlm: Some(1),
-        }];
+        }]
+        .into_iter()
+        .map(Into::into)
+        .collect();
         c.validate().unwrap();
         if let AlertRule::HighFee {
             threshold_stroops, ..
-        } = &c.rules[0]
+        } = &c.rules[0].rule
         {
             assert_eq!(
                 *threshold_stroops, 10_000_000,
@@ -1616,7 +1830,10 @@ mod tests {
         c.rules = vec![AlertRule::HighFee {
             threshold_stroops: 0,
             threshold_xlm: Some(0),
-        }];
+        }]
+        .into_iter()
+        .map(Into::into)
+        .collect();
         assert!(c.validate().is_err());
     }
 
@@ -1626,7 +1843,10 @@ mod tests {
         c.rules = vec![AlertRule::HighFee {
             threshold_stroops: 100,
             threshold_xlm: Some(1),
-        }];
+        }]
+        .into_iter()
+        .map(Into::into)
+        .collect();
         let err = c.validate().unwrap_err();
         assert!(err.to_string().contains("not both"));
     }
@@ -1637,7 +1857,10 @@ mod tests {
         c.rules = vec![AlertRule::HighFee {
             threshold_stroops: 0,
             threshold_xlm: None,
-        }];
+        }]
+        .into_iter()
+        .map(Into::into)
+        .collect();
         assert!(c.validate().is_err());
     }
 
@@ -1865,7 +2088,10 @@ mod tests {
         let mut c = valid_contract();
         c.rules = vec![AlertRule::FunctionCalled {
             function_name: "a".repeat(33),
-        }];
+        }]
+        .into_iter()
+        .map(Into::into)
+        .collect();
         let err = c.validate().unwrap_err().to_string();
         assert!(err.contains("contract 'Test'"), "got: {}", err);
         assert!(err.contains("FunctionCalled"), "got: {}", err);
@@ -1881,7 +2107,10 @@ mod tests {
         let mut c = valid_contract();
         c.rules = vec![AlertRule::FunctionCalled {
             function_name: "a".repeat(32),
-        }];
+        }]
+        .into_iter()
+        .map(Into::into)
+        .collect();
         assert!(c.validate().is_ok());
     }
 
@@ -1891,7 +2120,10 @@ mod tests {
             let mut c = valid_contract();
             c.rules = vec![AlertRule::FunctionCalled {
                 function_name: name.into(),
-            }];
+            }]
+            .into_iter()
+            .map(Into::into)
+            .collect();
             let err = c.validate().unwrap_err().to_string();
             assert!(
                 err.contains("not a valid Soroban symbol"),
@@ -1907,7 +2139,10 @@ mod tests {
         let mut c = valid_contract();
         c.rules = vec![AlertRule::FunctionCalled {
             function_name: "withdraw ".into(),
-        }];
+        }]
+        .into_iter()
+        .map(Into::into)
+        .collect();
         let err = c.validate().unwrap_err().to_string();
         assert!(err.contains("\"withdraw \""), "got: {}", err);
     }
@@ -1917,7 +2152,10 @@ mod tests {
         let mut c = valid_contract();
         c.rules = vec![AlertRule::AdminFunctionCalled {
             function_names: vec!["set_admin".into(), " upgrade".into()],
-        }];
+        }]
+        .into_iter()
+        .map(Into::into)
+        .collect();
         let err = c.validate().unwrap_err().to_string();
         assert!(err.contains("AdminFunctionCalled"), "got: {}", err);
         assert!(err.contains("not a valid Soroban symbol"), "got: {}", err);
@@ -1962,6 +2200,119 @@ mod tests {
         );
     }
 
+    // ── Issue #50: EventEmitted ───────────────────────────────────────────────
+
+    fn event_rule(topic: &str, topics: &[&str]) -> RuleConfig {
+        AlertRule::EventEmitted {
+            topic: topic.into(),
+            topics: topics.iter().map(|t| t.to_string()).collect(),
+        }
+        .into()
+    }
+
+    #[test]
+    fn event_emitted_accepts_symbol_topic_on_testnet() {
+        let mut c = valid_contract();
+        c.rules = vec![event_rule(" transfer ", &["*", "GABC"])];
+        c.validate().unwrap();
+        if let AlertRule::EventEmitted { topic, .. } = &c.rules[0].rule {
+            assert_eq!(topic, "transfer");
+        }
+        assert_eq!(c.rules[0].label(), "EventEmitted(transfer, *, GABC)");
+    }
+
+    #[test]
+    fn event_emitted_rejects_invalid_topic() {
+        let too_long = "a".repeat(33);
+        for bad in ["", "not-a-symbol", too_long.as_str()] {
+            let mut c = valid_contract();
+            c.rules = vec![event_rule(bad, &[])];
+            assert!(c.validate().is_err(), "topic {:?} should be rejected", bad);
+        }
+    }
+
+    #[test]
+    fn event_emitted_rejects_blank_extra_topic() {
+        let mut c = valid_contract();
+        c.rules = vec![event_rule("transfer", &["  "])];
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("blank"), "got: {}", err);
+    }
+
+    #[test]
+    fn event_emitted_on_mainnet_requires_rpc_url() {
+        let mut c = valid_contract();
+        c.network = Network::Mainnet;
+        c.rules = vec![event_rule("transfer", &[])];
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("soroban_rpc_url"), "got: {}", err);
+
+        let mut c = valid_contract();
+        c.network = Network::Mainnet;
+        c.rules = vec![event_rule("transfer", &[])];
+        c.soroban_rpc_url = Some("https://rpc.example.com/".into());
+        c.validate().unwrap();
+        assert_eq!(c.effective_soroban_rpc_url(), Some("https://rpc.example.com"));
+    }
+
+    #[test]
+    fn event_emitted_parses_from_toml() {
+        let mut cfg = parse_with_interval(
+            r#"
+            [[contracts]]
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            [[contracts.rules]]
+            type = "EventEmitted"
+            topic = "mint"
+            topics = ["*"]
+            "#,
+        );
+        cfg.validate().unwrap();
+        assert!(cfg.contracts[0].needs_events());
+        assert_eq!(
+            cfg.contracts[0].effective_soroban_rpc_url(),
+            Some("https://soroban-testnet.stellar.org")
+        );
+    }
+
+    // ── Issue #49: cooldown_seconds ───────────────────────────────────────────
+
+    #[test]
+    fn cooldown_seconds_parses_on_any_rule() {
+        let mut cfg = parse_with_interval(
+            r#"
+            [[contracts]]
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            [[contracts.rules]]
+            type = "AnyTransaction"
+            cooldown_seconds = 300
+            [[contracts.rules]]
+            type = "HighFee"
+            threshold_stroops = 100
+            "#,
+        );
+        cfg.validate().unwrap();
+        let rules = &cfg.contracts[0].rules;
+        assert_eq!(rules[0].cooldown_seconds, Some(300));
+        assert!(matches!(rules[0].rule, AlertRule::AnyTransaction));
+        assert_eq!(rules[1].cooldown_seconds, None);
+    }
+
+    #[test]
+    fn cooldown_seconds_above_max_is_rejected() {
+        let mut c = valid_contract();
+        c.rules = vec![RuleConfig {
+            rule: AlertRule::AnyTransaction,
+            cooldown_seconds: Some(MAX_COOLDOWN_SECONDS + 1),
+        }];
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("cooldown_seconds"), "got: {}", err);
     // ── Webhook destinations, formats and headers ────────────────────────────
 
     /// Parses and validates `contract_body` as the only `[[contracts]]` entry

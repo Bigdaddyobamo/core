@@ -362,6 +362,8 @@ pub fn test_payload_with_network(
             None => format!("{}/transactions/{}", horizon_base_url, tx_hash),
         },
         explorer_link: format!("https://stellar.expert/explorer/{}/tx/{}", network, tx_hash),
+        matched_events: vec![],
+        suppressed_count: 0,
         test: true,
     }
 }
@@ -393,6 +395,8 @@ mod tests {
             timestamp_iso: "2023-11-15T03:13:20Z".into(),
             horizon_link: "https://horizon-testnet.stellar.org/transactions/abc123".into(),
             explorer_link: "https://stellar.expert/explorer/testnet/tx/abc123".into(),
+            matched_events: vec![],
+            suppressed_count: 0,
             test: false,
         }
     }

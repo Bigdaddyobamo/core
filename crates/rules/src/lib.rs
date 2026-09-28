@@ -7,18 +7,38 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use txwatch_config::AlertRule;
+use serde_json::Value;
+use std::collections::HashMap;
+use txwatch_config::{AlertRule, RuleConfig, EVENT_TOPIC_WILDCARD};
 
 pub mod yield_calculator;
 pub use yield_calculator::{PoolYield, YieldCalculator};
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
-/// Maximum XLM supply in stroops: 50 billion XLM × 10^7 stroops/XLM.
-/// The total Stellar XLM supply is capped at ~50 billion XLM. This constant serves
-/// as a reference for validating that u64 is sufficient for any realistic transaction
-/// amount, since 500 trillion is well below u64::MAX (18.4 quintillion).
+/// Maximum XLM supply in stroops: 50 billion XLM × 10^7 stroops/XLM
+/// = 5 × 10^17 (500 quadrillion) stroops, well below u64::MAX (~1.8 × 10^19).
+/// Parsed amounts and fees above this value cannot exist on the network, so
+/// [`EnrichedTransaction::from_horizon`] discards them as malformed.
 pub const MAX_XLM_SUPPLY_STROOPS: u64 = 500_000_000_000_000_000;
+
+/// Returns `value` if it is a possible on-chain stroop amount, logging and
+/// discarding anything above [`MAX_XLM_SUPPLY_STROOPS`].
+fn sanitize_stroops(value: Option<u64>, field: &str, tx_hash: &str) -> Option<u64> {
+    match value {
+        Some(v) if v > MAX_XLM_SUPPLY_STROOPS => {
+            tracing::warn!(
+                tx = %tx_hash,
+                field,
+                value = v,
+                max = MAX_XLM_SUPPLY_STROOPS,
+                "parsed amount exceeds the total XLM supply — ignoring it"
+            );
+            None
+        }
+        other => other,
+    }
+}
 
 // ── Horizon transaction shape ─────────────────────────────────────────────────
 
@@ -35,6 +55,66 @@ pub struct HorizonTransaction {
     pub envelope_xdr: Option<String>,
     /// Base64-encoded XDR transaction result.
     pub result_xdr: Option<String>,
+    /// Ledger sequence the transaction was included in; used to look up its
+    /// contract events on Soroban RPC.
+    #[serde(default)]
+    pub ledger: Option<u32>,
+}
+
+// ── Contract events ───────────────────────────────────────────────────────────
+
+/// A Soroban contract event emitted by a transaction, as returned by Soroban
+/// RPC `getEvents` with `xdrFormat: "json"`. Topics and data are `ScVal`s in
+/// their JSON form, e.g. `{"symbol": "transfer"}` or `{"address": "G…"}`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ContractEvent {
+    /// Contract that emitted the event.
+    pub contract_id: String,
+    pub topics: Vec<Value>,
+    pub data: Value,
+}
+
+impl ContractEvent {
+    /// The first topic as a symbol, if it is one.
+    fn first_symbol(&self) -> Option<&str> {
+        self.topics.first()?.get("symbol")?.as_str()
+    }
+
+    /// Does this event match an `EventEmitted { topic, topics }` rule?
+    /// `topic` must equal topic 0 as a symbol exactly; each entry of `topics`
+    /// is compared positionally against topics 1.. (`"*"` matches anything).
+    pub fn matches(&self, topic: &str, topics: &[String]) -> bool {
+        if self.first_symbol() != Some(topic) {
+            return false;
+        }
+        topics.iter().enumerate().all(|(i, pattern)| {
+            pattern == EVENT_TOPIC_WILDCARD
+                || self
+                    .topics
+                    .get(i + 1)
+                    .is_some_and(|value| topic_value_matches(value, pattern))
+        })
+    }
+}
+
+/// Compare one `ScVal` topic against a config pattern. Single-key scalar
+/// values (`{"symbol": "x"}`, `{"address": "G…"}`, `{"u32": 5}`, `{"i128": "-1"}`)
+/// match the inner value's text; anything else matches its compact JSON.
+fn topic_value_matches(value: &Value, pattern: &str) -> bool {
+    let scalar = |v: &Value| match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    };
+    let inner = match value {
+        Value::Object(map) if map.len() == 1 => map.values().next().and_then(scalar),
+        other => scalar(other),
+    };
+    match inner {
+        Some(text) => text == pattern,
+        None => value.to_string() == pattern,
+    }
 }
 
 // ── Enriched transaction ──────────────────────────────────────────────────────
@@ -52,12 +132,15 @@ pub struct EnrichedTransaction {
     /// All Soroban contract functions invoked in this transaction (may be multiple).
     pub function_names: Vec<String>,
     /// Transfer amount in stroops (1 XLM = 10_000_000 stroops), if detected.
-    /// Uses u64 because the total XLM supply is ~50 billion XLM = ~500 trillion stroops,
-    /// which is well within u64::MAX (18.4 quintillion). This type is sufficient for any
-    /// realistic transaction amount on the Stellar network.
+    /// Uses u64 because the total XLM supply is ~50 billion XLM = 5 × 10^17
+    /// (500 quadrillion) stroops ([`MAX_XLM_SUPPLY_STROOPS`]), well within
+    /// u64::MAX (~1.8 × 10^19).
     pub amount_stroops: Option<u64>,
     /// Fee charged for this transaction in stroops.
     pub fee_charged_stroops: Option<u64>,
+    /// Contract events emitted by this transaction. Only populated when the
+    /// contract has an `EventEmitted` rule (fetched from Soroban RPC).
+    pub events: Vec<ContractEvent>,
 }
 
 impl EnrichedTransaction {
@@ -75,19 +158,32 @@ impl EnrichedTransaction {
             )
         })?;
 
+        let fee_charged_stroops = fee_charged_stroops.or_else(|| {
+            tx.fee_charged
+                .as_deref()
+                .and_then(|s| s.parse::<u64>().ok())
+        });
+
         Ok(Self {
+            amount_stroops: sanitize_stroops(amount_stroops, "amount_stroops", &tx.hash),
+            fee_charged_stroops: sanitize_stroops(
+                fee_charged_stroops,
+                "fee_charged_stroops",
+                &tx.hash,
+            ),
             hash: tx.hash,
             timestamp,
             successful: tx.successful,
             paging_token: tx.paging_token,
             function_names,
-            amount_stroops,
-            fee_charged_stroops: fee_charged_stroops.or_else(|| {
-                tx.fee_charged
-                    .as_deref()
-                    .and_then(|s| s.parse::<u64>().ok())
-            }),
+            events: Vec::new(),
         })
+    }
+
+    /// Attach the contract events emitted by this transaction.
+    pub fn with_events(mut self, events: Vec<ContractEvent>) -> Self {
+        self.events = events;
+        self
     }
 }
 
@@ -124,6 +220,15 @@ pub struct AlertPayload {
     pub horizon_link: String,
     /// Stellar Expert explorer link for the transaction.
     pub explorer_link: String,
+    /// Contract events that matched an `EventEmitted` rule (topics and data);
+    /// empty for every other rule type.
+    #[serde(default)]
+    pub matched_events: Vec<ContractEvent>,
+    /// Number of matches of this rule that were suppressed by its
+    /// `cooldown_seconds` since the previous alert was sent. 0 when the rule
+    /// has no cooldown or nothing was suppressed.
+    #[serde(default)]
+    pub suppressed_count: u64,
     /// `true` only for synthetic payloads sent by `txwatch test-webhook`;
     /// omitted from the JSON otherwise.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -150,13 +255,13 @@ pub fn alert_id(contract_id: &str, transaction_hash: &str, rule_triggered: &str)
 /// Evaluate all rules for one contract against one transaction.
 /// Returns one `AlertPayload` per matching rule.
 /// Never panics — errors in individual rule evaluation are logged and skipped.
-pub fn evaluate(
+pub fn evaluate<R: AsRef<AlertRule>>(
     label: &str,
     contract_id: &str,
     network: &str,
     horizon_base: &str,
     explorer_base: &str,
-    rules: &[AlertRule],
+    rules: &[R],
     tx: &EnrichedTransaction,
 ) -> Vec<AlertPayload> {
     let horizon_link = format!("{}/transactions/{}", horizon_base.trim_end_matches('/'), tx.hash);
@@ -166,6 +271,7 @@ pub fn evaluate(
 
     rules
         .iter()
+        .map(AsRef::as_ref)
         .filter_map(|rule| match eval_rule(rule, tx) {
             Ok(true) => Some(AlertPayload {
                 alert_id: alert_id(contract_id, &tx.hash, &rule_label(rule)),
@@ -183,6 +289,8 @@ pub fn evaluate(
                 timestamp_iso: timestamp_iso.clone(),
                 horizon_link: horizon_link.clone(),
                 explorer_link: explorer_link.clone(),
+                matched_events: matched_events(rule, tx),
+                suppressed_count: 0,
                 test: false,
             }),
             Ok(false) => None,
@@ -233,7 +341,24 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
             .fee_charged_stroops
             .map(|f| f >= *threshold_stroops)
             .unwrap_or(false),
+
+        AlertRule::EventEmitted { topic, topics } => {
+            tx.events.iter().any(|e| e.matches(topic, topics))
+        }
     })
+}
+
+/// The events an `EventEmitted` rule matched; empty for other rules.
+fn matched_events(rule: &AlertRule, tx: &EnrichedTransaction) -> Vec<ContractEvent> {
+    match rule {
+        AlertRule::EventEmitted { topic, topics } => tx
+            .events
+            .iter()
+            .filter(|e| e.matches(topic, topics))
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 // NOTE: When adding a new AlertRule variant, update both `eval_rule()` and
@@ -260,6 +385,9 @@ fn rule_label(rule: &AlertRule) -> String {
                 format!("HighFee(>={} stroops)", threshold_stroops)
             }
         }
+        AlertRule::EventEmitted { topic, topics } => {
+            txwatch_config::event_emitted_label(topic, topics)
+        }
     }
 }
 
@@ -271,6 +399,118 @@ fn rule_type(rule: &AlertRule) -> String {
         AlertRule::FunctionCalled { .. } => "FunctionCalled".into(),
         AlertRule::AdminFunctionCalled { .. } => "AdminFunctionCalled".into(),
         AlertRule::HighFee { .. } => "HighFee".into(),
+        AlertRule::EventEmitted { .. } => "EventEmitted".into(),
+    }
+}
+
+// ── Cooldowns ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy)]
+struct CooldownState {
+    last_fired: DateTime<Utc>,
+    suppressed: u64,
+}
+
+/// Enforces per-rule `cooldown_seconds`: after a rule fires for a contract,
+/// further matches of the same (contract, rule) within the window are dropped
+/// and counted, and the next alert that goes out carries that count in
+/// `suppressed_count`.
+///
+/// The current time is passed in by the caller, so tests control the clock.
+#[derive(Debug, Default)]
+pub struct CooldownTracker {
+    state: HashMap<(String, String), CooldownState>,
+}
+
+impl CooldownTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Filter `payloads` (as returned by [`evaluate`] for `rules`) through each
+    /// rule's cooldown at time `now`. Payloads whose rule has no cooldown pass
+    /// through unchanged.
+    pub fn apply(
+        &mut self,
+        rules: &[RuleConfig],
+        payloads: Vec<AlertPayload>,
+        now: DateTime<Utc>,
+    ) -> Vec<AlertPayload> {
+        payloads
+            .into_iter()
+            .filter_map(|mut payload| {
+                let cooldown = rules
+                    .iter()
+                    .find(|r| rule_label(&r.rule) == payload.rule_triggered)
+                    .and_then(|r| r.cooldown_seconds)
+                    .unwrap_or(0);
+                match self.check(
+                    &payload.contract_id,
+                    &payload.rule_triggered,
+                    cooldown,
+                    now,
+                ) {
+                    Some(suppressed) => {
+                        payload.suppressed_count = suppressed;
+                        Some(payload)
+                    }
+                    None => {
+                        tracing::debug!(
+                            contract = %payload.label,
+                            rule = %payload.rule_triggered,
+                            tx = %payload.transaction_hash,
+                            cooldown_seconds = cooldown,
+                            "rule matched within its cooldown — alert suppressed"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// Record a match of `rule` on `contract_id` at `now`. Returns
+    /// `Some(suppressed_count)` when the alert should fire (resetting the
+    /// window and the count), or `None` when it falls inside the cooldown.
+    pub fn check(
+        &mut self,
+        contract_id: &str,
+        rule: &str,
+        cooldown_seconds: u64,
+        now: DateTime<Utc>,
+    ) -> Option<u64> {
+        if cooldown_seconds == 0 {
+            return Some(0);
+        }
+        let key = (contract_id.to_owned(), rule.to_owned());
+        let window = i64::try_from(cooldown_seconds)
+            .ok()
+            .and_then(chrono::TimeDelta::try_seconds)
+            .unwrap_or(chrono::TimeDelta::MAX);
+        match self.state.get_mut(&key) {
+            Some(state) if now.signed_duration_since(state.last_fired) < window => {
+                state.suppressed = state.suppressed.saturating_add(1);
+                None
+            }
+            Some(state) => {
+                let suppressed = state.suppressed;
+                *state = CooldownState {
+                    last_fired: now,
+                    suppressed: 0,
+                };
+                Some(suppressed)
+            }
+            None => {
+                self.state.insert(
+                    key,
+                    CooldownState {
+                        last_fired: now,
+                        suppressed: 0,
+                    },
+                );
+                Some(0)
+            }
+        }
     }
 }
 
@@ -306,6 +546,7 @@ mod tests {
             function_names: function_names.iter().map(|s| s.to_string()).collect(),
             amount_stroops,
             fee_charged_stroops: None,
+            events: vec![],
         }
     }
 
@@ -559,6 +800,7 @@ mod tests {
                 function_names: vec![],
                 amount_stroops: None,
                 fee_charged_stroops: None,
+                events: vec![],
             };
             let mut payloads = evaluate(
                 "L",
@@ -647,6 +889,7 @@ mod tests {
             fee_charged: Some("100".into()),
             envelope_xdr: None,
             result_xdr: None,
+            ledger: None,
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
         assert_eq!(enriched.timestamp.year(), 2024);
@@ -663,6 +906,7 @@ mod tests {
             fee_charged: None,
             envelope_xdr: None,
             result_xdr: None,
+            ledger: None,
         };
         let result = EnrichedTransaction::from_horizon(raw, vec![], None, None);
         assert!(result.is_err(), "expected Err for invalid timestamp");
@@ -742,6 +986,8 @@ mod tests {
             timestamp_iso: "2024-01-15T12:00:00Z".into(),
             horizon_link: "https://horizon-testnet.stellar.org/transactions/abc123".into(),
             explorer_link: "https://stellar.expert/explorer/testnet/tx/abc123".into(),
+            matched_events: vec![],
+            suppressed_count: 0,
             test: false,
         };
 
@@ -816,5 +1062,266 @@ mod tests {
         assert_eq!(payloads.len(), 2);
         assert_eq!(payloads[0].alert_id, alert_id("CAAA", "deadbeef", "AnyTransaction"));
         assert_ne!(payloads[0].alert_id, payloads[1].alert_id);
+    }
+
+    // ── Issue #48: MAX_XLM_SUPPLY_STROOPS sanity check ────────────────────────
+
+    fn raw_tx(fee_charged: Option<&str>) -> HorizonTransaction {
+        HorizonTransaction {
+            hash: "h1".into(),
+            created_at: "2024-06-01T00:00:00Z".into(),
+            successful: true,
+            paging_token: "1".into(),
+            fee_charged: fee_charged.map(Into::into),
+            envelope_xdr: None,
+            result_xdr: None,
+            ledger: None,
+        }
+    }
+
+    #[test]
+    fn from_horizon_discards_amount_above_total_supply() {
+        let enriched = EnrichedTransaction::from_horizon(
+            raw_tx(None),
+            vec![],
+            Some(MAX_XLM_SUPPLY_STROOPS + 1),
+            None,
+        )
+        .unwrap();
+        assert_eq!(enriched.amount_stroops, None);
+    }
+
+    #[test]
+    fn from_horizon_keeps_amount_at_total_supply() {
+        let enriched = EnrichedTransaction::from_horizon(
+            raw_tx(None),
+            vec![],
+            Some(MAX_XLM_SUPPLY_STROOPS),
+            None,
+        )
+        .unwrap();
+        assert_eq!(enriched.amount_stroops, Some(MAX_XLM_SUPPLY_STROOPS));
+    }
+
+    #[test]
+    fn from_horizon_discards_fee_above_total_supply() {
+        let fee = (MAX_XLM_SUPPLY_STROOPS + 1).to_string();
+        let enriched =
+            EnrichedTransaction::from_horizon(raw_tx(Some(&fee)), vec![], None, None).unwrap();
+        assert_eq!(enriched.fee_charged_stroops, None);
+    }
+
+    // ── Issue #50: EventEmitted ───────────────────────────────────────────────
+
+    fn event(topics: Vec<Value>, data: Value) -> ContractEvent {
+        ContractEvent {
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            topics,
+            data,
+        }
+    }
+
+    fn transfer_event() -> ContractEvent {
+        event(
+            vec![
+                serde_json::json!({"symbol": "transfer"}),
+                serde_json::json!({"address": "GFROM"}),
+                serde_json::json!({"address": "GTO"}),
+            ],
+            serde_json::json!({"i128": "1000"}),
+        )
+    }
+
+    fn event_rule(topic: &str, topics: &[&str]) -> AlertRule {
+        AlertRule::EventEmitted {
+            topic: topic.into(),
+            topics: topics.iter().map(|t| t.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn event_emitted_fires_on_first_topic_symbol() {
+        let tx = make_tx(true, &[], None).with_events(vec![transfer_event()]);
+        let payloads = run(&[event_rule("transfer", &[])], &tx);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].rule_type, "EventEmitted");
+        assert_eq!(payloads[0].rule_triggered, "EventEmitted(transfer)");
+        assert_eq!(payloads[0].matched_events, vec![transfer_event()]);
+    }
+
+    #[test]
+    fn event_emitted_does_not_fire_on_other_symbol() {
+        let tx = make_tx(true, &[], None).with_events(vec![transfer_event()]);
+        assert!(run(&[event_rule("mint", &[])], &tx).is_empty());
+    }
+
+    #[test]
+    fn event_emitted_does_not_fire_without_events() {
+        let tx = make_tx(true, &["transfer"], None);
+        assert!(run(&[event_rule("transfer", &[])], &tx).is_empty());
+    }
+
+    #[test]
+    fn event_emitted_first_topic_must_be_a_symbol() {
+        let ev = event(
+            vec![serde_json::json!({"string": "transfer"})],
+            Value::Null,
+        );
+        let tx = make_tx(true, &[], None).with_events(vec![ev]);
+        assert!(run(&[event_rule("transfer", &[])], &tx).is_empty());
+    }
+
+    #[test]
+    fn event_emitted_matches_further_topics_positionally() {
+        let tx = make_tx(true, &[], None).with_events(vec![transfer_event()]);
+        assert_eq!(run(&[event_rule("transfer", &["GFROM"])], &tx).len(), 1);
+        assert_eq!(run(&[event_rule("transfer", &["*", "GTO"])], &tx).len(), 1);
+        assert!(run(&[event_rule("transfer", &["GTO"])], &tx).is_empty());
+        assert!(run(&[event_rule("transfer", &["*", "*", "GX"])], &tx).is_empty());
+    }
+
+    #[test]
+    fn event_emitted_wildcard_matches_missing_topic() {
+        let tx = make_tx(true, &[], None).with_events(vec![transfer_event()]);
+        assert_eq!(run(&[event_rule("transfer", &["*", "*", "*"])], &tx).len(), 1);
+    }
+
+    #[test]
+    fn event_emitted_payload_contains_only_matching_events() {
+        let mint = event(
+            vec![serde_json::json!({"symbol": "mint"})],
+            serde_json::json!({"i128": "5"}),
+        );
+        let tx = make_tx(true, &[], None).with_events(vec![mint, transfer_event()]);
+        let payloads = run(&[event_rule("transfer", &[])], &tx);
+        assert_eq!(payloads[0].matched_events, vec![transfer_event()]);
+    }
+
+    #[test]
+    fn non_event_rules_have_empty_matched_events() {
+        let tx = make_tx(true, &[], None).with_events(vec![transfer_event()]);
+        let payloads = run(&[AlertRule::AnyTransaction], &tx);
+        assert!(payloads[0].matched_events.is_empty());
+    }
+
+    #[test]
+    fn topic_value_matches_scalars_and_json() {
+        assert!(topic_value_matches(&serde_json::json!({"u32": 5}), "5"));
+        assert!(topic_value_matches(&serde_json::json!({"bool": true}), "true"));
+        assert!(topic_value_matches(&serde_json::json!("plain"), "plain"));
+        let vec_val = serde_json::json!({"vec": [{"u32": 1}]});
+        assert!(topic_value_matches(&vec_val, &vec_val.to_string()));
+        assert!(!topic_value_matches(&vec_val, "1"));
+    }
+
+    #[test]
+    fn event_emitted_label_includes_extra_topics() {
+        assert_eq!(
+            rule_label(&event_rule("transfer", &["*", "GTO"])),
+            "EventEmitted(transfer, *, GTO)"
+        );
+    }
+
+    // ── Issue #49: cooldowns ──────────────────────────────────────────────────
+
+    /// A clock the test advances by hand.
+    struct TestClock(DateTime<Utc>);
+
+    impl TestClock {
+        fn start() -> Self {
+            Self("2024-01-15T12:00:00Z".parse().unwrap())
+        }
+        fn now(&self) -> DateTime<Utc> {
+            self.0
+        }
+        fn advance(&mut self, secs: i64) {
+            self.0 += chrono::TimeDelta::seconds(secs);
+        }
+    }
+
+    fn with_cooldown(rule: AlertRule, cooldown: u64) -> RuleConfig {
+        RuleConfig {
+            rule,
+            cooldown_seconds: Some(cooldown),
+        }
+    }
+
+    fn fire(
+        tracker: &mut CooldownTracker,
+        rules: &[RuleConfig],
+        clock: &TestClock,
+    ) -> Vec<AlertPayload> {
+        let tx = make_tx(false, &[], None);
+        tracker.apply(rules, run(rules, &tx), clock.now())
+    }
+
+    #[test]
+    fn cooldown_suppresses_within_window_and_reports_count() {
+        let rules = vec![with_cooldown(AlertRule::AnyTransaction, 60)];
+        let mut tracker = CooldownTracker::new();
+        let mut clock = TestClock::start();
+
+        let first = fire(&mut tracker, &rules, &clock);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].suppressed_count, 0);
+
+        for _ in 0..3 {
+            clock.advance(10);
+            assert!(fire(&mut tracker, &rules, &clock).is_empty());
+        }
+
+        clock.advance(30); // 60s after the first alert
+        let next = fire(&mut tracker, &rules, &clock);
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].suppressed_count, 3);
+
+        clock.advance(60);
+        let after = fire(&mut tracker, &rules, &clock);
+        assert_eq!(after[0].suppressed_count, 0, "count resets after firing");
+    }
+
+    #[test]
+    fn no_cooldown_passes_everything_through() {
+        let rules: Vec<RuleConfig> = vec![AlertRule::AnyTransaction.into()];
+        let mut tracker = CooldownTracker::new();
+        let clock = TestClock::start();
+        for _ in 0..5 {
+            let out = fire(&mut tracker, &rules, &clock);
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].suppressed_count, 0);
+        }
+    }
+
+    #[test]
+    fn zero_cooldown_is_disabled() {
+        let rules = vec![with_cooldown(AlertRule::AnyTransaction, 0)];
+        let mut tracker = CooldownTracker::new();
+        let clock = TestClock::start();
+        assert_eq!(fire(&mut tracker, &rules, &clock).len(), 1);
+        assert_eq!(fire(&mut tracker, &rules, &clock).len(), 1);
+    }
+
+    #[test]
+    fn cooldown_is_tracked_per_rule() {
+        let rules = vec![
+            with_cooldown(AlertRule::AnyTransaction, 60),
+            AlertRule::TransactionFailed.into(),
+        ];
+        let mut tracker = CooldownTracker::new();
+        let mut clock = TestClock::start();
+        assert_eq!(fire(&mut tracker, &rules, &clock).len(), 2);
+        clock.advance(1);
+        let second = fire(&mut tracker, &rules, &clock);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].rule_type, "TransactionFailed");
+    }
+
+    #[test]
+    fn cooldown_is_tracked_per_contract() {
+        let mut tracker = CooldownTracker::new();
+        let now = TestClock::start().now();
+        assert_eq!(tracker.check("CA", "AnyTransaction", 60, now), Some(0));
+        assert_eq!(tracker.check("CB", "AnyTransaction", 60, now), Some(0));
+        assert_eq!(tracker.check("CA", "AnyTransaction", 60, now), None);
     }
 }
