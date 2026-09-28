@@ -290,7 +290,7 @@ mod tests {
     fn sample_payload() -> AlertPayload {
         AlertPayload {
             label: "Test Contract".into(),
-            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
             network: "testnet".into(),
             rule_type: "AnyTransaction".into(),
             rule_triggered: "AnyTransaction".into(),

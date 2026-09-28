@@ -907,7 +907,7 @@ mod tests {
         let client = Client::new();
         let contract = WatchedContract {
             label: "test".into(),
-            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
             network: Network::Testnet,
             rules: vec![AlertRule::FunctionCalled {
                 function_name: "withdraw".into(),
@@ -951,7 +951,7 @@ mod tests {
         let url = format!(
             "{}/accounts/{}/transactions?cursor=now&order=asc&limit=200&join=operations",
             server.uri(),
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
         );
         let page: HorizonPage = client.get(&url).send().await.unwrap().json().await.unwrap();
         assert!(page._embedded.records.is_empty());
@@ -1025,7 +1025,7 @@ mod tests {
             .await;
 
         let client = Client::new();
-        let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
         let mut cursors: HashMap<String, String> = HashMap::new();
         cursors.insert(contract_id.to_string(), "now".to_string());
 
@@ -1057,7 +1057,7 @@ mod tests {
             .await;
 
         let client = Client::new();
-        let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
         let mut cursors: HashMap<String, String> = HashMap::new();
         cursors.insert(contract_id.to_string(), "now".to_string());
 
@@ -1093,7 +1093,7 @@ mod tests {
             .await;
 
         let client = Client::new();
-        let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
         let mut cursors: HashMap<String, String> = HashMap::new();
         cursors.insert(contract_id.to_string(), "now".to_string());
 
@@ -1130,7 +1130,7 @@ mod tests {
             contracts: vec![
                 WatchedContract {
                     label: "Contract A".into(),
-                    contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+                    contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
                     network: txwatch_config::Network::Testnet,
                     rules: vec![txwatch_config::AlertRule::AnyTransaction],
                     webhook_url: "https://hooks.example.com/a".into(),
@@ -1141,7 +1141,7 @@ mod tests {
                 },
                 WatchedContract {
                     label: "Contract B".into(),
-                    contract_id: "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into(),
+                    contract_id: "CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526".into(),
                     network: txwatch_config::Network::Mainnet,
                     rules: vec![txwatch_config::AlertRule::AnyTransaction],
                     webhook_url: "https://hooks.example.com/b".into(),
@@ -1152,7 +1152,7 @@ mod tests {
                 },
                 WatchedContract {
                     label: "Contract C".into(),
-                    contract_id: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC".into(),
+                    contract_id: "CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ".into(),
                     network: txwatch_config::Network::Mainnet,
                     rules: vec![txwatch_config::AlertRule::AnyTransaction],
                     webhook_url: "https://hooks.example.com/c".into(),
@@ -1170,6 +1170,102 @@ mod tests {
         assert_eq!(networks, "mainnet, testnet");
         assert!(horizon_urls.contains("mainnet=https://horizon.stellar.org"));
         assert!(horizon_urls.contains("testnet=https://horizon-testnet.stellar.org"));
+    }
+
+    // ── cursor_file loading ──────────────────────────────────────────────────
+
+    const ID_A: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+    const ID_B: &str = "CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526";
+
+    fn cursor_config(cursor_file: Option<String>) -> AppConfig {
+        let contract = |id: &str| WatchedContract {
+            label: id[..4].into(),
+            contract_id: id.into(),
+            network: Network::Testnet,
+            rules: vec![AlertRule::AnyTransaction],
+            webhook_url: "https://hooks.example.com/x".into(),
+            webhook_secret: None,
+            poll_interval_seconds: None,
+            horizon_base_url_override: None,
+        };
+        AppConfig {
+            poll_interval_seconds: 10,
+            contracts: vec![contract(ID_A), contract(ID_B)],
+            cursor_file,
+            http_pool_max_idle_per_host: 10,
+            http_tcp_keepalive_secs: 30,
+            http_connection_verbose: None,
+        }
+    }
+
+    /// A fresh path in the temp dir, unique per test.
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("txwatch-{}-{}", std::process::id(), name))
+    }
+
+    fn all_now() -> HashMap<String, String> {
+        HashMap::from([(ID_A.into(), "now".into()), (ID_B.into(), "now".into())])
+    }
+
+    #[test]
+    fn load_cursors_without_cursor_file_starts_from_now() {
+        assert_eq!(load_cursors(&cursor_config(None)), all_now());
+    }
+
+    #[test]
+    fn load_cursors_reads_valid_cursor_file() {
+        let path = temp_path("valid.json");
+        fs::write(&path, format!(r#"{{"{ID_A}": "111", "{ID_B}": "222"}}"#)).unwrap();
+        let cursors = load_cursors(&cursor_config(Some(path.display().to_string())));
+        let _ = fs::remove_file(&path);
+        assert_eq!(
+            cursors,
+            HashMap::from([(ID_A.into(), "111".into()), (ID_B.into(), "222".into())])
+        );
+    }
+
+    #[test]
+    fn load_cursors_falls_back_to_now_only_for_missing_contracts() {
+        let path = temp_path("partial.json");
+        fs::write(&path, format!(r#"{{"{ID_A}": "111"}}"#)).unwrap();
+        let cursors = load_cursors(&cursor_config(Some(path.display().to_string())));
+        let _ = fs::remove_file(&path);
+        assert_eq!(cursors.get(ID_A).map(String::as_str), Some("111"));
+        assert_eq!(cursors.get(ID_B).map(String::as_str), Some("now"));
+    }
+
+    #[test]
+    fn load_cursors_ignores_malformed_cursor_file() {
+        let path = temp_path("malformed.json");
+        fs::write(&path, "{ not json").unwrap();
+        let cursors = load_cursors(&cursor_config(Some(path.display().to_string())));
+        let _ = fs::remove_file(&path);
+        assert_eq!(cursors, all_now());
+    }
+
+    #[test]
+    fn load_cursors_ignores_cursor_file_with_wrong_shape() {
+        let path = temp_path("wrong-shape.json");
+        fs::write(&path, format!(r#"{{"{ID_A}": 111}}"#)).unwrap();
+        let cursors = load_cursors(&cursor_config(Some(path.display().to_string())));
+        let _ = fs::remove_file(&path);
+        assert_eq!(cursors, all_now());
+    }
+
+    #[test]
+    fn load_cursors_ignores_unreadable_cursor_file() {
+        // A directory exists but cannot be read as a file.
+        let dir = temp_path("unreadable-dir");
+        fs::create_dir_all(&dir).unwrap();
+        let cursors = load_cursors(&cursor_config(Some(dir.display().to_string())));
+        let _ = fs::remove_dir(&dir);
+        assert_eq!(cursors, all_now());
+
+        let missing = temp_path("does-not-exist.json");
+        assert_eq!(
+            load_cursors(&cursor_config(Some(missing.display().to_string()))),
+            all_now()
+        );
     }
 
     #[tokio::test]
@@ -1212,7 +1308,7 @@ mod tests {
         let client = Client::new();
         let contract = WatchedContract {
             label: "Contract".into(),
-            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
             network: Network::Testnet,
             rules: vec![AlertRule::AnyTransaction],
             webhook_url: format!("{}/hooks", server.uri()),

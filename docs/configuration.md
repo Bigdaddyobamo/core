@@ -50,13 +50,14 @@ Each entry defines one watched Soroban contract. At least one entry is required.
 | Field            | Type            | Required | Description |
 |------------------|-----------------|----------|-------------|
 | `label`          | string          | yes      | Human-readable name shown in logs and alert payloads. Surrounding whitespace is trimmed. Must not be blank, contain control characters (newlines, ANSI escapes, …) or exceed 128 characters; must be unique across contracts, ignoring case. |
-| `contract_id`    | string          | yes      | Stellar C-address (56 chars, starts with `C`). |
+| `contract_id`    | string          | yes      | Stellar contract StrKey (`C…`, 56 characters). The address is fully decoded: characters outside `A–Z2–7` (lowercase, `0`, `1`, `8`, `9`), a non-contract version byte (e.g. a `G…` account) and a bad checksum are each reported as a distinct error. |
 | `network`        | string or table | yes      | `mainnet`, `testnet`, `futurenet`, or a custom network table (see below). |
 | `rules`          | array of tables | yes      | The `[[contracts.rules]]` entries (see below). At least one is required. |
-| `webhook_url`    | string          | yes      | `http://` or `https://` URL with a host that receives the alert JSON. |
+| `webhook_url`    | string          | yes      | `http://` or `https://` URL with a host that receives the alert JSON. Supports [environment interpolation](#environment-variable-interpolation). |
 | `poll_interval_seconds` | u64      | no       | Polls this contract at its own interval instead of the top-level `poll_interval_seconds`. Same bounds (5–3600). Contracts are scheduled independently; `txwatch validate` prints each contract's effective interval. |
 | `webhook_secret` | string          | no       | When set, every webhook POST carries `X-TxWatch-Signature: sha256=<hex HMAC-SHA256 of the body>` **and** the raw secret in `X-TxWatch-Secret`. Supports `${ENV_VAR}` interpolation (e.g. `webhook_secret = "${MY_SECRET}"`); an unset variable is a startup error. |
 | `batch_alerts`   | bool            | no       | Default `false`. When `true`, all alerts from one poll cycle are sent as a single `{"alerts": [...]}` POST (at most 50 per request, larger bursts are split). Useful for digest receivers and rate-limited targets such as Slack. See [Batched payload](#batched-payload). |
+| `webhook_secret` | string          | no       | When set, every webhook POST carries `X-TxWatch-Signature: sha256=<hex HMAC-SHA256 of the body>` **and** the raw secret in `X-TxWatch-Secret`. Supports [environment interpolation](#environment-variable-interpolation). |
 
 Unknown keys inside a `[[contracts]]` entry are rejected.
 
@@ -98,6 +99,10 @@ Alert payloads and logs report such contracts with `network = "custom"`. See `do
 ## `[[contracts.rules]]`
 
 At least one rule is required per contract. All matching rules fire independently.
+
+Keys that a rule type does not define are rejected, and the error names the rule
+(e.g. ``unknown field `threshold_xml`, expected `threshold_stroops` or `threshold_xlm` (field: contracts[0].rules[1] …)``),
+so a typo is never silently ignored.
 
 ### `AnyTransaction`
 Fires on every transaction that appears in the contract's Horizon history.
@@ -219,6 +224,30 @@ in an `alerts` array:
 |------------|---------|--------------------------------------------------|
 | `RUST_LOG` | `info`  | Log level: `error`, `warn`, `info`, `debug`, `trace` |
 
+### Environment variable interpolation
+
+These fields may reference environment variables anywhere in the value, so secrets
+such as webhook tokens stay out of the config file:
+
+- `webhook_url`, `webhook_secret`
+- custom network `horizon_url`, `explorer_url`, `passphrase`
+- `cursor_file`
+
+| Syntax              | Result |
+|---------------------|--------|
+| `${VAR}`            | Value of `VAR`. An unset variable is a startup error naming the field. |
+| `${VAR:-default}`   | Value of `VAR`, or `default` when `VAR` is unset or empty. |
+| `$${`               | A literal `${` (escape). |
+
+```toml
+webhook_url    = "https://hooks.slack.com/services/${SLACK_WEBHOOK_PATH}"
+webhook_secret = "Bearer ${TXWATCH_SECRET}"
+network        = { horizon_url = "${HORIZON_URL:-http://localhost:8000}" }
+```
+
+Variable names use letters, digits and `_` and must not start with a digit; `${}` and an
+unterminated `${` are errors.
+
 ## Pre-flight checks
 
 `txwatch validate --check-webhooks` checks all endpoints concurrently. It tries `HEAD` first; when a receiver returns `405 Method Not Allowed` or `501 Not Implemented`, TxWatch retries with `OPTIONS`. A per-URL table reports `reachable`, `reachable (OPTIONS)`, `method not allowed`, or `unreachable`, and any unreachable endpoint makes validation exit non-zero. Some serverless receivers reject both probe methods; use a real test webhook for those endpoints.
@@ -236,7 +265,7 @@ poll_interval_seconds = 10
 
 [[contracts]]
 label       = "My Escrow Contract"
-contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
 network     = "testnet"
 webhook_url = "https://hooks.example.com/my-webhook"
 

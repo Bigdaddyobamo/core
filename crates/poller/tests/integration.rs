@@ -497,7 +497,7 @@ async fn cursor_advances_after_each_transaction() {
     use std::collections::HashMap;
 
     let mut cursors: HashMap<String, String> = HashMap::new();
-    let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
     cursors.insert(contract_id.to_string(), "now".to_string());
 
     for token in &["100", "200", "300"] {
@@ -866,9 +866,9 @@ async fn contracts_polled_concurrently() {
         );
         c.label = label.to_string();
         c.contract_id = if label == "A" {
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string()
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".to_string()
         } else {
-            "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".to_string()
+            "CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526".to_string()
         };
         c.horizon_base_url_override = Some(horizon_uri.to_string());
         c
@@ -945,7 +945,7 @@ async fn reload_keeps_existing_cursors_and_starts_new_contracts() {
         vec![AlertRule::AnyTransaction],
     );
     b.label = "B".into();
-    b.contract_id = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into();
+    b.contract_id = "CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526".into();
     b.horizon_base_url_override = Some(horizon_b.uri());
 
     let config = |contracts| AppConfig {
@@ -1036,7 +1036,7 @@ async fn per_contract_poll_interval_is_scheduled_independently() {
         vec![AlertRule::AnyTransaction],
     );
     slow.label = "slow".into();
-    slow.contract_id = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into();
+    slow.contract_id = "CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526".into();
     slow.horizon_base_url_override = Some(slow_horizon.uri());
 
     let cfg = AppConfig {

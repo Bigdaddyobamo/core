@@ -288,7 +288,7 @@ mod tests {
     fn run(rules: &[AlertRule], tx: &EnrichedTransaction) -> Vec<AlertPayload> {
         evaluate(
             "Label",
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
             "testnet",
             "https://horizon-testnet.stellar.org",
             "https://stellar.expert/explorer/testnet",
@@ -538,7 +538,7 @@ mod tests {
             };
             let mut payloads = evaluate(
                 "L",
-                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
                 "testnet",
                 horizon_base,
                 explorer_base,
@@ -704,7 +704,7 @@ mod tests {
     fn alert_payload_serialises_to_valid_json_with_all_fields_present() {
         let payload = AlertPayload {
             label: "My Contract".into(),
-            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
             network: "testnet".into(),
             rule_type: "LargeTransfer".into(),
             rule_triggered: "LargeTransfer(>=10000XLM)".into(),
@@ -728,7 +728,7 @@ mod tests {
         assert_eq!(obj["label"].as_str(), Some("My Contract"));
         assert_eq!(
             obj["contract_id"].as_str(),
-            Some("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+            Some("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4")
         );
         assert_eq!(obj["network"].as_str(), Some("testnet"));
         assert_eq!(obj["rule_type"].as_str(), Some("LargeTransfer"));
