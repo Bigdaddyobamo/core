@@ -227,6 +227,12 @@ pub enum AlertRule {
         #[serde(default)]
         threshold_xlm: Option<u64>,
     },
+    /// Fires once when a contract has produced no transactions for longer than
+    /// `minutes` minutes, and again (with `resolved = true`) when activity
+    /// resumes.  Evaluated per poll cycle, not per transaction.
+    NoActivity {
+        minutes: u32,
+    },
 }
 
 impl AlertRule {
@@ -302,6 +308,14 @@ impl AlertRule {
                 }
                 _ => {}
             },
+            AlertRule::NoActivity { minutes } => {
+                if *minutes == 0 {
+                    bail!(
+                        "contract '{}': NoActivity minutes must be > 0",
+                        contract_label
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -328,6 +342,7 @@ impl AlertRule {
                     format!("HighFee(>={} stroops)", threshold_stroops)
                 }
             }
+            AlertRule::NoActivity { minutes } => format!("NoActivity({}min)", minutes),
         }
     }
 }
@@ -414,32 +429,34 @@ impl WatchedContract {
     fn collect_errors(&mut self) -> Vec<String> {
         let mut errors = Vec::new();
 
-        if self.label.trim().is_empty() {
-            errors.push("a contract has an empty label".to_owned());
         self.label = self.label.trim().to_owned();
         if self.label.is_empty() {
-            bail!("a contract has an empty label");
+            errors.push("a contract has an empty label".to_owned());
+            // Cannot check further label constraints without a non-empty label.
+            return errors;
         }
         // Labels end up in log lines and CLI output; `{:?}` escapes the
         // offending characters so the error itself cannot inject them.
         if self.label.chars().any(char::is_control) {
-            bail!(
+            errors.push(format!(
                 "contract label {:?} must not contain control characters",
                 self.label
-            );
+            ));
         }
         if self.label.chars().count() > MAX_LABEL_LEN {
-            bail!(
+            errors.push(format!(
                 "contract label '{}…' is longer than {} characters",
                 self.label.chars().take(32).collect::<String>(),
                 MAX_LABEL_LEN
-            );
+            ));
         }
         if let Some(interval) = self.poll_interval_seconds {
-            validate_poll_interval(
+            if let Err(e) = validate_poll_interval(
                 interval,
                 &format!("contract '{}': poll_interval_seconds", self.label),
-            )?;
+            ) {
+                errors.push(e.to_string());
+            }
         }
 
         // Stellar contract addresses start with 'C' and are 56 chars (base32)
@@ -605,25 +622,22 @@ impl AppConfig {
     /// Validates the whole config and reports every error found, not just the first.
     pub fn validate(&mut self) -> Result<()> {
         let mut errors = Vec::new();
-        if self.poll_interval_seconds < 5 {
-            errors.push("poll_interval_seconds must be >= 5".to_owned());
+        if let Err(e) = validate_poll_interval(self.poll_interval_seconds, "poll_interval_seconds") {
+            errors.push(e.to_string());
         }
-        if self.poll_interval_seconds > 3600 {
-            errors.push("poll_interval_seconds must be <= 3600 (1 hour)".to_owned());
-        validate_poll_interval(self.poll_interval_seconds, "poll_interval_seconds")?;
         if self.http_pool_max_idle_per_host == 0
             || self.http_pool_max_idle_per_host > MAX_HTTP_POOL_MAX_IDLE_PER_HOST
         {
-            bail!(
+            errors.push(format!(
                 "http_pool_max_idle_per_host must be between 1 and {}",
                 MAX_HTTP_POOL_MAX_IDLE_PER_HOST
-            );
+            ));
         }
         if self.http_tcp_keepalive_secs > MAX_HTTP_TCP_KEEPALIVE_SECS {
-            bail!(
+            errors.push(format!(
                 "http_tcp_keepalive_secs must be <= {} (0 disables keepalive)",
                 MAX_HTTP_TCP_KEEPALIVE_SECS
-            );
+            ));
         }
         if self.contracts.is_empty() {
             errors.push("at least one [[contracts]] entry is required".to_owned());
@@ -631,15 +645,12 @@ impl AppConfig {
         for contract in &mut self.contracts {
             errors.extend(contract.collect_errors());
         }
-        // Labels are already trimmed by `WatchedContract::validate`; compare
+        // Labels are already trimmed by `WatchedContract::collect_errors`; compare
         // case-insensitively so "Vault" and "vault" count as duplicates.
         let mut seen = std::collections::HashSet::new();
-        let mut reported = std::collections::HashSet::new();
         for contract in &self.contracts {
-            if !seen.insert(&contract.label) && reported.insert(&contract.label) {
-                errors.push(format!("duplicate contract label '{}'", contract.label));
             if !seen.insert(contract.label.to_lowercase()) {
-                bail!("duplicate contract label '{}'", contract.label);
+                errors.push(format!("duplicate contract label '{}'", contract.label));
             }
         }
         ValidationErrors::into_result(errors)
@@ -945,8 +956,8 @@ mod tests {
         let mut cfg = AppConfig {
             poll_interval_seconds: 1,
             contracts: vec![bad_id, bad_rule, valid_contract(), valid_contract()],
-            http_pool_max_idle_per_host: None,
-            http_tcp_keepalive_secs: None,
+            http_pool_max_idle_per_host: DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST,
+            http_tcp_keepalive_secs: DEFAULT_HTTP_TCP_KEEPALIVE_SECS,
             http_connection_verbose: None,
             cursor_file: None,
         };
@@ -1055,6 +1066,21 @@ mod tests {
             threshold_xlm: None,
         }];
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn no_activity_zero_minutes_is_rejected() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::NoActivity { minutes: 0 }];
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("NoActivity minutes must be > 0"), "got: {}", err);
+    }
+
+    #[test]
+    fn no_activity_nonzero_minutes_is_valid() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::NoActivity { minutes: 30 }];
+        assert!(c.validate().is_ok());
     }
 
     #[test]

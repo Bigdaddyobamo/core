@@ -170,7 +170,8 @@ threshold_stroops = 1000000
   "timestamp":           1705316096,
   "timestamp_iso":       "2024-01-15T12:00:00Z",
   "horizon_link":        "https://horizon-testnet.stellar.org/transactions/abc123...",
-  "explorer_link":       "https://stellar.expert/explorer/testnet/tx/abc123..."
+  "explorer_link":       "https://stellar.expert/explorer/testnet/tx/abc123...",
+  "resolved":            false
 }
 ```
 

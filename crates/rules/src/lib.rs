@@ -7,6 +7,8 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use txwatch_config::AlertRule;
 
 // ── Constants ──────────────────────────────────────────────────────────────────
@@ -99,6 +101,7 @@ pub struct AlertPayload {
     /// Stable machine-readable rule variant (e.g. `"LargeTransfer"`).
     pub rule_type: String,
     pub rule_triggered: String,
+    /// Transaction hash, or `null` for synthetic alerts (e.g. `NoActivity`).
     pub transaction_hash: String,
     /// First invoked function name (backward-compat singular field).
     pub function_name: Option<String>,
@@ -116,34 +119,138 @@ pub struct AlertPayload {
     pub horizon_link: String,
     /// Stellar Expert explorer link for the transaction.
     pub explorer_link: String,
+    /// `true` for a recovery alert (e.g. activity resumed after `NoActivity`).
+    /// `false` (the default) for an incident alert.
+    #[serde(default)]
+    pub resolved: bool,
 }
 
 // ── Rule evaluation ───────────────────────────────────────────────────────────
 
-/// Evaluate all rules for one contract against one transaction.
+/// Context passed to [`evaluate`] to identify the contract being evaluated
+/// and provide the link base URLs needed to build webhook payloads.
+///
+/// Using a struct instead of five positional `&str` parameters prevents
+/// argument-order bugs (e.g. swapping `horizon_base` and `explorer_base`).
+///
+/// # Example
+/// ```
+/// use txwatch_rules::EvalContext;
+/// use txwatch_config::{Network, WatchedContract, AlertRule};
+///
+/// let ctx = EvalContext::from_contract(
+///     &WatchedContract {
+///         label: "My Oracle".into(),
+///         contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+///         network: Network::Testnet,
+///         rules: vec![AlertRule::AnyTransaction],
+///         webhook_url: "https://hooks.example.com/hook".into(),
+///         webhook_secret: None,
+///         poll_interval_seconds: None,
+///         horizon_base_url_override: None,
+///     },
+/// );
+/// assert_eq!(ctx.network, "testnet");
+/// ```
+#[derive(Debug, Clone)]
+pub struct EvalContext<'a> {
+    pub label: &'a str,
+    pub contract_id: &'a str,
+    pub network: &'a str,
+    pub horizon_base: &'a str,
+    /// Explorer base URL for the network; `None` for custom networks that
+    /// have no configured explorer (links will fall back to `horizon_link`).
+    pub explorer_base: Option<&'a str>,
+}
+
+impl<'a> EvalContext<'a> {
+    /// Convenience constructor: derive all fields from a [`WatchedContract`].
+    /// Callers that need to override the Horizon base URL (e.g. tests using a
+    /// mock server) should fill in the fields manually instead.
+    pub fn from_contract(contract: &'a txwatch_config::WatchedContract) -> Self {
+        let horizon_base = contract
+            .horizon_base_url_override
+            .as_deref()
+            .unwrap_or_else(|| contract.network.horizon_base_url());
+        Self {
+            label: &contract.label,
+            contract_id: &contract.contract_id,
+            network: contract.network.as_str(),
+            horizon_base,
+            explorer_base: contract.network.explorer_base_url(),
+        }
+    }
+}
+
+/// Shared, thread-safe counter map used to rate-limit repeated evaluation
+/// warnings. Keyed by `"<contract_id>:<rule_label>"`.
+#[derive(Debug, Default, Clone)]
+pub struct WarningSuppressor(Arc<Mutex<HashMap<String, u64>>>);
+
+impl WarningSuppressor {
+    /// Returns `true` if the warning for this key should be emitted (i.e. the
+    /// first occurrence or every 100th recurrence).
+    pub fn should_warn(&self, key: &str) -> bool {
+        if let Ok(mut map) = self.0.lock() {
+            let count = map.entry(key.to_owned()).or_insert(0);
+            *count += 1;
+            *count == 1 || *count % 100 == 0
+        } else {
+            true // lock poisoned — always warn rather than silently drop
+        }
+    }
+
+    /// Returns how many times a warning has been suppressed for the given key.
+    #[cfg(test)]
+    pub fn suppressed_count(&self, key: &str) -> u64 {
+        self.0
+            .lock()
+            .ok()
+            .and_then(|m| m.get(key).copied())
+            .unwrap_or(0)
+    }
+}
+
+/// Evaluate all per-transaction rules for one contract against one transaction.
 /// Returns one `AlertPayload` per matching rule.
 /// Never panics — errors in individual rule evaluation are logged and skipped.
+/// Repeated errors for the same rule are suppressed after the first occurrence
+/// (see [`WarningSuppressor`]).
+///
+/// Pass `suppressor` as `None` to use a one-shot suppressor (appropriate for
+/// replay and tests). The poller keeps a per-contract suppressor to
+/// deduplicate repeated warnings across poll cycles.
 pub fn evaluate(
-    label: &str,
-    contract_id: &str,
-    network: &str,
-    horizon_base: &str,
-    explorer_base: &str,
+    ctx: &EvalContext<'_>,
     rules: &[AlertRule],
     tx: &EnrichedTransaction,
+    suppressor: Option<&WarningSuppressor>,
 ) -> Vec<AlertPayload> {
+    let horizon_base = ctx.horizon_base.trim_end_matches('/');
     let horizon_link = format!("{}/transactions/{}", horizon_base, tx.hash);
-    let explorer_link = format!("{}/tx/{}", explorer_base, tx.hash);
+    let explorer_link = match ctx.explorer_base {
+        Some(base) => format!("{}/tx/{}", base.trim_end_matches('/'), tx.hash),
+        None => horizon_link.clone(),
+    };
     let timestamp = tx.timestamp.timestamp();
     let timestamp_iso = tx.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
+    let _local_suppressor;
+    let suppressor = match suppressor {
+        Some(s) => s,
+        None => {
+            _local_suppressor = WarningSuppressor::default();
+            &_local_suppressor
+        }
+    };
 
     rules
         .iter()
         .filter_map(|rule| match eval_rule(rule, tx) {
             Ok(true) => Some(AlertPayload {
-                label: label.to_string(),
-                contract_id: contract_id.to_string(),
-                network: network.to_string(),
+                label: ctx.label.to_string(),
+                contract_id: ctx.contract_id.to_string(),
+                network: ctx.network.to_string(),
                 rule_type: rule_type(rule),
                 rule_triggered: rule_label(rule),
                 transaction_hash: tx.hash.clone(),
@@ -155,15 +262,19 @@ pub fn evaluate(
                 timestamp_iso: timestamp_iso.clone(),
                 horizon_link: horizon_link.clone(),
                 explorer_link: explorer_link.clone(),
+                resolved: false,
             }),
             Ok(false) => None,
             Err(e) => {
-                tracing::warn!(
-                    tx = %tx.hash,
-                    rule = %rule_label(rule),
-                    error = %e,
-                    "rule evaluation error — skipping"
-                );
+                let key = format!("{}:{}", ctx.contract_id, rule_label(rule));
+                if suppressor.should_warn(&key) {
+                    tracing::warn!(
+                        tx = %tx.hash,
+                        rule = %rule_label(rule),
+                        error = %e,
+                        "rule evaluation error — skipping"
+                    );
+                }
                 None
             }
         })
@@ -204,6 +315,10 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
             .fee_charged_stroops
             .map(|f| f >= *threshold_stroops)
             .unwrap_or(false),
+
+        // NoActivity is a poll-cycle-level rule evaluated by `check_no_activity`,
+        // not a per-transaction rule.  It never fires here.
+        AlertRule::NoActivity { .. } => false,
     })
 }
 
@@ -231,6 +346,7 @@ fn rule_label(rule: &AlertRule) -> String {
                 format!("HighFee(>={} stroops)", threshold_stroops)
             }
         }
+        AlertRule::NoActivity { minutes } => format!("NoActivity({}min)", minutes),
     }
 }
 
@@ -242,6 +358,139 @@ fn rule_type(rule: &AlertRule) -> String {
         AlertRule::FunctionCalled { .. } => "FunctionCalled".into(),
         AlertRule::AdminFunctionCalled { .. } => "AdminFunctionCalled".into(),
         AlertRule::HighFee { .. } => "HighFee".into(),
+        AlertRule::NoActivity { .. } => "NoActivity".into(),
+    }
+}
+
+// ── NoActivity poll-cycle evaluation ─────────────────────────────────────────
+
+/// State machine for a single `NoActivity` rule instance on one contract.
+///
+/// The poller keeps one `NoActivityState` per `(contract_id, rule_index)` pair
+/// and calls [`check_no_activity`] once per poll cycle — even when there are no
+/// new transactions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoActivityState {
+    /// The contract is active (or we haven't yet exceeded the threshold).
+    Active,
+    /// The threshold was exceeded and an alert was fired.  We're in the quiet
+    /// window; we will fire a recovery alert the next time a transaction arrives.
+    Alerting,
+}
+
+impl Default for NoActivityState {
+    fn default() -> Self {
+        Self::Active
+    }
+}
+
+/// Check the `NoActivity` rule for a single contract after one poll cycle.
+///
+/// * `rule`              — must be `AlertRule::NoActivity { minutes }`.
+/// * `last_seen`         — the timestamp of the most recent transaction seen,
+///                         or `None` if we have never seen any transaction.
+/// * `now`               — current time (injectable for testing).
+/// * `state`             — mutable state carried across poll cycles.
+/// * `ctx`               — context used to build the `AlertPayload`.
+///
+/// Returns `Some(payload)` when the rule fires (either an incident or a
+/// recovery); returns `None` when nothing changed.
+///
+/// Behaviour:
+/// - First breach → returns an incident payload and transitions to `Alerting`.
+/// - Still quiet (consecutive breaches) → returns `None` (already alerting).
+/// - Activity resumes after breach → returns a recovery payload
+///   (`resolved = true`) and transitions back to `Active`.
+/// - Activity present and never breached → returns `None`.
+pub fn check_no_activity(
+    rule: &AlertRule,
+    last_seen: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    state: &mut NoActivityState,
+    ctx: &EvalContext<'_>,
+) -> Option<AlertPayload> {
+    let AlertRule::NoActivity { minutes } = rule else {
+        return None;
+    };
+
+    let horizon_base = ctx.horizon_base.trim_end_matches('/');
+    let explorer_base = ctx.explorer_base.map(|b| b.trim_end_matches('/'));
+
+    let threshold = chrono::Duration::minutes(*minutes as i64);
+    let quiet_since = last_seen
+        .map(|t| now - t)
+        .unwrap_or_else(|| chrono::Duration::MAX);
+    let is_quiet = quiet_since >= threshold;
+
+    let ts = now.timestamp();
+    let ts_iso = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
+    // Synthetic payloads have no transaction — use empty hash and link to Horizon
+    // account page rather than a specific transaction.
+    let synthetic_hash = String::new();
+    let synthetic_horizon_link = format!(
+        "{}/accounts/{}",
+        horizon_base, ctx.contract_id
+    );
+    let synthetic_explorer_link = match explorer_base {
+        Some(base) => format!("{}/contract/{}", base, ctx.contract_id),
+        None => synthetic_horizon_link.clone(),
+    };
+
+    match (&*state, is_quiet) {
+        // Threshold just exceeded for the first time → fire incident.
+        (NoActivityState::Active, true) => {
+            *state = NoActivityState::Alerting;
+            Some(AlertPayload {
+                label: ctx.label.to_string(),
+                contract_id: ctx.contract_id.to_string(),
+                network: ctx.network.to_string(),
+                rule_type: "NoActivity".into(),
+                rule_triggered: format!("NoActivity({}min)", minutes),
+                transaction_hash: synthetic_hash,
+                function_name: None,
+                function_names: vec![],
+                amount_xlm: None,
+                fee_charged_stroops: None,
+                timestamp: ts,
+                timestamp_iso: ts_iso,
+                horizon_link: synthetic_horizon_link,
+                explorer_link: synthetic_explorer_link,
+                resolved: false,
+            })
+        }
+        // Already alerting and activity has resumed → fire recovery.
+        (NoActivityState::Alerting, false) => {
+            *state = NoActivityState::Active;
+            let tx_ts = last_seen.unwrap_or(now);
+            let last_horizon_link = match last_seen {
+                Some(_) => format!("{}/accounts/{}", horizon_base, ctx.contract_id),
+                None => synthetic_horizon_link,
+            };
+            let last_explorer_link = match (explorer_base, last_seen) {
+                (Some(base), _) => format!("{}/contract/{}", base, ctx.contract_id),
+                _ => last_horizon_link.clone(),
+            };
+            Some(AlertPayload {
+                label: ctx.label.to_string(),
+                contract_id: ctx.contract_id.to_string(),
+                network: ctx.network.to_string(),
+                rule_type: "NoActivity".into(),
+                rule_triggered: format!("NoActivity({}min) resolved", minutes),
+                transaction_hash: synthetic_hash,
+                function_name: None,
+                function_names: vec![],
+                amount_xlm: None,
+                fee_charged_stroops: None,
+                timestamp: tx_ts.timestamp(),
+                timestamp_iso: tx_ts.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                horizon_link: last_horizon_link,
+                explorer_link: last_explorer_link,
+                resolved: true,
+            })
+        }
+        // No change in state.
+        _ => None,
     }
 }
 
@@ -281,15 +530,18 @@ mod tests {
     }
 
     fn run(rules: &[AlertRule], tx: &EnrichedTransaction) -> Vec<AlertPayload> {
-        evaluate(
-            "Label",
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            "testnet",
-            "https://horizon-testnet.stellar.org",
-            "https://stellar.expert/explorer/testnet",
-            rules,
-            tx,
-        )
+        let contract = txwatch_config::WatchedContract {
+            label: "Label".into(),
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            network: txwatch_config::Network::Testnet,
+            rules: rules.to_vec(),
+            webhook_url: "https://hooks.example.com/hook".into(),
+            webhook_secret: None,
+            poll_interval_seconds: None,
+            horizon_base_url_override: None,
+        };
+        let ctx = EvalContext::from_contract(&contract);
+        evaluate(&ctx, rules, tx, None)
     }
 
     #[test]
@@ -521,7 +773,7 @@ mod tests {
     #[test]
     fn url_fields_have_no_trailing_slash_and_exact_format() {
         // Verify both link fields are normalised even when base URLs have trailing slashes.
-        fn run_with_bases(horizon_base: &str, explorer_base: &str) -> AlertPayload {
+        fn run_with_bases(horizon_base: &str, explorer_base: Option<&str>) -> AlertPayload {
             let tx = EnrichedTransaction {
                 hash: "deadbeef".into(),
                 timestamp: "2024-01-15T12:00:00Z".parse().unwrap(),
@@ -531,14 +783,18 @@ mod tests {
                 amount_stroops: None,
                 fee_charged_stroops: None,
             };
-            let mut payloads = evaluate(
-                "L",
-                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-                "testnet",
+            let ctx = EvalContext {
+                label: "L",
+                contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                network: "testnet",
                 horizon_base,
                 explorer_base,
+            };
+            let mut payloads = evaluate(
+                &ctx,
                 &[AlertRule::AnyTransaction],
                 &tx,
+                None,
             );
             payloads.remove(0)
         }
@@ -546,7 +802,7 @@ mod tests {
         // Without trailing slash — baseline
         let p = run_with_bases(
             "https://horizon-testnet.stellar.org",
-            "https://stellar.expert/explorer/testnet",
+            Some("https://stellar.expert/explorer/testnet"),
         );
         assert_eq!(
             p.horizon_link,
@@ -560,7 +816,7 @@ mod tests {
         // With trailing slash — must produce identical output
         let p2 = run_with_bases(
             "https://horizon-testnet.stellar.org/",
-            "https://stellar.expert/explorer/testnet/",
+            Some("https://stellar.expert/explorer/testnet/"),
         );
         assert_eq!(p.horizon_link, p2.horizon_link);
         assert_eq!(p.explorer_link, p2.explorer_link);
@@ -712,6 +968,7 @@ mod tests {
             timestamp_iso: "2024-01-15T12:00:00Z".into(),
             horizon_link: "https://horizon-testnet.stellar.org/transactions/abc123".into(),
             explorer_link: "https://stellar.expert/explorer/testnet/tx/abc123".into(),
+            resolved: false,
         };
 
         let json = serde_json::to_value(payload).expect("serialize AlertPayload to JSON");
@@ -745,5 +1002,302 @@ mod tests {
             obj["explorer_link"].as_str(),
             Some("https://stellar.expert/explorer/testnet/tx/abc123")
         );
+        assert_eq!(obj["resolved"].as_bool(), Some(false));
+    }
+}
+
+// ── Property-based tests (#61) ────────────────────────────────────────────────
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use txwatch_config::AlertRule;
+
+    /// Minimal valid `EnrichedTransaction` for property tests.
+    fn arb_tx(
+        amount_stroops: Option<u64>,
+        fee_stroops: Option<u64>,
+        function_names: Vec<String>,
+        successful: bool,
+    ) -> EnrichedTransaction {
+        EnrichedTransaction {
+            hash: "proptesthash".into(),
+            timestamp: "2024-01-01T00:00:00Z".parse().unwrap(),
+            successful,
+            paging_token: "1".into(),
+            function_names,
+            amount_stroops,
+            fee_charged_stroops: fee_stroops,
+        }
+    }
+
+    fn eval_one(rule: AlertRule, tx: &EnrichedTransaction) -> Vec<AlertPayload> {
+        let contract = txwatch_config::WatchedContract {
+            label: "PropTest".into(),
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            network: txwatch_config::Network::Testnet,
+            rules: vec![rule.clone()],
+            webhook_url: "https://hooks.example.com/hook".into(),
+            webhook_secret: None,
+            poll_interval_seconds: None,
+            horizon_base_url_override: None,
+        };
+        let ctx = EvalContext::from_contract(&contract);
+        evaluate(&ctx, &[rule], tx, None)
+    }
+
+    proptest! {
+        /// LargeTransfer fires iff amount_stroops >= threshold_xlm × 10^7,
+        /// for all valid (non-zero, non-overflowing) threshold values.
+        #[test]
+        fn large_transfer_fires_iff_at_or_above_threshold(
+            amount_stroops in 0u64..=u64::MAX / 2,
+            threshold_xlm in 1u64..=1_000_000_000u64,
+        ) {
+            let tx = arb_tx(Some(amount_stroops), None, vec![], true);
+            let rule = AlertRule::LargeTransfer { threshold_xlm };
+            let payloads = eval_one(rule, &tx);
+            let threshold_stroops = threshold_xlm.saturating_mul(10_000_000);
+            let should_fire = amount_stroops >= threshold_stroops;
+            prop_assert_eq!(payloads.len() == 1, should_fire,
+                "amount={} threshold_xlm={} threshold_stroops={} should_fire={}",
+                amount_stroops, threshold_xlm, threshold_stroops, should_fire);
+        }
+
+        /// LargeTransfer never panics for any u64 threshold and amount combination.
+        #[test]
+        fn large_transfer_never_panics(
+            amount_stroops in 0u64..=u64::MAX,
+            threshold_xlm in 0u64..=u64::MAX,
+        ) {
+            let tx = arb_tx(Some(amount_stroops), None, vec![], true);
+            // Use u64::MAX as threshold to exercise checked_mul overflow path.
+            // validate() rejects threshold_xlm=0 so we can pass any value here
+            // directly — eval_rule returns Ok(false) on overflow.
+            let rule = AlertRule::LargeTransfer { threshold_xlm };
+            // Must not panic regardless of inputs.
+            let _ = eval_one(rule, &tx);
+        }
+
+        /// HighFee fires iff fee_charged_stroops >= threshold_stroops, for all u64 values.
+        #[test]
+        fn high_fee_fires_iff_at_or_above_threshold(
+            fee in 0u64..=u64::MAX,
+            threshold in 1u64..=u64::MAX,
+        ) {
+            let tx = arb_tx(None, Some(fee), vec![], true);
+            let rule = AlertRule::HighFee { threshold_stroops: threshold, threshold_xlm: None };
+            let payloads = eval_one(rule, &tx);
+            let should_fire = fee >= threshold;
+            prop_assert_eq!(payloads.len() == 1, should_fire,
+                "fee={} threshold={} should_fire={}", fee, threshold, should_fire);
+        }
+
+        /// evaluate never panics for arbitrary EnrichedTransaction inputs.
+        #[test]
+        fn evaluate_never_panics(
+            amount_stroops in proptest::option::of(0u64..=u64::MAX),
+            fee_stroops in proptest::option::of(0u64..=u64::MAX),
+            successful in proptest::bool::ANY,
+        ) {
+            let tx = arb_tx(amount_stroops, fee_stroops, vec![], successful);
+            let rules = vec![
+                AlertRule::AnyTransaction,
+                AlertRule::TransactionFailed,
+                AlertRule::LargeTransfer { threshold_xlm: 1 },
+                AlertRule::HighFee { threshold_stroops: 1, threshold_xlm: None },
+            ];
+            let contract = txwatch_config::WatchedContract {
+                label: "PropTest".into(),
+                contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+                network: txwatch_config::Network::Testnet,
+                rules: rules.clone(),
+                webhook_url: "https://hooks.example.com/hook".into(),
+                webhook_secret: None,
+                poll_interval_seconds: None,
+                horizon_base_url_override: None,
+            };
+            let ctx = EvalContext::from_contract(&contract);
+            // Must not panic.
+            let _ = evaluate(&ctx, &rules, &tx, None);
+        }
+    }
+}
+
+// ── NoActivity tests (#62) ────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod no_activity_tests {
+    use super::*;
+    use chrono::TimeZone;
+    use txwatch_config::AlertRule;
+
+    fn ctx() -> txwatch_config::WatchedContract {
+        txwatch_config::WatchedContract {
+            label: "Oracle".into(),
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            network: txwatch_config::Network::Testnet,
+            rules: vec![AlertRule::NoActivity { minutes: 5 }],
+            webhook_url: "https://hooks.example.com/hook".into(),
+            webhook_secret: None,
+            poll_interval_seconds: None,
+            horizon_base_url_override: None,
+        }
+    }
+
+    fn ts(h: i32, m: i32) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc.with_ymd_and_hms(2024, 1, 15, h as u32, m as u32, 0).unwrap()
+    }
+
+    #[test]
+    fn no_activity_fires_when_threshold_exceeded() {
+        let contract = ctx();
+        let eval_ctx = EvalContext::from_contract(&contract);
+        let rule = AlertRule::NoActivity { minutes: 5 };
+        let mut state = NoActivityState::default();
+
+        // Last seen 6 minutes ago — threshold is 5 min, so this should fire.
+        let last_seen = ts(12, 0);
+        let now = ts(12, 6);
+        let payload = check_no_activity(&rule, Some(last_seen), now, &mut state, &eval_ctx);
+
+        assert!(payload.is_some(), "should fire when quiet for > threshold");
+        let p = payload.unwrap();
+        assert_eq!(p.rule_type, "NoActivity");
+        assert!(!p.resolved, "incident payload must have resolved=false");
+        assert!(p.transaction_hash.is_empty(), "synthetic payload has empty hash");
+        assert_eq!(state, NoActivityState::Alerting);
+    }
+
+    #[test]
+    fn no_activity_does_not_fire_below_threshold() {
+        let contract = ctx();
+        let eval_ctx = EvalContext::from_contract(&contract);
+        let rule = AlertRule::NoActivity { minutes: 5 };
+        let mut state = NoActivityState::default();
+
+        // Last seen 4 minutes ago — below threshold.
+        let last_seen = ts(12, 0);
+        let now = ts(12, 4);
+        let payload = check_no_activity(&rule, Some(last_seen), now, &mut state, &eval_ctx);
+
+        assert!(payload.is_none());
+        assert_eq!(state, NoActivityState::Active);
+    }
+
+    #[test]
+    fn no_activity_fires_exactly_at_threshold() {
+        let contract = ctx();
+        let eval_ctx = EvalContext::from_contract(&contract);
+        let rule = AlertRule::NoActivity { minutes: 5 };
+        let mut state = NoActivityState::default();
+
+        // Exactly 5 minutes gap — should fire.
+        let last_seen = ts(12, 0);
+        let now = ts(12, 5);
+        let payload = check_no_activity(&rule, Some(last_seen), now, &mut state, &eval_ctx);
+
+        assert!(payload.is_some(), "should fire at exactly threshold");
+    }
+
+    #[test]
+    fn no_activity_does_not_repeat_while_alerting() {
+        let contract = ctx();
+        let eval_ctx = EvalContext::from_contract(&contract);
+        let rule = AlertRule::NoActivity { minutes: 5 };
+        let mut state = NoActivityState::Alerting;
+
+        // Still quiet — already alerting, so no second payload.
+        let last_seen = ts(12, 0);
+        let now = ts(12, 20);
+        let payload = check_no_activity(&rule, Some(last_seen), now, &mut state, &eval_ctx);
+
+        assert!(payload.is_none(), "should not re-fire while already alerting");
+        assert_eq!(state, NoActivityState::Alerting);
+    }
+
+    #[test]
+    fn no_activity_fires_recovery_when_activity_resumes() {
+        let contract = ctx();
+        let eval_ctx = EvalContext::from_contract(&contract);
+        let rule = AlertRule::NoActivity { minutes: 5 };
+        let mut state = NoActivityState::Alerting;
+
+        // Activity just happened (1 minute ago) while we were in Alerting state.
+        let last_seen = ts(12, 10);
+        let now = ts(12, 11);
+        let payload = check_no_activity(&rule, Some(last_seen), now, &mut state, &eval_ctx);
+
+        assert!(payload.is_some(), "should fire recovery when activity resumes");
+        let p = payload.unwrap();
+        assert!(p.resolved, "recovery payload must have resolved=true");
+        assert_eq!(p.rule_type, "NoActivity");
+        assert_eq!(state, NoActivityState::Active);
+    }
+
+    #[test]
+    fn no_activity_no_last_seen_fires_immediately() {
+        let contract = ctx();
+        let eval_ctx = EvalContext::from_contract(&contract);
+        let rule = AlertRule::NoActivity { minutes: 5 };
+        let mut state = NoActivityState::default();
+
+        // No transactions ever seen — treated as infinite quiet period.
+        let now = ts(12, 0);
+        let payload = check_no_activity(&rule, None, now, &mut state, &eval_ctx);
+
+        assert!(payload.is_some(), "should fire when no transactions ever seen");
+        assert!(!payload.unwrap().resolved);
+    }
+}
+
+// ── WarningSuppressor tests (#60) ─────────────────────────────────────────────
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod suppressor_tests {
+    use super::*;
+
+    #[test]
+    fn first_warning_is_always_emitted() {
+        let s = WarningSuppressor::default();
+        assert!(s.should_warn("contract:rule"), "first occurrence must warn");
+    }
+
+    #[test]
+    fn second_through_99th_are_suppressed() {
+        let s = WarningSuppressor::default();
+        s.should_warn("k"); // first — emitted
+        for _ in 2..100 {
+            assert!(!s.should_warn("k"), "occurrences 2-99 must be suppressed");
+        }
+    }
+
+    #[test]
+    fn hundredth_occurrence_is_emitted() {
+        let s = WarningSuppressor::default();
+        for _ in 0..99 {
+            s.should_warn("k");
+        }
+        assert!(s.should_warn("k"), "100th occurrence must be emitted");
+    }
+
+    #[test]
+    fn different_keys_are_independent() {
+        let s = WarningSuppressor::default();
+        assert!(s.should_warn("a"));
+        assert!(s.should_warn("b"));
+    }
+
+    #[test]
+    fn suppressed_count_tracks_calls() {
+        let s = WarningSuppressor::default();
+        s.should_warn("x");
+        s.should_warn("x");
+        s.should_warn("x");
+        assert_eq!(s.suppressed_count("x"), 3);
     }
 }
