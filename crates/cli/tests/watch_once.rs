@@ -47,7 +47,7 @@ cursor_file = '{cursor}'
 
 [[contracts]]
 label       = "Once Contract"
-contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
 network     = "testnet"
 webhook_url = "{webhook_url}"
 
@@ -112,7 +112,7 @@ async fn once_delivers_alert_saves_cursor_and_exits_zero() {
         serde_json::from_str(&fs::read_to_string(&cursor_path).expect("cursor file written"))
             .unwrap();
     assert_eq!(
-        cursors["CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"],
+        cursors["CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"],
         "700"
     );
 }

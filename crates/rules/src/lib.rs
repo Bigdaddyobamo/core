@@ -121,6 +121,10 @@ pub struct AlertPayload {
     pub horizon_link: String,
     /// Stellar Expert explorer link for the transaction.
     pub explorer_link: String,
+    /// `true` only for synthetic payloads sent by `txwatch test-webhook`;
+    /// omitted from the JSON otherwise.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub test: bool,
 }
 
 /// Deterministic alert ID: the first 32 hex characters (128 bits) of
@@ -176,6 +180,7 @@ pub fn evaluate(
                 timestamp_iso: timestamp_iso.clone(),
                 horizon_link: horizon_link.clone(),
                 explorer_link: explorer_link.clone(),
+                test: false,
             }),
             Ok(false) => None,
             Err(e) => {
@@ -304,7 +309,7 @@ mod tests {
     fn run(rules: &[AlertRule], tx: &EnrichedTransaction) -> Vec<AlertPayload> {
         evaluate(
             "Label",
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
             "testnet",
             "https://horizon-testnet.stellar.org",
             "https://stellar.expert/explorer/testnet",
@@ -554,7 +559,7 @@ mod tests {
             };
             let mut payloads = evaluate(
                 "L",
-                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
                 "testnet",
                 horizon_base,
                 explorer_base,
@@ -721,7 +726,7 @@ mod tests {
         let payload = AlertPayload {
             alert_id: "0123456789abcdef0123456789abcdef".into(),
             label: "My Contract".into(),
-            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
             network: "testnet".into(),
             rule_type: "LargeTransfer".into(),
             rule_triggered: "LargeTransfer(>=10000XLM)".into(),
@@ -734,6 +739,7 @@ mod tests {
             timestamp_iso: "2024-01-15T12:00:00Z".into(),
             horizon_link: "https://horizon-testnet.stellar.org/transactions/abc123".into(),
             explorer_link: "https://stellar.expert/explorer/testnet/tx/abc123".into(),
+            test: false,
         };
 
         let json = serde_json::to_value(payload).expect("serialize AlertPayload to JSON");
@@ -744,7 +750,7 @@ mod tests {
         assert_eq!(obj["label"].as_str(), Some("My Contract"));
         assert_eq!(
             obj["contract_id"].as_str(),
-            Some("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+            Some("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4")
         );
         assert_eq!(obj["network"].as_str(), Some("testnet"));
         assert_eq!(obj["rule_type"].as_str(), Some("LargeTransfer"));
@@ -766,6 +772,10 @@ mod tests {
         assert_eq!(
             obj["explorer_link"].as_str(),
             Some("https://stellar.expert/explorer/testnet/tx/abc123")
+        );
+        assert!(
+            !obj.contains_key("test"),
+            "real alerts must not carry the test marker"
         );
     }
 

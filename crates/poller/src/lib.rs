@@ -18,7 +18,13 @@ use tracing::{debug, error, info, warn};
 use txwatch_config::{AppConfig, WatchedContract};
 use txwatch_config::WebhookDestination;
 use txwatch_notifier::send_to_destination;
+use txwatch_notifier::{send_webhook, send_webhook_batch, MAX_BATCH_SIZE};
 use txwatch_rules::{evaluate, EnrichedTransaction, HorizonTransaction};
+
+pub mod event_stream;
+pub use event_stream::{EventFilter, GetEventsParams, SorobanEvent, SorobanEventStreamer};
+pub mod plan_cache;
+pub use plan_cache::{PlanCache, PlanStatistics};
 
 // ── Optional Prometheus metrics ───────────────────────────────────────────────
 
@@ -551,6 +557,9 @@ async fn poll_contract(
     let mut alert_count = 0u64;
     let mut webhook_failures = 0u64;
     let destinations = contract.destinations();
+    let mut delivery_tasks = JoinSet::new();
+    // With `batch_alerts`, alerts are collected here and sent after the loop.
+    let mut batch: Vec<txwatch_rules::AlertPayload> = Vec::new();
 
     for record in all_records {
         let paging_token = record.tx.paging_token.clone();
@@ -609,12 +618,84 @@ async fn poll_contract(
             if dry_run {
                 info!(contract = %contract.label, rule = %payload.rule_triggered,
                     tx = %payload.transaction_hash, "dry-run enabled: not sending webhook");
+            } else if contract.batch_alerts {
+                batch.push(payload);
             } else {
                 info!(contract = %contract.label, rule = %payload.rule_triggered,
                     tx = %payload.transaction_hash, destinations = destinations.len(),
                     "rule fired — sending webhook");
                 webhook_failures += deliver_to_all(client, contract, &destinations, &payload).await;
+                    tx = %payload.transaction_hash, "rule fired — sending webhook");
+                let client = client.clone();
+                let webhook_url = contract.webhook_url.clone();
+                let webhook_secret = contract.webhook_secret.clone();
+                let contract_label = contract.label.clone();
+                let network_str = contract.network.as_str().to_string();
+                let payload_clone = payload.clone();
+
+                delivery_tasks.spawn(async move {
+                    let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+                    #[cfg(feature = "metrics")]
+                    let started = std::time::Instant::now();
+                    let delivery = send_webhook(
+                        &client,
+                        &webhook_url,
+                        &payload_clone,
+                        webhook_secret.as_deref(),
+                        shutdown_rx,
+                    )
+                    .await;
+                    #[cfg(feature = "metrics")]
+                    metrics::observe_webhook_delivery(started.elapsed().as_secs_f64());
+                    if let Err(e) = &delivery {
+                        error!(contract = %contract_label, rule = %payload_clone.rule_triggered,
+                            tx = %payload_clone.transaction_hash, error = %e, "webhook delivery failed");
+                        #[cfg(feature = "metrics")]
+                        metrics::inc_webhook_failures(&contract_label, &network_str);
+                    }
+                    delivery.is_err()
+                });
             }
+        }
+    }
+
+    while let Some(res) = delivery_tasks.join_next().await {
+        match res {
+            Ok(failed) => {
+                if failed {
+                    webhook_failures += 1;
+                }
+            }
+            Err(e) => {
+                error!(contract = %contract.label, error = ?e, "webhook delivery task panicked");
+                webhook_failures += 1;
+            }
+        }
+    }
+
+    // One POST per chunk of at most MAX_BATCH_SIZE alerts; each failed chunk
+    // counts as one webhook failure.
+    for chunk in batch.chunks(MAX_BATCH_SIZE) {
+        info!(contract = %contract.label, alerts = chunk.len(), "sending batched webhook");
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        #[cfg(feature = "metrics")]
+        let started = std::time::Instant::now();
+        let delivery = send_webhook_batch(
+            client,
+            &contract.webhook_url,
+            chunk,
+            contract.webhook_secret.as_deref(),
+            shutdown_rx,
+        )
+        .await;
+        #[cfg(feature = "metrics")]
+        metrics::observe_webhook_delivery(started.elapsed().as_secs_f64());
+        if let Err(e) = delivery {
+            error!(contract = %contract.label, alerts = chunk.len(), error = %e,
+                "batched webhook delivery failed");
+            webhook_failures += 1;
+            #[cfg(feature = "metrics")]
+            metrics::inc_webhook_failures(&contract.label, contract.network.as_str());
         }
     }
 
@@ -894,7 +975,7 @@ mod tests {
         let client = Client::new();
         let contract = WatchedContract {
             label: "test".into(),
-            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
             network: Network::Testnet,
             rules: vec![AlertRule::FunctionCalled {
                 function_name: "withdraw".into(),
@@ -907,6 +988,7 @@ mod tests {
             webhook_headers: Default::default(),
             webhook_routing_key: None,
             webhooks: Vec::new(),
+            batch_alerts: false,
         };
         let mut cursors: HashMap<String, String> = HashMap::new();
         cursors.insert(contract.contract_id.clone(), "now".to_string());
@@ -941,7 +1023,7 @@ mod tests {
         let url = format!(
             "{}/accounts/{}/transactions?cursor=now&order=asc&limit=200&join=operations",
             server.uri(),
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
         );
         let page: HorizonPage = client.get(&url).send().await.unwrap().json().await.unwrap();
         assert!(page._embedded.records.is_empty());
@@ -1015,7 +1097,7 @@ mod tests {
             .await;
 
         let client = Client::new();
-        let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
         let mut cursors: HashMap<String, String> = HashMap::new();
         cursors.insert(contract_id.to_string(), "now".to_string());
 
@@ -1032,6 +1114,7 @@ mod tests {
             webhook_headers: Default::default(),
             webhook_routing_key: None,
             webhooks: Vec::new(),
+            batch_alerts: false,
         };
 
         // 429 is handled with a back-off and returns Ok((0,0,0)), not an error
@@ -1050,7 +1133,7 @@ mod tests {
             .await;
 
         let client = Client::new();
-        let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
         let mut cursors: HashMap<String, String> = HashMap::new();
         cursors.insert(contract_id.to_string(), "now".to_string());
 
@@ -1067,6 +1150,7 @@ mod tests {
             webhook_headers: Default::default(),
             webhook_routing_key: None,
             webhooks: Vec::new(),
+            batch_alerts: false,
         };
 
         let err = poll_contract(&client, &contract, &mut cursors, false)
@@ -1089,7 +1173,7 @@ mod tests {
             .await;
 
         let client = Client::new();
-        let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
         let mut cursors: HashMap<String, String> = HashMap::new();
         cursors.insert(contract_id.to_string(), "now".to_string());
 
@@ -1106,6 +1190,7 @@ mod tests {
             webhook_headers: Default::default(),
             webhook_routing_key: None,
             webhooks: Vec::new(),
+            batch_alerts: false,
         };
 
         let result = poll_contract(&client, &contract, &mut cursors, false).await;
@@ -1124,11 +1209,12 @@ mod tests {
             http_pool_max_idle_per_host: 10,
             http_tcp_keepalive_secs: 30,
             http_connection_verbose: None,
+            max_contracts: None,
             cursor_file: None,
             contracts: vec![
                 WatchedContract {
                     label: "Contract A".into(),
-                    contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+                    contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
                     network: txwatch_config::Network::Testnet,
                     rules: vec![txwatch_config::AlertRule::AnyTransaction],
                     webhook_url: Some("https://hooks.example.com/a".into()),
@@ -1139,10 +1225,11 @@ mod tests {
                     webhook_headers: Default::default(),
                     webhook_routing_key: None,
                     webhooks: Vec::new(),
+                    batch_alerts: false,
                 },
                 WatchedContract {
                     label: "Contract B".into(),
-                    contract_id: "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into(),
+                    contract_id: "CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526".into(),
                     network: txwatch_config::Network::Mainnet,
                     rules: vec![txwatch_config::AlertRule::AnyTransaction],
                     webhook_url: Some("https://hooks.example.com/b".into()),
@@ -1153,10 +1240,11 @@ mod tests {
                     webhook_headers: Default::default(),
                     webhook_routing_key: None,
                     webhooks: Vec::new(),
+                    batch_alerts: false,
                 },
                 WatchedContract {
                     label: "Contract C".into(),
-                    contract_id: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC".into(),
+                    contract_id: "CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ".into(),
                     network: txwatch_config::Network::Mainnet,
                     rules: vec![txwatch_config::AlertRule::AnyTransaction],
                     webhook_url: Some("https://hooks.example.com/c".into()),
@@ -1167,6 +1255,7 @@ mod tests {
                     webhook_headers: Default::default(),
                     webhook_routing_key: None,
                     webhooks: Vec::new(),
+                    batch_alerts: false,
                 },
             ],
         };
@@ -1177,6 +1266,102 @@ mod tests {
         assert_eq!(networks, "mainnet, testnet");
         assert!(horizon_urls.contains("mainnet=https://horizon.stellar.org"));
         assert!(horizon_urls.contains("testnet=https://horizon-testnet.stellar.org"));
+    }
+
+    // ── cursor_file loading ──────────────────────────────────────────────────
+
+    const ID_A: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+    const ID_B: &str = "CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526";
+
+    fn cursor_config(cursor_file: Option<String>) -> AppConfig {
+        let contract = |id: &str| WatchedContract {
+            label: id[..4].into(),
+            contract_id: id.into(),
+            network: Network::Testnet,
+            rules: vec![AlertRule::AnyTransaction],
+            webhook_url: "https://hooks.example.com/x".into(),
+            webhook_secret: None,
+            poll_interval_seconds: None,
+            horizon_base_url_override: None,
+        };
+        AppConfig {
+            poll_interval_seconds: 10,
+            contracts: vec![contract(ID_A), contract(ID_B)],
+            cursor_file,
+            http_pool_max_idle_per_host: 10,
+            http_tcp_keepalive_secs: 30,
+            http_connection_verbose: None,
+        }
+    }
+
+    /// A fresh path in the temp dir, unique per test.
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("txwatch-{}-{}", std::process::id(), name))
+    }
+
+    fn all_now() -> HashMap<String, String> {
+        HashMap::from([(ID_A.into(), "now".into()), (ID_B.into(), "now".into())])
+    }
+
+    #[test]
+    fn load_cursors_without_cursor_file_starts_from_now() {
+        assert_eq!(load_cursors(&cursor_config(None)), all_now());
+    }
+
+    #[test]
+    fn load_cursors_reads_valid_cursor_file() {
+        let path = temp_path("valid.json");
+        fs::write(&path, format!(r#"{{"{ID_A}": "111", "{ID_B}": "222"}}"#)).unwrap();
+        let cursors = load_cursors(&cursor_config(Some(path.display().to_string())));
+        let _ = fs::remove_file(&path);
+        assert_eq!(
+            cursors,
+            HashMap::from([(ID_A.into(), "111".into()), (ID_B.into(), "222".into())])
+        );
+    }
+
+    #[test]
+    fn load_cursors_falls_back_to_now_only_for_missing_contracts() {
+        let path = temp_path("partial.json");
+        fs::write(&path, format!(r#"{{"{ID_A}": "111"}}"#)).unwrap();
+        let cursors = load_cursors(&cursor_config(Some(path.display().to_string())));
+        let _ = fs::remove_file(&path);
+        assert_eq!(cursors.get(ID_A).map(String::as_str), Some("111"));
+        assert_eq!(cursors.get(ID_B).map(String::as_str), Some("now"));
+    }
+
+    #[test]
+    fn load_cursors_ignores_malformed_cursor_file() {
+        let path = temp_path("malformed.json");
+        fs::write(&path, "{ not json").unwrap();
+        let cursors = load_cursors(&cursor_config(Some(path.display().to_string())));
+        let _ = fs::remove_file(&path);
+        assert_eq!(cursors, all_now());
+    }
+
+    #[test]
+    fn load_cursors_ignores_cursor_file_with_wrong_shape() {
+        let path = temp_path("wrong-shape.json");
+        fs::write(&path, format!(r#"{{"{ID_A}": 111}}"#)).unwrap();
+        let cursors = load_cursors(&cursor_config(Some(path.display().to_string())));
+        let _ = fs::remove_file(&path);
+        assert_eq!(cursors, all_now());
+    }
+
+    #[test]
+    fn load_cursors_ignores_unreadable_cursor_file() {
+        // A directory exists but cannot be read as a file.
+        let dir = temp_path("unreadable-dir");
+        fs::create_dir_all(&dir).unwrap();
+        let cursors = load_cursors(&cursor_config(Some(dir.display().to_string())));
+        let _ = fs::remove_dir(&dir);
+        assert_eq!(cursors, all_now());
+
+        let missing = temp_path("does-not-exist.json");
+        assert_eq!(
+            load_cursors(&cursor_config(Some(missing.display().to_string()))),
+            all_now()
+        );
     }
 
     #[tokio::test]
@@ -1219,7 +1404,7 @@ mod tests {
         let client = Client::new();
         let contract = WatchedContract {
             label: "Contract".into(),
-            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
             network: Network::Testnet,
             rules: vec![AlertRule::AnyTransaction],
             webhook_url: Some(format!("{}/hooks", server.uri())),
@@ -1230,6 +1415,7 @@ mod tests {
             webhook_headers: Default::default(),
             webhook_routing_key: None,
             webhooks: Vec::new(),
+            batch_alerts: false,
         };
         let mut cursors: HashMap<String, String> = HashMap::new();
         cursors.insert(contract.contract_id.clone(), "now".to_string());
@@ -1308,6 +1494,65 @@ mod tests {
                 },
             ],
         };
+    // ── Batched delivery ─────────────────────────────────────────────────────
+
+    /// Mounts a Horizon returning `n` transactions (one page) on `server`, and
+    /// returns a contract that batches its alerts to `receiver`.
+    async fn batching_contract(server: &MockServer, receiver: &MockServer, n: u64) -> WatchedContract {
+        let records: Vec<_> = (1..=n)
+            .map(|i| {
+                serde_json::json!({
+                    "hash": format!("tx{}", i),
+                    "created_at": "2020-01-01T00:00:00Z",
+                    "successful": true,
+                    "paging_token": i.to_string(),
+                    "operations": [{ "type": "invoke_host_function", "function": "withdraw" }],
+                })
+            })
+            .collect();
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "_embedded": { "records": records } })),
+            )
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(receiver)
+            .await;
+
+        WatchedContract {
+            label: "batch".into(),
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            network: Network::Testnet,
+            rules: vec![AlertRule::AnyTransaction],
+            webhook_url: format!("{}/hook", receiver.uri()),
+            webhook_secret: None,
+            poll_interval_seconds: None,
+            batch_alerts: true,
+            horizon_base_url_override: Some(server.uri()),
+        }
+    }
+
+    async fn batch_sizes(receiver: &MockServer) -> Vec<usize> {
+        receiver
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| {
+                let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+                body["alerts"].as_array().expect("batched body").len()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn batch_alerts_sends_one_post_per_cycle() {
+        let (server, receiver) = (MockServer::start().await, MockServer::start().await);
+        let contract = batching_contract(&server, &receiver, 3).await;
         let mut cursors = HashMap::from([(contract.contract_id.clone(), "now".to_string())]);
 
         let (txs, alerts, failures) = poll_contract(&Client::new(), &contract, &mut cursors, false)
@@ -1327,5 +1572,39 @@ mod tests {
 
         // The failing destination was retried on its own.
         assert_eq!(broken.received_requests().await.unwrap().len(), 3);
+        assert_eq!((txs, alerts, failures), (3, 3, 0));
+        assert_eq!(batch_sizes(&receiver).await, vec![3]);
+    }
+
+    #[tokio::test]
+    async fn batch_alerts_splits_large_batches() {
+        let (server, receiver) = (MockServer::start().await, MockServer::start().await);
+        let contract = batching_contract(&server, &receiver, 120).await;
+        let mut cursors = HashMap::from([(contract.contract_id.clone(), "now".to_string())]);
+
+        let (_, alerts, _) = poll_contract(&Client::new(), &contract, &mut cursors, false)
+            .await
+            .unwrap();
+        assert_eq!(alerts, 120);
+        assert_eq!(batch_sizes(&receiver).await, vec![50, 50, 20]);
+    }
+
+    #[tokio::test]
+    async fn batch_alerts_sends_nothing_in_dry_run_or_without_alerts() {
+        let (server, receiver) = (MockServer::start().await, MockServer::start().await);
+        let contract = batching_contract(&server, &receiver, 3).await;
+        let mut cursors = HashMap::from([(contract.contract_id.clone(), "now".to_string())]);
+        poll_contract(&Client::new(), &contract, &mut cursors, true)
+            .await
+            .unwrap();
+        assert!(receiver.received_requests().await.unwrap().is_empty());
+
+        let (server, receiver) = (MockServer::start().await, MockServer::start().await);
+        let contract = batching_contract(&server, &receiver, 0).await;
+        let mut cursors = HashMap::from([(contract.contract_id.clone(), "now".to_string())]);
+        poll_contract(&Client::new(), &contract, &mut cursors, false)
+            .await
+            .unwrap();
+        assert!(receiver.received_requests().await.unwrap().is_empty());
     }
 }

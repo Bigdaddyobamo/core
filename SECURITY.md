@@ -34,3 +34,4 @@ unless you ask us not to.
 TxWatch handles webhook secrets and forwards alert data to external
 endpoints. Issues such as secret leakage in requests or logs, signature
 bypasses, and request forgery against configured webhooks are in scope.
+For a detailed analysis of trust boundaries, assets, and attack surfaces, see [Threat Model](docs/THREAT_MODEL.md).

@@ -11,7 +11,7 @@ poll_interval_seconds = 10
 
 [[contracts]]
 label       = "Test Contract"
-contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
 network     = "testnet"
 webhook_url = "https://hooks.example.com/test"
 
@@ -24,7 +24,7 @@ poll_interval_seconds = 10
 
 [[contracts]]
 label       = "Alpha Contract"
-contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
 network     = "testnet"
 webhook_url = "https://hooks.example.com/alpha"
 
@@ -33,7 +33,7 @@ webhook_url = "https://hooks.example.com/alpha"
 
 [[contracts]]
 label       = "Beta Contract"
-contract_id = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+contract_id = "CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526"
 network     = "mainnet"
 webhook_url = "https://hooks.example.com/beta"
 
@@ -88,11 +88,11 @@ fn validate_prints_all_contract_labels_ids_and_rule_counts() {
 
     // Both contract IDs must appear.
     assert!(
-        stdout.contains("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        stdout.contains("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"),
         "expected Alpha contract_id in output"
     );
     assert!(
-        stdout.contains("CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"),
+        stdout.contains("CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526"),
         "expected Beta contract_id in output"
     );
 
@@ -114,7 +114,7 @@ poll_interval_seconds = 10
 
 [[contracts]]
 label       = "Test Contract"
-contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
 network     = "testnet"
 webhook_url = "https://hooks.example.com/test"
 
@@ -148,12 +148,15 @@ webhook_url = "https://hooks.example.com/test"
         "    contract_id  : CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
         "    webhooks     : 1\n",
         "      - https://hooks.example.com/test (format: txwatch, secret: none)\n",
+        "    contract_id  : CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4\n",
+        "    webhook_url  : https://hooks.example.com/test\n",
+        "    secret       : none\n",
         "    interval     : 10s\n",
         "    rules        : 2\n",
         "      - AnyTransaction\n",
         "      - TransactionFailed\n",
         "    horizon      : https://horizon-testnet.stellar.org\n",
-        "    explorer     : https://stellar.expert/explorer/testnet/contract/CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n"
+        "    explorer     : https://stellar.expert/explorer/testnet/contract/CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4\n"
     );
 
     assert_eq!(stdout, expected);
@@ -219,7 +222,7 @@ fn validate_output_shows_effective_poll_interval_per_contract() {
     const OVERRIDE_CONFIG: &str = r#"
 [[contracts]]
 label                 = "Fast"
-contract_id           = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+contract_id           = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
 network               = "testnet"
 webhook_url           = "https://hooks.example.com/fast"
 poll_interval_seconds = 5
@@ -229,7 +232,7 @@ poll_interval_seconds = 5
 
 [[contracts]]
 label       = "Default"
-contract_id = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+contract_id = "CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526"
 network     = "testnet"
 webhook_url = "https://hooks.example.com/default"
 
@@ -270,7 +273,7 @@ poll_interval_seconds = 10
 
 [[contracts]]
 label          = "Test Contract"
-contract_id    = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+contract_id    = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
 network        = "testnet"
 webhook_url    = "https://hooks.example.com/test"
 webhook_secret = "super-secret-value"
@@ -307,8 +310,8 @@ webhook_secret = "super-secret-value"
     let expected = r#"{
   "contracts": [
     {
-      "contract_id": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-      "explorer_url": "https://stellar.expert/explorer/testnet/contract/CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "contract_id": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+      "explorer_url": "https://stellar.expert/explorer/testnet/contract/CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
       "horizon_url": "https://horizon-testnet.stellar.org",
       "label": "Test Contract",
       "network": "testnet",

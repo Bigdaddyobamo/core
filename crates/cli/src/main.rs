@@ -316,6 +316,7 @@ async fn main() -> Result<()> {
                 destination.validate()?;
                 (vec![destination], selected)
             };
+            let payload = test_payload_with_network(&label, &network_name, &horizon_base_url);
             let client = build_client().context("failed to build HTTP client")?;
 
             // Try every destination, then fail if any of them failed.
