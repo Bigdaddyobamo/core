@@ -1,11 +1,9 @@
-version: '3.8'
-
 services:
   txwatch:
     build: .
     container_name: txwatch-dev
     volumes:
-      - ./config/example.toml:/config/txwatch.toml:ro
+      - ./config/docker-compose.toml:/config/txwatch.toml:ro
     environment:
       RUST_LOG: debug
       TXWATCH_CONFIG: /config/txwatch.toml

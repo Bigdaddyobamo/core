@@ -8,7 +8,7 @@ Part of the [TxWatch](https://github.com/Tx-wats) ecosystem.
 
 ## What is this?
 
-**TxWatch** sits between the [Stellar Horizon REST API](https://developers.stellar.org/api/horizon)
+**TxWatch** sits between the [Stellar Horizon REST API](https://developers.stellar.org/docs/data/apis/horizon)
 and your infrastructure. It polls every contract you configure, evaluates alert rules against
 each new transaction, and fires a JSON webhook the moment a condition is met — no SDK, no
 subscriptions, no infrastructure beyond a single Rust binary.
@@ -72,7 +72,7 @@ subscriptions, no infrastructure beyond a single Rust binary.
 ```bash
 # 1. Clone
 git clone https://github.com/Tx-wats/core
-cd tx-watch-core
+cd core
 
 # 2. Copy and edit the example config (./txwatch.toml is the default path)
 cp config/example.toml txwatch.toml
@@ -370,7 +370,7 @@ scrape_configs:
 | Stellar Expert (testnet) | https://stellar.expert/explorer/testnet |
 | Stellar Laboratory | https://laboratory.stellar.org |
 | Friendbot (fund testnet accounts) | https://friendbot.stellar.org |
-| Soroban docs | https://developers.stellar.org/docs/smart-contracts |
+| Soroban docs | https://developers.stellar.org/docs/build/smart-contracts/overview |
 
 ---
 
@@ -389,4 +389,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-MIT
+[Apache-2.0](LICENSE)
