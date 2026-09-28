@@ -53,9 +53,10 @@ async fn mocked_poll_is_reflected_in_metrics_endpoint() {
         poll_interval_seconds: 5,
         contracts: vec![contract],
         cursor_file: None,
-        http_pool_max_idle_per_host: None,
-        http_tcp_keepalive_secs: None,
+        http_pool_max_idle_per_host: 10,
+        http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
+        max_contracts: None,
     };
 
     // The endpoint keeps running for the scrape; only the poller is stopped.

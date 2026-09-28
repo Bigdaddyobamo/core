@@ -15,7 +15,7 @@ poll_interval_seconds = 3600
 
 [[contracts]]
 label       = "Metrics Contract"
-contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
 network     = "testnet"
 webhook_url = "https://hooks.example.com/metrics"
 

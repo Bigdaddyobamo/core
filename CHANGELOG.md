@@ -37,8 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `TXWATCH_CONFIG` environment variable for the config path
 - `SIGHUP` reloads the config without restarting; cursors of remaining contracts are kept and an invalid file is ignored
 - Per-contract `poll_interval_seconds` override; each contract is polled on its own schedule and `txwatch validate` shows the effective interval
+- `EventEmitted` rule matching Soroban contract events by topic (symbol on topic 0, optional positional topics with `*` wildcard); events are fetched from Soroban RPC `getEvents` and included in the new `matched_events` payload field. New `soroban_rpc_url` contract setting and `rpc_url` custom-network setting
+- Optional per-rule `cooldown_seconds`: matches of the same (contract, rule) inside the window are suppressed and reported in the new `suppressed_count` payload field of the next alert
 
 ### Changed
+
+- Parsed transfer amounts and fees above the total XLM supply (`MAX_XLM_SUPPLY_STROOPS`, 5 × 10^17 stroops) are discarded as malformed
+- `HighFee` docs now say the rule fires when the fee is greater than or equal to the threshold (matching the behaviour), name the `fee_charged_stroops` payload field correctly and document `threshold_xlm`
 
 - `poll_interval_seconds` is bounded to 5–3600 seconds
 - `txwatch test-webhook` exits with code 1 when delivery fails
