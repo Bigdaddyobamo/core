@@ -150,6 +150,39 @@ jobs:
       - name: Run cargo-deny to check dependencies
         uses: EmbarkStudios/cargo-deny-action@v2
 
+  # ── Markdown link check ─────────────────────────────────────────────────────
+  links:
+    name: Markdown links
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check links with lychee
+        uses: lycheeverse/lychee-action@v2
+        with:
+          fail: true
+          # Placeholder hosts used in examples and local dev URLs aren't real links.
+          args: >-
+            --no-progress
+            --exclude-path target
+            --exclude '^https?://(localhost|127\.0\.0\.1|webhook)(:[0-9]+)?'
+            --exclude 'hooks\.example\.com'
+            --exclude 'friendbot\.stellar\.org'
+            './**/*.md'
+
+  # ── Docker image ────────────────────────────────────────────────────────────
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build the image
+        run: docker build --tag txwatch:ci .
+
+      - name: Smoke-test the image
+        run: docker run --rm txwatch:ci --version
+
   # ── Build (release) ─────────────────────────────────────────────────────────
   build:
     name: Build (release)

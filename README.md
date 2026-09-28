@@ -8,7 +8,7 @@ Part of the [TxWatch](https://github.com/Tx-wats) ecosystem.
 
 ## What is this?
 
-**TxWatch** sits between the [Stellar Horizon REST API](https://developers.stellar.org/api/horizon)
+**TxWatch** sits between the [Stellar Horizon REST API](https://developers.stellar.org/docs/data/apis/horizon)
 and your infrastructure. It polls every contract you configure, evaluates alert rules against
 each new transaction, and fires a JSON webhook the moment a condition is met — no SDK, no
 subscriptions, no infrastructure beyond a single Rust binary.
@@ -72,7 +72,7 @@ subscriptions, no infrastructure beyond a single Rust binary.
 ```bash
 # 1. Clone
 git clone https://github.com/Tx-wats/core
-cd tx-watch-core
+cd core
 
 # 2. Copy and edit the example config (./txwatch.toml is the default path)
 cp config/example.toml txwatch.toml
@@ -184,7 +184,7 @@ poll_interval_seconds = 10
 
 [[contracts]]
 label       = "My Escrow Contract"
-contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
 network     = "testnet"
 webhook_url = "https://hooks.example.com/my-webhook"
 
@@ -225,6 +225,7 @@ See [docs/alert-rules.md](docs/alert-rules.md) for full details.
 
 ```json
 {
+  "alert_id":         "3f2b9c1d8e7a6b5c4d3e2f1a0b9c8d7e",
   "label":            "My Escrow Contract",
   "contract_id":      "CAAA...",
   "network":          "testnet",
@@ -250,8 +251,16 @@ See [docs/alert-rules.md](docs/alert-rules.md) for full details.
 - `X-TxWatch-Version: <package version>`
 - `X-TxWatch-Signature: sha256=<hmac>` (optional, only when `webhook_secret` is configured — HMAC-SHA256 of the request body)
 - `X-TxWatch-Secret: <webhook_secret>` (optional, only when `webhook_secret` is configured — the raw secret; verify the signature instead where possible)
+- Any custom headers from `webhook_headers` (e.g. `Authorization: Bearer ${TOKEN}`)
+
+**Destinations and formats:** a contract can deliver to several receivers at once via
+`[[contracts.webhooks]]`, and each destination can use `format = "slack"`, `"discord"` or
+`"pagerduty"` instead of the JSON above, so Slack, Discord and PagerDuty work without an adapter
+service. See [Multiple destinations](docs/configuration.md#multiple-destinations) and
+[Webhook formats](docs/configuration.md#webhook-formats).
 
 **Fields:**
+- `alert_id` — stable ID of this alert (same contract, transaction and rule → same ID); use it to de-duplicate redeliveries
 - `rule_type` — stable machine-readable rule variant (e.g. `"LargeTransfer"`, `"HighFee"`); use this for programmatic routing
 - `rule_triggered` — human-readable rule description with parameters (e.g. `"LargeTransfer(>=10000XLM)"`); use this for display
 - `function_name` — the first invoked Soroban function name, or `null` for non-Soroban transactions.
@@ -369,7 +378,7 @@ scrape_configs:
 | Stellar Expert (testnet) | https://stellar.expert/explorer/testnet |
 | Stellar Laboratory | https://laboratory.stellar.org |
 | Friendbot (fund testnet accounts) | https://friendbot.stellar.org |
-| Soroban docs | https://developers.stellar.org/docs/smart-contracts |
+| Soroban docs | https://developers.stellar.org/docs/build/smart-contracts/overview |
 
 ---
 
@@ -388,4 +397,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-MIT
+[Apache-2.0](LICENSE)

@@ -5,13 +5,19 @@
 
 use anyhow::{anyhow, Result};
 use chrono::Utc;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use reqwest::Client;
+use serde::Serialize;
 use sha2::Sha256;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, span, warn, Level};
+use txwatch_config::{WebhookDestination, WebhookHeaders};
 use txwatch_rules::AlertPayload;
+
+pub mod format;
+pub mod kyc_auth;
+pub use kyc_auth::{constant_time_compare, verify_kyc_webhook};
 
 const MAX_RETRIES: u32 = 3;
 
@@ -60,13 +66,129 @@ pub async fn send_webhook(
     url: &str,
     payload: &AlertPayload,
     secret: Option<&str>,
-    mut shutdown: oneshot::Receiver<()>,
+    shutdown: oneshot::Receiver<()>,
 ) -> Result<DeliveryResult> {
-    let mut shutdown_live = true;
     let span = span!(Level::INFO, "send_webhook", contract = %payload.label, rule = %payload.rule_triggered);
     let _enter = span.enter();
 
     let body = serde_json::to_string(payload)?;
+    deliver(client, url, body, secret, &WebhookHeaders::default(), payload, shutdown).await
+}
+
+/// Deliver `payload` to one configured destination: the body is rendered in
+/// the destination's [`format`](txwatch_config::WebhookFormat), and its
+/// custom headers and secret are applied. Retries as [`send_webhook`] does.
+/// Header values and secrets are never logged.
+pub async fn send_to_destination(
+    client: &Client,
+    destination: &WebhookDestination,
+    payload: &AlertPayload,
+    shutdown: oneshot::Receiver<()>,
+) -> Result<DeliveryResult> {
+    let span = span!(
+        Level::INFO,
+        "send_webhook",
+        contract = %payload.label,
+        rule = %payload.rule_triggered,
+        format = %destination.format
+    );
+    let _enter = span.enter();
+
+    let body = format::render_body(
+        destination.format,
+        payload,
+        destination.routing_key.as_deref(),
+    )?;
+    deliver(
+        client,
+        &destination.url,
+        body,
+        destination.secret.as_deref(),
+        &destination.headers,
+        payload,
+        shutdown,
+    deliver(
+        client,
+        url,
+        body,
+        secret,
+        shutdown,
+        &payload.rule_triggered,
+        &payload.transaction_hash,
+    )
+    .await
+}
+
+/// [`send_to_destination`] for callers that have no shutdown signal to honour.
+pub async fn send_to_destination_simple(
+    client: &Client,
+    destination: &WebhookDestination,
+    payload: &AlertPayload,
+) -> Result<DeliveryResult> {
+    let (_tx, rx) = oneshot::channel();
+    send_to_destination(client, destination, payload, rx).await
+}
+
+/// POSTs `body` with retries and exponential backoff. `payload` only labels
+/// log lines.
+/// Maximum number of alerts in one batched POST; larger sets are split.
+pub const MAX_BATCH_SIZE: usize = 50;
+
+/// Body of a batched webhook POST: `{"alerts": [<AlertPayload>, ...]}`.
+#[derive(Debug, Serialize)]
+pub struct AlertBatch<'a> {
+    pub alerts: &'a [AlertPayload],
+}
+
+/// POST `payloads` as one `{"alerts": [...]}` request, with the same retries,
+/// headers and signature as [`send_webhook`] (the signature covers the whole
+/// batch body). At most [`MAX_BATCH_SIZE`] payloads are accepted; split
+/// larger sets with `payloads.chunks(MAX_BATCH_SIZE)`.
+pub async fn send_webhook_batch(
+    client: &Client,
+    url: &str,
+    payloads: &[AlertPayload],
+    secret: Option<&str>,
+    shutdown: oneshot::Receiver<()>,
+) -> Result<DeliveryResult> {
+    if payloads.is_empty() {
+        return Err(anyhow!("cannot send an empty alert batch"));
+    }
+    if payloads.len() > MAX_BATCH_SIZE {
+        return Err(anyhow!(
+            "alert batch of {} exceeds the maximum of {}",
+            payloads.len(),
+            MAX_BATCH_SIZE
+        ));
+    }
+    let span = span!(Level::INFO, "send_webhook_batch", contract = %payloads[0].label, alerts = payloads.len());
+    let _enter = span.enter();
+
+    let body = serde_json::to_string(&AlertBatch { alerts: payloads })?;
+    let rule = format!("batch of {}", payloads.len());
+    let txs = payloads
+        .iter()
+        .map(|p| p.transaction_hash.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    deliver(client, url, body, secret, shutdown, &rule, &txs).await
+}
+
+/// POSTs `body` with retries and exponential backoff; `rule` and `tx` only
+/// label the log lines.
+async fn deliver(
+    client: &Client,
+    url: &str,
+    body: String,
+    secret: Option<&str>,
+    headers: &WebhookHeaders,
+    payload: &AlertPayload,
+    mut shutdown: oneshot::Receiver<()>,
+    mut shutdown: oneshot::Receiver<()>,
+    rule: &str,
+    tx: &str,
+) -> Result<DeliveryResult> {
+    let mut shutdown_live = true;
     let mut last_err: Option<anyhow::Error> = None;
 
     for attempt in 1..=MAX_RETRIES {
@@ -75,8 +197,13 @@ pub async fn send_webhook(
             .unwrap_or_else(|_| Duration::from_secs(0))
             .as_secs();
 
-        let mut req = client
-            .post(url)
+        let mut req = client.post(url);
+        // Custom headers first, so the TxWatch headers below always win
+        // (validation already rejects reserved names).
+        for (name, value) in headers.iter() {
+            req = req.header(name, value);
+        }
+        req = req
             .header("Content-Type", "application/json")
             .header("X-TxWatch-Version", env!("CARGO_PKG_VERSION"))
             .body(body.clone());
@@ -107,8 +234,8 @@ pub async fn send_webhook(
                 info!(
                     timestamp = %ts,
                     url       = %url,
-                    rule      = %payload.rule_triggered,
-                    tx        = %payload.transaction_hash,
+                    rule      = %rule,
+                    tx        = %tx,
                     attempts  = attempt,
                     "webhook delivered"
                 );
@@ -161,13 +288,16 @@ pub async fn send_webhook(
     let err = last_err.unwrap_or_else(|| anyhow!("webhook failed after {} retries", MAX_RETRIES));
     error!(
         url  = %url,
-        rule = %payload.rule_triggered,
-        tx   = %payload.transaction_hash,
+        rule = %rule,
+        tx   = %tx,
         "webhook delivery failed permanently: {}",
         err
     );
     Err(err)
 }
+
+/// Contract ID used by test payloads.
+pub const TEST_CONTRACT_ID: &str = "CTEST000000000000000000000000000000000000000000000000000";
 
 /// Build a synthetic `AlertPayload` suitable for `test-webhook`.
 pub fn test_payload(label: &str, webhook_url: &str) -> AlertPayload {
@@ -176,21 +306,46 @@ pub fn test_payload(label: &str, webhook_url: &str) -> AlertPayload {
         webhook_url,
         "testnet",
         "https://horizon-testnet.stellar.org",
+        Some("https://stellar.expert/explorer/testnet"),
     )
 }
 
+/// Build a synthetic `AlertPayload` for a network. Pass the network's own
+/// `Network::as_str()`, `horizon_base_url()` and `explorer_base_url()`: the
+/// explorer path is not the network name (mainnet is `/explorer/public`). A
+/// network without an explorer links to the transaction on Horizon instead.
+/// Contract ID used by test payloads: a valid contract StrKey (base32, contract
+/// version byte, correct CRC16 checksum) that visibly reads as synthetic, so
+/// receivers that validate or decode addresses accept it.
+pub const TEST_CONTRACT_ID: &str = "CATXWATCHTESTCONTRACTAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA5UI";
+
+/// Build a synthetic `AlertPayload` suitable for `test-webhook`.
+pub fn test_payload(label: &str) -> AlertPayload {
+    test_payload_with_network(label, "testnet", "https://horizon-testnet.stellar.org")
+}
+
 /// Build a synthetic `AlertPayload` with an explicit network name and Horizon base URL.
+///
+/// `label` is used as-is. The webhook URL is deliberately not part of the
+/// payload: receivers often forward alerts to chat, and URLs can embed tokens.
+/// Test payloads are marked with `rule_type = "TestWebhook"` and `"test": true`.
 pub fn test_payload_with_network(
     label: &str,
-    webhook_url: &str,
     network: &str,
     horizon_base_url: &str,
+    explorer_base_url: Option<&str>,
 ) -> AlertPayload {
     let now = Utc::now();
     let tx_hash = "0000000000000000000000000000000000000000000000000000000000000000";
     AlertPayload {
+        // Unique per send, so repeated tests are not de-duplicated by receivers.
+        alert_id: txwatch_rules::alert_id(
+            TEST_CONTRACT_ID,
+            tx_hash,
+            &format!("TestWebhook@{}", now.timestamp_nanos_opt().unwrap_or_default()),
+        ),
         label: label.to_string(),
-        contract_id: "CTEST000000000000000000000000000000000000000000000000000".into(),
+        contract_id: TEST_CONTRACT_ID.into(),
         network: network.to_string(),
         rule_type: "TestWebhook".into(),
         rule_triggered: "TestWebhook".into(),
@@ -202,11 +357,15 @@ pub fn test_payload_with_network(
         timestamp: now.timestamp(),
         timestamp_iso: now.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         horizon_link: format!("{}/transactions/{}", horizon_base_url, tx_hash),
+        explorer_link: match explorer_base_url {
+            Some(explorer) => format!("{}/tx/{}", explorer, tx_hash),
+            None => format!("{}/transactions/{}", horizon_base_url, tx_hash),
+        },
         explorer_link: format!("https://stellar.expert/explorer/{}/tx/{}", network, tx_hash),
         matched_events: vec![],
         suppressed_count: 0,
+        test: true,
     }
-    .with_label(format!("{} (test-webhook to {})", label, webhook_url))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -214,15 +373,16 @@ pub fn test_payload_with_network(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn sample_payload() -> AlertPayload {
         AlertPayload {
+            alert_id: "0123456789abcdef0123456789abcdef".into(),
             label: "Test Contract".into(),
-            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
             network: "testnet".into(),
             rule_type: "AnyTransaction".into(),
             rule_triggered: "AnyTransaction".into(),
@@ -237,6 +397,7 @@ mod tests {
             explorer_link: "https://stellar.expert/explorer/testnet/tx/abc123".into(),
             matched_events: vec![],
             suppressed_count: 0,
+            test: false,
         }
     }
 
@@ -459,17 +620,13 @@ mod tests {
         );
     }
 
-    /// Issue #13: test_payload produces a structurally valid AlertPayload (56-char contract ID).
+    /// Issue #13: test_payload produces a structurally valid AlertPayload.
     #[test]
     fn test_payload_is_structurally_valid() {
-        let p = test_payload("My Contract", "https://example.com/hook");
-        assert!(p.label.contains("My Contract"));
+        let p = test_payload("My Contract");
+        assert_eq!(p.rule_type, "TestWebhook");
         assert_eq!(p.rule_triggered, "TestWebhook");
-        assert_eq!(p.contract_id.len(), 56, "contract_id must be 56 characters");
-        assert!(
-            p.contract_id.starts_with('C'),
-            "contract_id must start with 'C'"
-        );
+        assert!(p.test, "test payloads must be marked as such");
         assert!(
             p.horizon_link.contains("/transactions/"),
             "horizon_link must contain /transactions/"
@@ -483,16 +640,85 @@ mod tests {
     /// Issue #13: test_payload_with_network derives links from the supplied network config.
     #[test]
     fn test_payload_with_network_derives_links_from_config() {
+        let network = txwatch_config::Network::Mainnet;
         let p = test_payload_with_network(
             "Label",
             "https://example.com/hook",
-            "mainnet",
-            "https://horizon.stellar.org",
+            network.as_str(),
+            network.horizon_base_url(),
+            network.explorer_base_url(),
         );
+        let p = test_payload_with_network("Label", "mainnet", "https://horizon.stellar.org");
         assert!(p
             .horizon_link
             .starts_with("https://horizon.stellar.org/transactions/"));
-        assert!(p.explorer_link.contains("/mainnet/"));
+        assert!(
+            p.explorer_link
+                .starts_with("https://stellar.expert/explorer/public/tx/"),
+            "mainnet explorer path is /explorer/public/, got {}",
+            p.explorer_link
+        );
+    }
+
+    #[test]
+    fn test_payload_with_network_uses_futurenet_explorer() {
+        let network = txwatch_config::Network::Futurenet;
+        let p = test_payload_with_network(
+            "Label",
+            "https://example.com/hook",
+            network.as_str(),
+            network.horizon_base_url(),
+            network.explorer_base_url(),
+        );
+        assert_eq!(p.network, "futurenet");
+        assert!(p
+            .horizon_link
+            .starts_with("https://horizon-futurenet.stellar.org/transactions/"));
+        assert!(
+            p.explorer_link
+                .starts_with("https://stellar.expert/explorer/futurenet/tx/"),
+            "got {}",
+            p.explorer_link
+        );
+    }
+
+    #[test]
+    fn test_payload_without_explorer_links_to_horizon() {
+        let p = test_payload_with_network(
+            "Label",
+            "https://example.com/hook",
+            "custom",
+            "http://localhost:8000",
+            None,
+        );
+        assert_eq!(p.explorer_link, p.horizon_link);
+        assert!(p
+            .explorer_link
+            .starts_with("http://localhost:8000/transactions/"));
+    }
+
+    /// The label is passed through unchanged; the webhook URL (which may embed
+    /// a token) never appears anywhere in the payload.
+    #[test]
+    fn test_payload_keeps_label_and_never_includes_webhook_url() {
+        let p = test_payload("My Contract");
+        assert_eq!(p.label, "My Contract");
+
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(!json.contains("test-webhook to"), "got: {}", json);
+        assert!(!json.contains("example.com"), "got: {}", json);
+        assert!(json.contains(r#""test":true"#), "got: {}", json);
+    }
+
+    /// The synthetic contract ID passes the same StrKey decoding (alphabet,
+    /// version byte, CRC16 checksum) that txwatch-config provides.
+    #[test]
+    fn test_payload_contract_id_is_a_valid_strkey() {
+        let p = test_payload("My Contract");
+        assert_eq!(p.contract_id, TEST_CONTRACT_ID);
+        txwatch_config::validate_contract_id(&p.contract_id)
+            .unwrap_or_else(|e| panic!("{} is not a valid contract StrKey: {}", p.contract_id, e));
+        assert!(p.contract_id.contains("TXWATCHTEST"));
     }
 
     #[tokio::test]
@@ -529,5 +755,111 @@ mod tests {
         let url = format!("{}/hook", server.uri());
         let result = send_webhook(&client, &url, &sample_payload(), None, dummy_shutdown()).await;
         assert!(result.is_ok());
+    }
+
+    // ── Destinations ─────────────────────────────────────────────────────────
+
+    fn destination(url: String, format: txwatch_config::WebhookFormat) -> WebhookDestination {
+        WebhookDestination {
+            url,
+            secret: None,
+            format,
+            headers: WebhookHeaders::default(),
+            routing_key: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn destination_sends_custom_headers_and_keeps_txwatch_headers() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .and(header("Authorization", "Bearer t0ken"))
+            .and(header("X-Api-Key", "k"))
+            .and(header("Content-Type", "application/json"))
+            .and(header("X-TxWatch-Version", env!("CARGO_PKG_VERSION")))
+    // ── Batched delivery ─────────────────────────────────────────────────────
+
+    fn payload_for(tx: &str) -> AlertPayload {
+        let mut p = sample_payload();
+        p.transaction_hash = tx.into();
+        p
+    }
+
+    #[tokio::test]
+    async fn batch_posts_alerts_array_once_with_signature_over_the_batch() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut dest = destination(
+            format!("{}/hook", server.uri()),
+            txwatch_config::WebhookFormat::Txwatch,
+        );
+        dest.headers.0.insert("Authorization".into(), "Bearer t0ken".into());
+        dest.headers.0.insert("X-Api-Key".into(), "k".into());
+        send_to_destination_simple(&build_client().unwrap(), &dest, &sample_payload())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn destination_renders_its_format_and_signs_the_rendered_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let mut dest = destination(server.uri(), txwatch_config::WebhookFormat::Pagerduty);
+        dest.routing_key = Some("R0UT1NG".into());
+        dest.secret = Some("s3".into());
+        send_to_destination_simple(&build_client().unwrap(), &dest, &sample_payload())
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["routing_key"], "R0UT1NG");
+        assert_eq!(body["event_action"], "trigger");
+        assert_eq!(body["dedup_key"], sample_payload().alert_id);
+        let payloads = vec![payload_for("tx1"), payload_for("tx2")];
+        let client = build_client().unwrap();
+        let url = format!("{}/hook", server.uri());
+        let delivery = send_webhook_batch(&client, &url, &payloads, Some("s3"), dummy_shutdown())
+            .await
+            .unwrap();
+        assert_eq!(delivery.attempts, 1);
+
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let alerts = body["alerts"].as_array().expect("alerts array");
+        assert_eq!(alerts.len(), 2);
+        assert_eq!(alerts[0]["transaction_hash"], "tx1");
+        assert_eq!(alerts[1]["transaction_hash"], "tx2");
+        assert_eq!(body.as_object().unwrap().len(), 1, "only the alerts key");
+
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"s3").unwrap();
+        mac.update(&requests[0].body);
+        let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        assert_eq!(requests[0].headers.get("x-txwatch-signature").unwrap(), &expected);
+    }
+
+    #[tokio::test]
+    async fn batch_rejects_empty_and_oversized_batches() {
+        let client = build_client().unwrap();
+        let url = "http://127.0.0.1:9/hook";
+        assert!(send_webhook_batch(&client, url, &[], None, dummy_shutdown())
+            .await
+            .is_err());
+        let too_many: Vec<_> = (0..=MAX_BATCH_SIZE).map(|i| payload_for(&i.to_string())).collect();
+        let err = send_webhook_batch(&client, url, &too_many, None, dummy_shutdown())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("exceeds the maximum of 50"), "got: {}", err);
     }
 }
