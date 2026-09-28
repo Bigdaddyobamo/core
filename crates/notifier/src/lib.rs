@@ -5,8 +5,9 @@
 
 use anyhow::{anyhow, Result};
 use chrono::Utc;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use reqwest::Client;
+use serde::Serialize;
 use sha2::Sha256;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
@@ -60,13 +61,79 @@ pub async fn send_webhook(
     url: &str,
     payload: &AlertPayload,
     secret: Option<&str>,
-    mut shutdown: oneshot::Receiver<()>,
+    shutdown: oneshot::Receiver<()>,
 ) -> Result<DeliveryResult> {
-    let mut shutdown_live = true;
     let span = span!(Level::INFO, "send_webhook", contract = %payload.label, rule = %payload.rule_triggered);
     let _enter = span.enter();
 
     let body = serde_json::to_string(payload)?;
+    deliver(
+        client,
+        url,
+        body,
+        secret,
+        shutdown,
+        &payload.rule_triggered,
+        &payload.transaction_hash,
+    )
+    .await
+}
+
+/// Maximum number of alerts in one batched POST; larger sets are split.
+pub const MAX_BATCH_SIZE: usize = 50;
+
+/// Body of a batched webhook POST: `{"alerts": [<AlertPayload>, ...]}`.
+#[derive(Debug, Serialize)]
+pub struct AlertBatch<'a> {
+    pub alerts: &'a [AlertPayload],
+}
+
+/// POST `payloads` as one `{"alerts": [...]}` request, with the same retries,
+/// headers and signature as [`send_webhook`] (the signature covers the whole
+/// batch body). At most [`MAX_BATCH_SIZE`] payloads are accepted; split
+/// larger sets with `payloads.chunks(MAX_BATCH_SIZE)`.
+pub async fn send_webhook_batch(
+    client: &Client,
+    url: &str,
+    payloads: &[AlertPayload],
+    secret: Option<&str>,
+    shutdown: oneshot::Receiver<()>,
+) -> Result<DeliveryResult> {
+    if payloads.is_empty() {
+        return Err(anyhow!("cannot send an empty alert batch"));
+    }
+    if payloads.len() > MAX_BATCH_SIZE {
+        return Err(anyhow!(
+            "alert batch of {} exceeds the maximum of {}",
+            payloads.len(),
+            MAX_BATCH_SIZE
+        ));
+    }
+    let span = span!(Level::INFO, "send_webhook_batch", contract = %payloads[0].label, alerts = payloads.len());
+    let _enter = span.enter();
+
+    let body = serde_json::to_string(&AlertBatch { alerts: payloads })?;
+    let rule = format!("batch of {}", payloads.len());
+    let txs = payloads
+        .iter()
+        .map(|p| p.transaction_hash.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    deliver(client, url, body, secret, shutdown, &rule, &txs).await
+}
+
+/// POSTs `body` with retries and exponential backoff; `rule` and `tx` only
+/// label the log lines.
+async fn deliver(
+    client: &Client,
+    url: &str,
+    body: String,
+    secret: Option<&str>,
+    mut shutdown: oneshot::Receiver<()>,
+    rule: &str,
+    tx: &str,
+) -> Result<DeliveryResult> {
+    let mut shutdown_live = true;
     let mut last_err: Option<anyhow::Error> = None;
 
     for attempt in 1..=MAX_RETRIES {
@@ -107,8 +174,8 @@ pub async fn send_webhook(
                 info!(
                     timestamp = %ts,
                     url       = %url,
-                    rule      = %payload.rule_triggered,
-                    tx        = %payload.transaction_hash,
+                    rule      = %rule,
+                    tx        = %tx,
                     attempts  = attempt,
                     "webhook delivered"
                 );
@@ -161,28 +228,31 @@ pub async fn send_webhook(
     let err = last_err.unwrap_or_else(|| anyhow!("webhook failed after {} retries", MAX_RETRIES));
     error!(
         url  = %url,
-        rule = %payload.rule_triggered,
-        tx   = %payload.transaction_hash,
+        rule = %rule,
+        tx   = %tx,
         "webhook delivery failed permanently: {}",
         err
     );
     Err(err)
 }
 
+/// Contract ID used by test payloads: a valid contract StrKey (base32, contract
+/// version byte, correct CRC16 checksum) that visibly reads as synthetic, so
+/// receivers that validate or decode addresses accept it.
+pub const TEST_CONTRACT_ID: &str = "CATXWATCHTESTCONTRACTAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA5UI";
+
 /// Build a synthetic `AlertPayload` suitable for `test-webhook`.
-pub fn test_payload(label: &str, webhook_url: &str) -> AlertPayload {
-    test_payload_with_network(
-        label,
-        webhook_url,
-        "testnet",
-        "https://horizon-testnet.stellar.org",
-    )
+pub fn test_payload(label: &str) -> AlertPayload {
+    test_payload_with_network(label, "testnet", "https://horizon-testnet.stellar.org")
 }
 
 /// Build a synthetic `AlertPayload` with an explicit network name and Horizon base URL.
+///
+/// `label` is used as-is. The webhook URL is deliberately not part of the
+/// payload: receivers often forward alerts to chat, and URLs can embed tokens.
+/// Test payloads are marked with `rule_type = "TestWebhook"` and `"test": true`.
 pub fn test_payload_with_network(
     label: &str,
-    webhook_url: &str,
     network: &str,
     horizon_base_url: &str,
 ) -> AlertPayload {
@@ -190,7 +260,7 @@ pub fn test_payload_with_network(
     let tx_hash = "0000000000000000000000000000000000000000000000000000000000000000";
     AlertPayload {
         label: label.to_string(),
-        contract_id: "CTEST000000000000000000000000000000000000000000000000000".into(),
+        contract_id: TEST_CONTRACT_ID.into(),
         network: network.to_string(),
         rule_type: "TestWebhook".into(),
         rule_triggered: "TestWebhook".into(),
@@ -203,8 +273,8 @@ pub fn test_payload_with_network(
         timestamp_iso: now.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         horizon_link: format!("{}/transactions/{}", horizon_base_url, tx_hash),
         explorer_link: format!("https://stellar.expert/explorer/{}/tx/{}", network, tx_hash),
+        test: true,
     }
-    .with_label(format!("{} (test-webhook to {})", label, webhook_url))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -212,7 +282,7 @@ pub fn test_payload_with_network(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -220,7 +290,7 @@ mod tests {
     fn sample_payload() -> AlertPayload {
         AlertPayload {
             label: "Test Contract".into(),
-            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
             network: "testnet".into(),
             rule_type: "AnyTransaction".into(),
             rule_triggered: "AnyTransaction".into(),
@@ -233,6 +303,7 @@ mod tests {
             timestamp_iso: "2023-11-15T03:13:20Z".into(),
             horizon_link: "https://horizon-testnet.stellar.org/transactions/abc123".into(),
             explorer_link: "https://stellar.expert/explorer/testnet/tx/abc123".into(),
+            test: false,
         }
     }
 
@@ -455,17 +526,13 @@ mod tests {
         );
     }
 
-    /// Issue #13: test_payload produces a structurally valid AlertPayload (56-char contract ID).
+    /// Issue #13: test_payload produces a structurally valid AlertPayload.
     #[test]
     fn test_payload_is_structurally_valid() {
-        let p = test_payload("My Contract", "https://example.com/hook");
-        assert!(p.label.contains("My Contract"));
+        let p = test_payload("My Contract");
+        assert_eq!(p.rule_type, "TestWebhook");
         assert_eq!(p.rule_triggered, "TestWebhook");
-        assert_eq!(p.contract_id.len(), 56, "contract_id must be 56 characters");
-        assert!(
-            p.contract_id.starts_with('C'),
-            "contract_id must start with 'C'"
-        );
+        assert!(p.test, "test payloads must be marked as such");
         assert!(
             p.horizon_link.contains("/transactions/"),
             "horizon_link must contain /transactions/"
@@ -479,16 +546,35 @@ mod tests {
     /// Issue #13: test_payload_with_network derives links from the supplied network config.
     #[test]
     fn test_payload_with_network_derives_links_from_config() {
-        let p = test_payload_with_network(
-            "Label",
-            "https://example.com/hook",
-            "mainnet",
-            "https://horizon.stellar.org",
-        );
+        let p = test_payload_with_network("Label", "mainnet", "https://horizon.stellar.org");
         assert!(p
             .horizon_link
             .starts_with("https://horizon.stellar.org/transactions/"));
         assert!(p.explorer_link.contains("/mainnet/"));
+    }
+
+    /// The label is passed through unchanged; the webhook URL (which may embed
+    /// a token) never appears anywhere in the payload.
+    #[test]
+    fn test_payload_keeps_label_and_never_includes_webhook_url() {
+        let p = test_payload("My Contract");
+        assert_eq!(p.label, "My Contract");
+
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(!json.contains("test-webhook to"), "got: {}", json);
+        assert!(!json.contains("example.com"), "got: {}", json);
+        assert!(json.contains(r#""test":true"#), "got: {}", json);
+    }
+
+    /// The synthetic contract ID passes the same StrKey decoding (alphabet,
+    /// version byte, CRC16 checksum) that txwatch-config provides.
+    #[test]
+    fn test_payload_contract_id_is_a_valid_strkey() {
+        let p = test_payload("My Contract");
+        assert_eq!(p.contract_id, TEST_CONTRACT_ID);
+        txwatch_config::validate_contract_id(&p.contract_id)
+            .unwrap_or_else(|e| panic!("{} is not a valid contract StrKey: {}", p.contract_id, e));
+        assert!(p.contract_id.contains("TXWATCHTEST"));
     }
 
     #[tokio::test]
@@ -525,5 +611,59 @@ mod tests {
         let url = format!("{}/hook", server.uri());
         let result = send_webhook(&client, &url, &sample_payload(), None, dummy_shutdown()).await;
         assert!(result.is_ok());
+    }
+
+    // ── Batched delivery ─────────────────────────────────────────────────────
+
+    fn payload_for(tx: &str) -> AlertPayload {
+        let mut p = sample_payload();
+        p.transaction_hash = tx.into();
+        p
+    }
+
+    #[tokio::test]
+    async fn batch_posts_alerts_array_once_with_signature_over_the_batch() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let payloads = vec![payload_for("tx1"), payload_for("tx2")];
+        let client = build_client().unwrap();
+        let url = format!("{}/hook", server.uri());
+        let delivery = send_webhook_batch(&client, &url, &payloads, Some("s3"), dummy_shutdown())
+            .await
+            .unwrap();
+        assert_eq!(delivery.attempts, 1);
+
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let alerts = body["alerts"].as_array().expect("alerts array");
+        assert_eq!(alerts.len(), 2);
+        assert_eq!(alerts[0]["transaction_hash"], "tx1");
+        assert_eq!(alerts[1]["transaction_hash"], "tx2");
+        assert_eq!(body.as_object().unwrap().len(), 1, "only the alerts key");
+
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"s3").unwrap();
+        mac.update(&requests[0].body);
+        let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        assert_eq!(requests[0].headers.get("x-txwatch-signature").unwrap(), &expected);
+    }
+
+    #[tokio::test]
+    async fn batch_rejects_empty_and_oversized_batches() {
+        let client = build_client().unwrap();
+        let url = "http://127.0.0.1:9/hook";
+        assert!(send_webhook_batch(&client, url, &[], None, dummy_shutdown())
+            .await
+            .is_err());
+        let too_many: Vec<_> = (0..=MAX_BATCH_SIZE).map(|i| payload_for(&i.to_string())).collect();
+        let err = send_webhook_batch(&client, url, &too_many, None, dummy_shutdown())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("exceeds the maximum of 50"), "got: {}", err);
     }
 }

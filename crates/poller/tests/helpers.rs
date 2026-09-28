@@ -4,13 +4,14 @@ use txwatch_config::{AlertRule, Network, WatchedContract};
 pub fn contract(webhook_url: &str, rules: Vec<AlertRule>) -> WatchedContract {
     WatchedContract {
         label: "Integration Test Contract".into(),
-        contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+        contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
         network: Network::Testnet,
         rules,
         webhook_url: webhook_url.to_string(),
         webhook_secret: None,
         poll_interval_seconds: None,
         horizon_base_url_override: None,
+        batch_alerts: false,
     }
 }
 
