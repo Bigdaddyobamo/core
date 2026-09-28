@@ -3,7 +3,7 @@ poll_interval_seconds = 10
 [[contracts]]
 label       = "My Escrow Contract"
 # Replace with your actual Soroban contract address (56 characters, starts with 'C')
-contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
 network     = "testnet"
 webhook_url = "https://hooks.example.com/my-webhook"
 # webhook_secret = "my-secret-token"   # optional: HMAC-SHA256 signature sent as X-TxWatch-Signature header
@@ -22,7 +22,7 @@ webhook_url = "https://hooks.example.com/my-webhook"
 [[contracts]]
 label       = "Mainnet Vault"
 # Replace with your actual Soroban contract address (56 characters, starts with 'C')
-contract_id = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+contract_id = "CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526"
 network     = "mainnet"
 webhook_url = "https://hooks.example.com/vault-webhook"
 
@@ -43,7 +43,7 @@ webhook_url = "https://hooks.example.com/vault-webhook"
 [[contracts]]
 label       = "Mainnet Bridge Gateway"
 # Replace with your actual Soroban contract address (56 characters, starts with 'C')
-contract_id = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+contract_id = "CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ"
 # network must be one of: mainnet / testnet / futurenet
 network     = "mainnet"
 # webhook_url can differ per contract — this allows routing alerts to different endpoints

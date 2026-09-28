@@ -3,4 +3,3 @@ target/
 *.md
 .github/
 .gitignore
-Cargo.lock

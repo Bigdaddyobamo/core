@@ -19,7 +19,7 @@ poll_interval_seconds = 10
 
 [[contracts]]
 label       = "Replay Contract"
-contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
 network     = "testnet"
 webhook_url = "{webhook_url}"
 

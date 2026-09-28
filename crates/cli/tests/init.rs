@@ -5,7 +5,7 @@ use std::{
     process::{Command, Output, Stdio},
 };
 
-const CONTRACT_ID: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const CONTRACT_ID: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
 
 fn txwatch() -> Command {
     Command::new(env!("CARGO_BIN_EXE_txwatch"))
