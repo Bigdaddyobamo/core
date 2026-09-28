@@ -168,7 +168,9 @@ All matching rules fire; there is no short-circuit.
 | `rule_triggered`   | string      | yes            | Human-readable rule description          |
 | `transaction_hash` | string      | yes            | Stellar transaction hash                 |
 | `function_name`    | string/null | no             | Soroban function name if available; `null` indicates a non-Soroban transaction |
-| `amount_xlm`       | u64/null    | no             | Transfer amount in XLM if available      |
+| `amount_xlm`       | u64/null    | no             | Transfer amount in whole XLM (truncated). Kept for backward compatibility — use `amount_xlm_decimal` for precise accounting |
+| `amount_stroops`   | u64/null    | no             | Raw transfer amount in stroops (1 XLM = 10,000,000 stroops), or `null` |
+| `amount_xlm_decimal` | string/null | no           | Transfer amount as a decimal string with 7 fractional digits (e.g. `"9999.9900000"`), or `null` |
 | `timestamp`        | i64         | yes            | Unix timestamp (seconds) of transaction  |
 | `horizon_link`     | string      | yes            | Direct link to transaction on Horizon    |
 | `explorer_link`    | string      | yes            | Stellar Expert explorer link for the transaction |
@@ -203,11 +205,11 @@ The webhook payload includes two rule-related fields:
 
 1. Add a variant to `AlertRule` in `crates/config/src/lib.rs`
 2. Add field validation in `AlertRule::validate()` in the same file
-3. Add the match arm in `eval_rule()` in `crates/rules/src/lib.rs`
-4. Add the label string in `rule_label()` in the same file
-5. Add a stable `rule_type` string in `rule_type()` in the same file
+3. Add the match arm in `AlertRule::label()` in the same file
+4. Add the match arm in `AlertRule::rule_type()` in the same file
+5. Add the match arm in `eval_rule()` in `crates/rules/src/lib.rs`
 6. Add unit tests in `crates/rules/src/lib.rs`
 7. Update the rule type table in this section
 8. Update the webhook payload example in README.md (if adding a new example)
 
-No other crates need changes.
+**Note:** `rule_triggered` and `rule_type` in webhook payloads are now produced by `AlertRule::label()` and `AlertRule::rule_type()` from `txwatch-config`. There are no duplicate implementations in `txwatch-rules`. A single change to `AlertRule::label()` is reflected consistently in both CLI `validate` output and webhook payloads.

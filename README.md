@@ -235,6 +235,8 @@ See [docs/alert-rules.md](docs/alert-rules.md) for full details.
   "function_name":    "transfer",
   "function_names":   ["transfer"],
   "amount_xlm":       15000,
+  "amount_stroops":   150000000000000,
+  "amount_xlm_decimal": "15000.0000000",
   "fee_charged_stroops": 50000,
   "timestamp":        1705316096,
   "timestamp_iso":    "2024-01-15T12:00:00Z",
@@ -265,6 +267,9 @@ service. See [Multiple destinations](docs/configuration.md#multiple-destinations
 - `rule_triggered` — human-readable rule description with parameters (e.g. `"LargeTransfer(>=10000XLM)"`); use this for display
 - `function_name` — the first invoked Soroban function name, or `null` for non-Soroban transactions.
 - `function_names` — all invoked Soroban function names in the transaction (may contain multiple entries for multi-op transactions).
+- `amount_xlm` — transfer amount in whole XLM (truncated integer, e.g. `9999` for a 9,999.99 XLM transfer), or `null`. Kept for backward compatibility — use `amount_xlm_decimal` for precise accounting.
+- `amount_stroops` — raw transfer amount in stroops (1 XLM = 10,000,000 stroops), or `null`.
+- `amount_xlm_decimal` — transfer amount as a decimal string with 7 fractional digits (e.g. `"9999.9900000"`), or `null`. Use this instead of `amount_xlm` when precision matters.
 - `matched_events` — for `EventEmitted` alerts, the matching contract events (`contract_id`, `topics`, `data`, as decoded `ScVal` JSON); empty for other rules.
 - `suppressed_count` — matches of this rule suppressed by its `cooldown_seconds` since the previous alert; `0` otherwise.
 - `horizon_link` — direct Horizon REST API URL for the transaction (e.g. `https://horizon-testnet.stellar.org/transactions/<hash>`); useful for fetching raw XDR or operation details programmatically.

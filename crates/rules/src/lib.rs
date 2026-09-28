@@ -208,9 +208,16 @@ pub struct AlertPayload {
     pub function_name: Option<String>,
     /// All invoked function names in this transaction.
     pub function_names: Vec<String>,
-    /// Amount in whole XLM (stroops / 10_000_000), present for LargeTransfer.
+    /// Amount in whole XLM (truncated, stroops / 10_000_000), present for
+    /// LargeTransfer. Kept for backward compatibility — use `amount_xlm_decimal`
+    /// for precise accounting (e.g. 9,999.99 XLM appears here as `9999`).
     #[serde(rename = "amount_xlm")]
     pub amount_xlm: Option<u64>,
+    /// Transfer amount in stroops (1 XLM = 10_000_000 stroops).
+    pub amount_stroops: Option<u64>,
+    /// Transfer amount as a decimal string with 7 fractional digits
+    /// (e.g. `"9999.9900000"`), or `null` when no amount is present.
+    pub amount_xlm_decimal: Option<String>,
     /// Fee charged in stroops.
     pub fee_charged_stroops: Option<u64>,
     /// Unix timestamp (seconds).
@@ -264,10 +271,25 @@ pub fn evaluate<R: AsRef<AlertRule>>(
     rules: &[R],
     tx: &EnrichedTransaction,
 ) -> Vec<AlertPayload> {
+    // #45: Trim trailing slashes so callers that pass "https://host/" do not
+    // produce double slashes in the generated links.
+    let horizon_base = horizon_base.trim_end_matches('/');
+    let explorer_base = explorer_base.trim_end_matches('/');
+
+    let horizon_link = format!("{}/transactions/{}", horizon_base, tx.hash);
+    let explorer_link = format!("{}/tx/{}", explorer_base, tx.hash);
     let horizon_link = format!("{}/transactions/{}", horizon_base.trim_end_matches('/'), tx.hash);
     let explorer_link = format!("{}/tx/{}", explorer_base.trim_end_matches('/'), tx.hash);
     let timestamp = tx.timestamp.timestamp();
     let timestamp_iso = tx.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
+    // #46: Compute both forms of the amount once per transaction.
+    let amount_xlm = tx.amount_stroops.map(|s| s / 10_000_000);
+    let amount_xlm_decimal = tx.amount_stroops.map(|s| {
+        let whole = s / 10_000_000;
+        let frac = s % 10_000_000;
+        format!("{}.{:07}", whole, frac)
+    });
 
     rules
         .iter()
@@ -278,12 +300,15 @@ pub fn evaluate<R: AsRef<AlertRule>>(
                 label: label.to_string(),
                 contract_id: contract_id.to_string(),
                 network: network.to_string(),
-                rule_type: rule_type(rule),
-                rule_triggered: rule_label(rule),
+                // #44: Use the single canonical implementations from txwatch-config.
+                rule_type: rule.rule_type().to_string(),
+                rule_triggered: rule.label(),
                 transaction_hash: tx.hash.clone(),
                 function_name: tx.function_names.first().cloned(),
                 function_names: tx.function_names.clone(),
-                amount_xlm: tx.amount_stroops.map(|s| s / 10_000_000),
+                amount_xlm,
+                amount_stroops: tx.amount_stroops,
+                amount_xlm_decimal: amount_xlm_decimal.clone(),
                 fee_charged_stroops: tx.fee_charged_stroops,
                 timestamp,
                 timestamp_iso: timestamp_iso.clone(),
@@ -297,7 +322,7 @@ pub fn evaluate<R: AsRef<AlertRule>>(
             Err(e) => {
                 tracing::warn!(
                     tx = %tx.hash,
-                    rule = %rule_label(rule),
+                    rule = %rule.label(),
                     error = %e,
                     "rule evaluation error — skipping"
                 );
@@ -307,23 +332,23 @@ pub fn evaluate<R: AsRef<AlertRule>>(
         .collect()
 }
 
-// NOTE: When adding a new AlertRule variant, update both `eval_rule()` and
-// `rule_label()` together. Rust's exhaustive matching catches missing arms,
-// but this convention should be preserved for new rule variants.
+// NOTE: When adding a new AlertRule variant, update both `eval_rule()` in this
+// file and `AlertRule::label()` / `AlertRule::rule_type()` in txwatch-config together.
+// Rust's exhaustive matching catches missing arms in eval_rule automatically.
 fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
     Ok(match rule {
         AlertRule::AnyTransaction => true,
 
         AlertRule::TransactionFailed => !tx.successful,
 
-        AlertRule::LargeTransfer { threshold_xlm } => {
-            let threshold_stroops = threshold_xlm
-                .checked_mul(10_000_000)
-                .context("threshold_xlm overflow when converting to stroops")?;
-            tx.amount_stroops
-                .map(|s| s >= threshold_stroops)
-                .unwrap_or(false)
-        }
+        // #43: threshold_stroops is pre-computed once during validation; no
+        // per-evaluation multiplication or overflow path needed.
+        AlertRule::LargeTransfer {
+            threshold_stroops, ..
+        } => tx
+            .amount_stroops
+            .map(|s| s >= *threshold_stroops)
+            .unwrap_or(false),
 
         AlertRule::FunctionCalled { function_name } => tx
             .function_names
@@ -578,38 +603,143 @@ mod tests {
         assert_eq!(payloads[0].rule_triggered, "AnyTransaction");
     }
 
+    /// #44: rule_triggered in the payload and rule.label() must agree for every variant.
+    /// This guards against CLI validate and webhook payloads drifting from each other.
     #[test]
     fn rule_label_formats_are_stable() {
-        assert_eq!(rule_label(&AlertRule::AnyTransaction), "AnyTransaction");
+        assert_eq!(AlertRule::AnyTransaction.label(), "AnyTransaction");
+        assert_eq!(AlertRule::TransactionFailed.label(), "TransactionFailed");
         assert_eq!(
-            rule_label(&AlertRule::TransactionFailed),
-            "TransactionFailed"
-        );
-        assert_eq!(
-            rule_label(&AlertRule::LargeTransfer {
-                threshold_xlm: 10_000
-            }),
+            AlertRule::LargeTransfer {
+                threshold_xlm: 10_000,
+                threshold_stroops: 10_000 * 10_000_000,
+            }
+            .label(),
             "LargeTransfer(>=10000XLM)"
         );
         assert_eq!(
-            rule_label(&AlertRule::FunctionCalled {
+            AlertRule::FunctionCalled {
                 function_name: "withdraw".into()
-            }),
+            }
+            .label(),
             "FunctionCalled(withdraw)"
         );
         assert_eq!(
-            rule_label(&AlertRule::AdminFunctionCalled {
+            AlertRule::AdminFunctionCalled {
                 function_names: vec!["set_admin".into(), "upgrade".into()]
-            }),
+            }
+            .label(),
             "AdminFunctionCalled([set_admin, upgrade])"
         );
         assert_eq!(
-            rule_label(&AlertRule::HighFee {
+            AlertRule::HighFee {
                 threshold_stroops: 10_000,
                 threshold_xlm: None
-            }),
+            }
+            .label(),
             "HighFee(>=10000 stroops)"
         );
+    }
+
+    /// #44: rule_type() must agree with the rule_type field in the webhook payload.
+    #[test]
+    fn rule_type_formats_are_stable() {
+        assert_eq!(AlertRule::AnyTransaction.rule_type(), "AnyTransaction");
+        assert_eq!(AlertRule::TransactionFailed.rule_type(), "TransactionFailed");
+        assert_eq!(
+            AlertRule::LargeTransfer {
+                threshold_xlm: 1,
+                threshold_stroops: 10_000_000,
+            }
+            .rule_type(),
+            "LargeTransfer"
+        );
+        assert_eq!(
+            AlertRule::FunctionCalled {
+                function_name: "f".into()
+            }
+            .rule_type(),
+            "FunctionCalled"
+        );
+        assert_eq!(
+            AlertRule::AdminFunctionCalled {
+                function_names: vec!["f".into()]
+            }
+            .rule_type(),
+            "AdminFunctionCalled"
+        );
+        assert_eq!(
+            AlertRule::HighFee {
+                threshold_stroops: 1,
+                threshold_xlm: None
+            }
+            .rule_type(),
+            "HighFee"
+        );
+    }
+
+    /// #44: payload rule_triggered must equal AlertRule::label() for every variant.
+    #[test]
+    fn payload_rule_triggered_matches_alert_rule_label_for_every_variant() {
+        let rules: &[AlertRule] = &[
+            AlertRule::AnyTransaction,
+            AlertRule::TransactionFailed,
+            AlertRule::LargeTransfer {
+                threshold_xlm: 10_000,
+                threshold_stroops: 10_000 * 10_000_000,
+            },
+            AlertRule::FunctionCalled {
+                function_name: "withdraw".into(),
+            },
+            AlertRule::AdminFunctionCalled {
+                function_names: vec!["set_admin".into(), "upgrade".into()],
+            },
+            AlertRule::HighFee {
+                threshold_stroops: 50_000,
+                threshold_xlm: None,
+            },
+        ];
+        // A transaction that will satisfy every rule.
+        let mut tx = EnrichedTransaction {
+            hash: "abc123".into(),
+            timestamp: "2024-01-15T12:00:00Z".parse().unwrap(),
+            successful: false,
+            paging_token: "1".into(),
+            function_names: vec!["withdraw".into(), "set_admin".into()],
+            amount_stroops: Some(100_000_000_000_000),
+            fee_charged_stroops: Some(50_000),
+        };
+        tx.successful = false; // satisfies TransactionFailed
+
+        for rule in rules {
+            let payloads = evaluate(
+                "L",
+                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "testnet",
+                "https://horizon-testnet.stellar.org",
+                "https://stellar.expert/explorer/testnet",
+                std::slice::from_ref(rule),
+                &tx,
+            );
+            assert_eq!(
+                payloads.len(),
+                1,
+                "rule {:?} should fire on the test transaction",
+                rule.rule_type()
+            );
+            assert_eq!(
+                payloads[0].rule_triggered,
+                rule.label(),
+                "payload rule_triggered must equal AlertRule::label() for {:?}",
+                rule.rule_type()
+            );
+            assert_eq!(
+                payloads[0].rule_type,
+                rule.rule_type(),
+                "payload rule_type must equal AlertRule::rule_type() for {:?}",
+                rule.rule_type()
+            );
+        }
     }
 
     #[test]
@@ -633,6 +763,7 @@ mod tests {
         let payloads = run(
             &[AlertRule::LargeTransfer {
                 threshold_xlm: 10_000,
+                threshold_stroops: 10_000 * 10_000_000,
             }],
             &tx,
         );
@@ -646,6 +777,7 @@ mod tests {
         let payloads = run(
             &[AlertRule::LargeTransfer {
                 threshold_xlm: 10_000,
+                threshold_stroops: 10_000 * 10_000_000,
             }],
             &tx,
         );
@@ -655,23 +787,14 @@ mod tests {
     #[test]
     fn large_transfer_no_amount_does_not_fire() {
         let tx = make_tx(true, &[], None);
-        let payloads = run(&[AlertRule::LargeTransfer { threshold_xlm: 1 }], &tx);
-        assert!(payloads.is_empty());
-    }
-
-    #[test]
-    fn large_transfer_overflow_is_handled_gracefully() {
-        let tx = make_tx(true, &[], Some(1_000_000_000_000_000));
         let payloads = run(
             &[AlertRule::LargeTransfer {
-                threshold_xlm: u64::MAX,
+                threshold_xlm: 1,
+                threshold_stroops: 10_000_000,
             }],
             &tx,
         );
-        assert!(
-            payloads.is_empty(),
-            "overflowing LargeTransfer thresholds should not panic"
-        );
+        assert!(payloads.is_empty());
     }
 
     #[test]
@@ -680,6 +803,7 @@ mod tests {
         let payloads = run(
             &[AlertRule::LargeTransfer {
                 threshold_xlm: 10_000,
+                threshold_stroops: 10_000 * 10_000_000,
             }],
             &tx,
         );
@@ -693,6 +817,7 @@ mod tests {
         let payloads = run(
             &[AlertRule::LargeTransfer {
                 threshold_xlm: 10_000,
+                threshold_stroops: 10_000 * 10_000_000,
             }],
             &tx,
         );
@@ -769,6 +894,7 @@ mod tests {
             AlertRule::TransactionFailed,
             AlertRule::LargeTransfer {
                 threshold_xlm: 10_000,
+                threshold_stroops: 10_000 * 10_000_000,
             },
             AlertRule::AdminFunctionCalled {
                 function_names: vec!["set_admin".into()],
@@ -968,6 +1094,53 @@ mod tests {
         assert_eq!(payloads[0].function_name.as_deref(), Some("foo"));
     }
 
+    // ── Issue #46: amount_xlm_decimal and amount_stroops fields ──────────────
+
+    #[test]
+    fn amount_xlm_decimal_is_formatted_with_7_decimal_places() {
+        // 9,999 XLM + 9,900,000 stroops = 9999.9900000
+        let tx = make_tx(true, &[], Some(99_999_900_000));
+        let payloads = run(
+            &[AlertRule::LargeTransfer {
+                threshold_xlm: 1,
+                threshold_stroops: 10_000_000,
+            }],
+            &tx,
+        );
+        assert_eq!(payloads.len(), 1);
+        // amount_xlm truncates the fractional part
+        assert_eq!(payloads[0].amount_xlm, Some(9_999));
+        // amount_xlm_decimal is precise
+        assert_eq!(
+            payloads[0].amount_xlm_decimal.as_deref(),
+            Some("9999.9900000")
+        );
+        // amount_stroops is the raw value
+        assert_eq!(payloads[0].amount_stroops, Some(99_999_900_000));
+    }
+
+    #[test]
+    fn amount_xlm_decimal_is_none_when_no_amount() {
+        let tx = make_tx(true, &[], None);
+        let payloads = run(&[AlertRule::AnyTransaction], &tx);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].amount_xlm, None);
+        assert_eq!(payloads[0].amount_xlm_decimal, None);
+        assert_eq!(payloads[0].amount_stroops, None);
+    }
+
+    #[test]
+    fn sub_xlm_amount_is_not_zero_in_decimal_field() {
+        // Less than 1 XLM — amount_xlm truncates to 0 but decimal is correct
+        let tx = make_tx(true, &[], Some(5_000_000)); // 0.5 XLM
+        let payloads = run(&[AlertRule::AnyTransaction], &tx);
+        assert_eq!(payloads[0].amount_xlm, Some(0));
+        assert_eq!(
+            payloads[0].amount_xlm_decimal.as_deref(),
+            Some("0.5000000")
+        );
+    }
+
     #[test]
     fn alert_payload_serialises_to_valid_json_with_all_fields_present() {
         let payload = AlertPayload {
@@ -981,6 +1154,8 @@ mod tests {
             function_name: Some("transfer".into()),
             function_names: vec!["transfer".into()],
             amount_xlm: Some(15000),
+            amount_stroops: Some(150_000_000_000_000),
+            amount_xlm_decimal: Some("15000.0000000".into()),
             fee_charged_stroops: Some(50000),
             timestamp: 1705316096,
             timestamp_iso: "2024-01-15T12:00:00Z".into(),
@@ -1011,6 +1186,8 @@ mod tests {
         assert_eq!(obj["function_name"].as_str(), Some("transfer"));
         assert_eq!(obj["function_names"].as_array().map(|a| a.len()), Some(1));
         assert_eq!(obj["amount_xlm"].as_u64(), Some(15000));
+        assert_eq!(obj["amount_stroops"].as_u64(), Some(150_000_000_000_000));
+        assert_eq!(obj["amount_xlm_decimal"].as_str(), Some("15000.0000000"));
         assert_eq!(obj["fee_charged_stroops"].as_u64(), Some(50000));
         assert_eq!(obj["timestamp"].as_i64(), Some(1705316096));
         assert_eq!(obj["timestamp_iso"].as_str(), Some("2024-01-15T12:00:00Z"));
