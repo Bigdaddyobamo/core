@@ -7,6 +7,8 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use txwatch_config::{AlertRule, FunctionMatchMode};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use txwatch_config::AlertRule;
@@ -46,7 +48,7 @@ fn sanitize_stroops(value: Option<u64>, field: &str, tx_hash: &str) -> Option<u6
 // ── Horizon transaction shape ─────────────────────────────────────────────────
 
 /// Raw Horizon transaction record as returned by the REST API.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct HorizonTransaction {
     pub hash: String,
     pub created_at: String, // RFC 3339
@@ -58,6 +60,17 @@ pub struct HorizonTransaction {
     pub envelope_xdr: Option<String>,
     /// Base64-encoded XDR transaction result.
     pub result_xdr: Option<String>,
+    // ── Issue #56: additional Horizon fields ──────────────────────────────────
+    /// Ledger sequence number in which this transaction was included.
+    pub ledger: Option<u32>,
+    /// Source account address (G-address) of the transaction.
+    pub source_account: Option<String>,
+    /// Memo content as a string (may be absent for `MemoNone`).
+    pub memo: Option<String>,
+    /// Memo type: `"none"`, `"text"`, `"id"`, `"hash"`, `"return"`.
+    pub memo_type: Option<String>,
+    /// Total number of operations in the transaction.
+    pub operation_count: Option<u32>,
     /// Ledger sequence the transaction was included in; used to look up its
     /// contract events on Soroban RPC.
     #[serde(default)]
@@ -141,6 +154,17 @@ pub struct EnrichedTransaction {
     pub amount_stroops: Option<u64>,
     /// Fee charged for this transaction in stroops.
     pub fee_charged_stroops: Option<u64>,
+    // ── Issue #56: additional metadata fields ─────────────────────────────────
+    /// Ledger sequence number in which this transaction was included.
+    pub ledger: Option<u32>,
+    /// Source account address (G-address) of the transaction.
+    pub source_account: Option<String>,
+    /// Memo content (absent for `MemoNone`).
+    pub memo: Option<String>,
+    /// Memo type: `"none"`, `"text"`, `"id"`, `"hash"`, `"return"`.
+    pub memo_type: Option<String>,
+    /// Total number of operations in the transaction.
+    pub operation_count: Option<u32>,
     /// Contract events emitted by this transaction. Only populated when the
     /// contract has an `EventEmitted` rule (fetched from Soroban RPC).
     pub events: Vec<ContractEvent>,
@@ -179,6 +203,17 @@ impl EnrichedTransaction {
             successful: tx.successful,
             paging_token: tx.paging_token,
             function_names,
+            amount_stroops,
+            fee_charged_stroops: fee_charged_stroops.or_else(|| {
+                tx.fee_charged
+                    .as_deref()
+                    .and_then(|s| s.parse::<u64>().ok())
+            }),
+            ledger: tx.ledger,
+            source_account: tx.source_account,
+            memo: tx.memo,
+            memo_type: tx.memo_type,
+            operation_count: tx.operation_count,
             events: Vec::new(),
         })
     }
@@ -195,6 +230,14 @@ impl EnrichedTransaction {
 /// The JSON body POSTed to the webhook URL when a rule fires.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AlertPayload {
+    /// Schema version for this payload shape (issue #58).
+    /// Receivers should use this to detect breaking changes.
+    /// Additive changes (new optional fields) keep the same version;
+    /// breaking changes (field removals or renames) bump it.
+    pub schema_version: u32,
+    /// Stable, deterministic alert identifier derived from
+    /// (network, contract_id, tx hash, rule_type, rule params) via SHA-256
+    /// (issue #57). Receivers should deduplicate on this value.
     /// Stable identifier of this alert (see [`alert_id`]): the same contract,
     /// transaction and rule always produce the same ID, so receivers can
     /// de-duplicate retries. Used as the PagerDuty `dedup_key`.
@@ -231,6 +274,22 @@ pub struct AlertPayload {
     pub horizon_link: String,
     /// Stellar Expert explorer link for the transaction.
     pub explorer_link: String,
+    // ── Issue #56: additional metadata fields ─────────────────────────────────
+    /// Ledger sequence number in which this transaction was included.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ledger: Option<u32>,
+    /// Source account address (G-address) of the transaction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_account: Option<String>,
+    /// Memo content (absent for `MemoNone`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memo: Option<String>,
+    /// Memo type: `"none"`, `"text"`, `"id"`, `"hash"`, `"return"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memo_type: Option<String>,
+    /// Total number of operations in the transaction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation_count: Option<u32>,
     /// `true` for a recovery alert (e.g. activity resumed after `NoActivity`).
     /// `false` (the default) for an incident alert.
     #[serde(default)]
@@ -267,6 +326,35 @@ pub fn alert_id(contract_id: &str, transaction_hash: &str, rule_triggered: &str)
 
 // ── Rule evaluation ───────────────────────────────────────────────────────────
 
+/// Derive a deterministic alert identifier from the tuple
+/// (network, contract_id, transaction_hash, rule_type, rule_triggered).
+/// Returns the first 16 bytes (32 hex chars) of the SHA-256 digest,
+/// which is short enough to fit in headers while being collision-resistant
+/// for any realistic alert volume (issue #57).
+fn derive_alert_id(
+    network: &str,
+    contract_id: &str,
+    tx_hash: &str,
+    rule_type: &str,
+    rule_triggered: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    // Use null bytes as separators to prevent cross-field collisions.
+    hasher.update(network.as_bytes());
+    hasher.update(b"\x00");
+    hasher.update(contract_id.as_bytes());
+    hasher.update(b"\x00");
+    hasher.update(tx_hash.as_bytes());
+    hasher.update(b"\x00");
+    hasher.update(rule_type.as_bytes());
+    hasher.update(b"\x00");
+    hasher.update(rule_triggered.as_bytes());
+    let digest = hasher.finalize();
+    // Take the first 16 bytes → 32 hex characters.
+    hex::encode(&digest[..16])
+}
+
+/// Evaluate all rules for one contract against one transaction.
 /// Context passed to [`evaluate`] to identify the contract being evaluated
 /// and provide the link base URLs needed to build webhook payloads.
 ///
@@ -414,6 +502,34 @@ pub fn evaluate<R: AsRef<AlertRule>>(
         .iter()
         .map(AsRef::as_ref)
         .filter_map(|rule| match eval_rule(rule, tx) {
+            Ok(true) => {
+                let rt = rule_type(rule);
+                let rl = rule_label(rule);
+                let alert_id = derive_alert_id(network, contract_id, &tx.hash, &rt, &rl);
+                Some(AlertPayload {
+                    schema_version: 1,
+                    alert_id,
+                    label: label.to_string(),
+                    contract_id: contract_id.to_string(),
+                    network: network.to_string(),
+                    rule_type: rt,
+                    rule_triggered: rl,
+                    transaction_hash: tx.hash.clone(),
+                    function_name: tx.function_names.first().cloned(),
+                    function_names: tx.function_names.clone(),
+                    amount_xlm: tx.amount_stroops.map(|s| s / 10_000_000),
+                    fee_charged_stroops: tx.fee_charged_stroops,
+                    timestamp,
+                    timestamp_iso: timestamp_iso.clone(),
+                    horizon_link: horizon_link.clone(),
+                    explorer_link: explorer_link.clone(),
+                    ledger: tx.ledger,
+                    source_account: tx.source_account.clone(),
+                    memo: tx.memo.clone(),
+                    memo_type: tx.memo_type.clone(),
+                    operation_count: tx.operation_count,
+                })
+            }
             Ok(true) => Some(AlertPayload {
                 label: ctx.label.to_string(),
                 contract_id: ctx.contract_id.to_string(),
@@ -487,10 +603,14 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
             .map(|s| s >= *threshold_stroops)
             .unwrap_or(false),
 
-        AlertRule::FunctionCalled { function_name } => tx
-            .function_names
-            .iter()
-            .any(|f| f == function_name.as_str()),
+        AlertRule::FunctionCalled {
+            function_name,
+            match_mode,
+        } => tx.function_names.iter().any(|f| match match_mode {
+            FunctionMatchMode::Exact => f == function_name.as_str(),
+            FunctionMatchMode::Prefix => f.starts_with(function_name.as_str()),
+            FunctionMatchMode::Glob => glob_match(function_name, f),
+        }),
 
         AlertRule::AdminFunctionCalled { function_names } => tx.function_names.iter().any(|f| {
             let f_lower = f.to_lowercase();
@@ -536,7 +656,14 @@ fn rule_label(rule: &AlertRule) -> String {
         AlertRule::LargeTransfer { threshold_xlm } => {
             format!("LargeTransfer(>={}XLM)", threshold_xlm)
         }
-        AlertRule::FunctionCalled { function_name } => format!("FunctionCalled({})", function_name),
+        AlertRule::FunctionCalled {
+            function_name,
+            match_mode,
+        } => match match_mode {
+            FunctionMatchMode::Exact => format!("FunctionCalled({})", function_name),
+            FunctionMatchMode::Prefix => format!("FunctionCalled(prefix:{})", function_name),
+            FunctionMatchMode::Glob => format!("FunctionCalled(glob:{})", function_name),
+        },
         AlertRule::AdminFunctionCalled { function_names } => {
             format!("AdminFunctionCalled([{}])", function_names.join(", "))
         }
@@ -813,6 +940,39 @@ impl CooldownTracker {
     }
 }
 
+// ── Glob matching (issue #55) ─────────────────────────────────────────────────
+
+/// Match `text` against a `pattern` that may contain `*` (any sequence of
+/// characters) and `?` (exactly one character). All other characters are
+/// matched literally, case-sensitively.
+///
+/// This is a lightweight recursive implementation with no external dependencies.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    glob_match_inner(&p, &t)
+}
+
+fn glob_match_inner(p: &[char], t: &[char]) -> bool {
+    match (p.first(), t.first()) {
+        // Both exhausted → match.
+        (None, None) => true,
+        // Pattern consumed but text remains → no match.
+        (None, Some(_)) => false,
+        // `*` → try consuming zero characters (advance pattern only) or one
+        // character from text (advance text only).
+        (Some('*'), _) => glob_match_inner(&p[1..], t) || (!t.is_empty() && glob_match_inner(p, &t[1..])),
+        // Text consumed but pattern has non-`*` characters remaining → no match.
+        (Some(_), None) => false,
+        // `?` → match any single character.
+        (Some('?'), Some(_)) => glob_match_inner(&p[1..], &t[1..]),
+        // Literal character match.
+        (Some(pc), Some(tc)) if pc == tc => glob_match_inner(&p[1..], &t[1..]),
+        // Literal mismatch.
+        _ => false,
+    }
+}
+
 impl AlertPayload {
     /// Builder helper to override the label (used by test-webhook).
     pub fn with_label(mut self, label: String) -> Self {
@@ -845,6 +1005,11 @@ mod tests {
             function_names: function_names.iter().map(|s| s.to_string()).collect(),
             amount_stroops,
             fee_charged_stroops: None,
+            ledger: None,
+            source_account: None,
+            memo: None,
+            memo_type: None,
+            operation_count: None,
             events: vec![],
         }
     }
@@ -904,6 +1069,10 @@ mod tests {
             "LargeTransfer(>=10000XLM)"
         );
         assert_eq!(
+            rule_label(&AlertRule::FunctionCalled {
+                function_name: "withdraw".into(),
+                match_mode: Default::default(),
+            }),
             AlertRule::FunctionCalled {
                 function_name: "withdraw".into()
             }
@@ -1116,6 +1285,7 @@ mod tests {
         let payloads = run(
             &[AlertRule::FunctionCalled {
                 function_name: "withdraw".into(),
+                match_mode: Default::default(),
             }],
             &tx,
         );
@@ -1129,6 +1299,7 @@ mod tests {
         let payloads = run(
             &[AlertRule::FunctionCalled {
                 function_name: "withdraw".into(),
+                match_mode: Default::default(),
             }],
             &tx,
         );
@@ -1154,6 +1325,7 @@ mod tests {
         let payloads = run(
             &[AlertRule::FunctionCalled {
                 function_name: "withdraw".into(),
+                match_mode: Default::default(),
             }],
             &tx,
         );
@@ -1212,6 +1384,11 @@ mod tests {
                 function_names: vec![],
                 amount_stroops: None,
                 fee_charged_stroops: None,
+                ledger: None,
+                source_account: None,
+                memo: None,
+                memo_type: None,
+                operation_count: None,
                 events: vec![],
             };
             let ctx = EvalContext {
@@ -1307,6 +1484,7 @@ mod tests {
             successful: true,
             paging_token: "1".into(),
             fee_charged: Some("100".into()),
+            ..Default::default()
             envelope_xdr: None,
             result_xdr: None,
             ledger: None,
@@ -1323,6 +1501,7 @@ mod tests {
             created_at: "not-a-timestamp".into(),
             successful: true,
             paging_token: "1".into(),
+            ..Default::default()
             fee_charged: None,
             envelope_xdr: None,
             result_xdr: None,
@@ -1347,6 +1526,7 @@ mod tests {
         let payloads = run(
             &[AlertRule::FunctionCalled {
                 function_name: "withdraw".into(),
+                match_mode: Default::default(),
             }],
             &tx,
         );
@@ -1360,6 +1540,7 @@ mod tests {
         let payloads = run(
             &[AlertRule::FunctionCalled {
                 function_name: "withdraw".into(),
+                match_mode: Default::default(),
             }],
             &tx,
         );
@@ -1438,6 +1619,8 @@ mod tests {
     #[test]
     fn alert_payload_serialises_to_valid_json_with_all_fields_present() {
         let payload = AlertPayload {
+            schema_version: 1,
+            alert_id: "deadbeefcafe0000deadbeefcafe0000".into(),
             alert_id: "0123456789abcdef0123456789abcdef".into(),
             label: "My Contract".into(),
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
@@ -1455,6 +1638,11 @@ mod tests {
             timestamp_iso: "2024-01-15T12:00:00Z".into(),
             horizon_link: "https://horizon-testnet.stellar.org/transactions/abc123".into(),
             explorer_link: "https://stellar.expert/explorer/testnet/tx/abc123".into(),
+            ledger: None,
+            source_account: None,
+            memo: None,
+            memo_type: None,
+            operation_count: None,
             resolved: false,
             matched_events: vec![],
             suppressed_count: 0,
@@ -1466,6 +1654,11 @@ mod tests {
             .as_object()
             .expect("AlertPayload should serialize to a JSON object");
 
+        assert_eq!(obj["schema_version"].as_u64(), Some(1));
+        assert!(
+            obj["alert_id"].as_str().is_some(),
+            "alert_id must be present"
+        );
         assert_eq!(obj["label"].as_str(), Some("My Contract"));
         assert_eq!(
             obj["contract_id"].as_str(),
@@ -1493,6 +1686,12 @@ mod tests {
         assert_eq!(
             obj["explorer_link"].as_str(),
             Some("https://stellar.expert/explorer/testnet/tx/abc123")
+        );
+        // Optional fields absent when None (skip_serializing_if)
+        assert!(!obj.contains_key("ledger"), "ledger absent when None");
+        assert!(
+            !obj.contains_key("source_account"),
+            "source_account absent when None"
         );
         assert_eq!(obj["resolved"].as_bool(), Some(false));
     }

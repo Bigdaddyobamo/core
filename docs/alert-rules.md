@@ -46,16 +46,33 @@ threshold_xlm = 10000
 
 ### `FunctionCalled`
 
-| Field           | Type   | Required | Description                          |
-|-----------------|--------|----------|--------------------------------------|
-| `function_name` | string | yes      | Exact function name (case-sensitive) |
+| Field           | Type   | Required | Default   | Description                              |
+|-----------------|--------|----------|-----------|------------------------------------------|
+| `function_name` | string | yes      | —         | Pattern to match against the invoked function name |
+| `match`         | string | no       | `"exact"` | Matching mode: `"exact"`, `"prefix"`, or `"glob"` |
 
-Matches when the Soroban `invoke_host_function` operation calls exactly `function_name`.
+Matches when the Soroban `invoke_host_function` operation calls a function that satisfies the
+match condition. `"exact"` (the default) requires an identical name; `"prefix"` requires the
+invoked name to start with `function_name`; `"glob"` matches using `*` (any sequence) and `?`
+(exactly one character).
 
 ```toml
+# Exact match (default — backward compatible)
 [[contracts.rules]]
 type          = "FunctionCalled"
 function_name = "withdraw"
+
+# Prefix match: fires on admin_set_fee, admin_pause, admin_upgrade, …
+[[contracts.rules]]
+type          = "FunctionCalled"
+function_name = "admin_"
+match         = "prefix"
+
+# Glob match: fires on set_fee, set_admin, set_pause, …
+[[contracts.rules]]
+type          = "FunctionCalled"
+function_name = "set_*"
+match         = "glob"
 ```
 
 ### `AdminFunctionCalled`
@@ -160,6 +177,29 @@ All matching rules fire; there is no short-circuit.
 
 ## Webhook payload fields
 
+| Field                | Type        | Always present | Description                              |
+|----------------------|-------------|----------------|------------------------------------------|
+| `schema_version`     | u32         | yes            | Payload shape version (currently `1`); bump on breaking changes |
+| `alert_id`           | string      | yes            | Deterministic 32-hex-char ID for deduplication (see below) |
+| `label`              | string      | yes            | Contract label from config               |
+| `contract_id`        | string      | yes            | Stellar C-address                        |
+| `network`            | string      | yes            | `mainnet` / `testnet` / `futurenet`      |
+| `rule_type`          | string      | yes            | Stable machine-readable rule variant     |
+| `rule_triggered`     | string      | yes            | Human-readable rule description          |
+| `transaction_hash`   | string      | yes            | Stellar transaction hash                 |
+| `function_name`      | string/null | no             | First Soroban function name; `null` for non-Soroban transactions |
+| `function_names`     | [string]    | yes            | All Soroban function names in the transaction |
+| `amount_xlm`         | u64/null    | no             | Transfer amount in XLM if available      |
+| `fee_charged_stroops`| u64/null    | no             | Transaction fee in stroops               |
+| `timestamp`          | i64         | yes            | Unix timestamp (seconds) of transaction  |
+| `timestamp_iso`      | string      | yes            | ISO 8601 timestamp string                |
+| `horizon_link`       | string      | yes            | Direct link to transaction on Horizon    |
+| `explorer_link`      | string      | yes            | Stellar Expert explorer link             |
+| `ledger`             | u32/null    | no             | Ledger sequence number (when available)  |
+| `source_account`     | string/null | no             | Source account G-address (when available)|
+| `memo`               | string/null | no             | Memo content (absent for `MemoNone`)     |
+| `memo_type`          | string/null | no             | Memo type: `"none"`, `"text"`, `"id"`, `"hash"`, `"return"` |
+| `operation_count`    | u32/null    | no             | Total operations in the transaction      |
 | Field              | Type        | Always present | Description                              |
 |--------------------|-------------|----------------|------------------------------------------|
 | `label`            | string      | yes            | Contract label from config               |
@@ -179,6 +219,23 @@ All matching rules fire; there is no short-circuit.
 | `suppressed_count` | u64         | yes            | Matches suppressed by this rule's `cooldown_seconds` since the previous alert; `0` otherwise |
 
 > `horizon_link` and `explorer_link` are always present in every alert payload, even when `function_name` is `null` for a non-Soroban transaction.
+
+### `alert_id` and deduplication
+
+`alert_id` is derived deterministically from `(network, contract_id, tx_hash, rule_type, rule_triggered)`
+via SHA-256 (first 16 bytes → 32 hex chars). The same alert always produces the same `alert_id`,
+so receivers can safely deduplicate retries and cursor replays by storing and checking this value.
+It is also sent as the `X-TxWatch-Alert-Id` request header, enabling deduplication without parsing
+the JSON body.
+
+### Schema compatibility policy
+
+`schema_version` is currently `1`. The versioning policy:
+- **Additive changes** (new optional fields added to the payload) keep the same version.
+- **Breaking changes** (field removals, renames, or type changes) bump the version.
+
+Receivers should read `schema_version` before processing other fields to detect incompatible
+format changes in stored or queued payloads.
 
 ## Stable rule_type values
 

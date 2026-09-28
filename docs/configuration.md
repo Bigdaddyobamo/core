@@ -287,14 +287,36 @@ threshold_xlm = 10000          # must be > 0
 ```
 
 ### `FunctionCalled`
-Fires when the Soroban invocation calls exactly `function_name` (case-sensitive).
+Fires when the Soroban invocation calls exactly `function_name` (case-sensitive) by default.
 Function names must be valid Soroban symbols: at most 32 characters from `[a-zA-Z0-9_]`
 (no spaces, hyphens or surrounding whitespace). The same applies to `AdminFunctionCalled`.
+
+An optional `match` field controls how `function_name` is compared to the invoked function:
+
+| Value | Behaviour |
+|-------|-----------|
+| `"exact"` (default) | The invoked name must equal `function_name` exactly |
+| `"prefix"` | The invoked name must start with `function_name` |
+| `"glob"` | The invoked name must match the glob pattern in `function_name` (`*` = any sequence, `?` = one character) |
+
+Prefix and exact patterns must be valid Soroban symbols. Glob patterns may additionally contain
+`*` and `?`; all other characters must be `[a-zA-Z0-9_]` and the pattern must be ≤ 64 characters.
 
 ```toml
 [[contracts.rules]]
 type          = "FunctionCalled"
 function_name = "withdraw"
+# match = "exact"   # default; omit for backward compatibility
+
+[[contracts.rules]]
+type          = "FunctionCalled"
+function_name = "admin_"
+match         = "prefix"          # fires on admin_set_fee, admin_pause, etc.
+
+[[contracts.rules]]
+type          = "FunctionCalled"
+function_name = "admin_*"
+match         = "glob"            # same as prefix example above
 ```
 
 ### `AdminFunctionCalled`
@@ -335,6 +357,8 @@ topics = ["*", "GDESTINATION..."]   # optional: topic 1 = any, topic 2 = this ad
 
 ```json
 {
+  "schema_version":      1,
+  "alert_id":            "a3f1bc20e94d77c1a3f1bc20e94d77c1",
   "alert_id":            "3f2b9c1d8e7a6b5c4d3e2f1a0b9c8d7e",
   "label":               "My Escrow Contract",
   "contract_id":         "CAAA...",
@@ -361,6 +385,16 @@ topics = ["*", "GDESTINATION..."]   # optional: topic 1 = any, topic 2 = this ad
 This example and the one in the README are checked against `AlertPayload` by
 `crates/rules/tests/docs_payload.rs`, so they cannot drift from the code.
 
+**Schema compatibility policy:** `schema_version` is `1`. Additive changes (new optional
+fields added) keep the same version. Breaking changes (field removals, renames, or type
+changes) bump the version. Receivers should check `schema_version` to detect incompatible
+changes before parsing other fields.
+
+- `schema_version` — integer version of this payload shape. Use this to detect breaking changes.
+- `alert_id` — stable, deterministic identifier (32 hex chars) derived from
+  `(network, contract_id, tx_hash, rule_type, rule_triggered)` via SHA-256. Identical for every
+  retry of the same alert. Receivers should deduplicate on this value. Also sent as the
+  `X-TxWatch-Alert-Id` request header for deduplication without parsing the body.
 - `alert_id` — stable 32-character hex ID derived from the contract, transaction and rule; the same
   alert always has the same ID, so receivers can de-duplicate redeliveries. PagerDuty uses it as the
   `dedup_key`.

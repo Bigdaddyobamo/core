@@ -1395,6 +1395,8 @@ mod tests {
             network: Network::Testnet,
             rules: vec![AlertRule::FunctionCalled {
                 function_name: "withdraw".into(),
+                match_mode: Default::default(),
+            }],
             }]
             .into_iter()
             .map(Into::into)
