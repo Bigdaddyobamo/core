@@ -260,6 +260,12 @@ pub enum AlertRule {
         #[serde(default)]
         threshold_xlm: Option<u64>,
     },
+    /// Fires once when a contract has produced no transactions for longer than
+    /// `minutes` minutes, and again (with `resolved = true`) when activity
+    /// resumes.  Evaluated per poll cycle, not per transaction.
+    NoActivity {
+        minutes: u32,
+    },
     /// Fires when the transaction emitted a Soroban contract event whose first
     /// topic is the symbol `topic` (e.g. `transfer`, `mint`, `admin_changed`).
     /// `topics` optionally constrains the following topics positionally
@@ -402,6 +408,13 @@ impl AlertRule {
                 }
                 _ => {}
             },
+            AlertRule::NoActivity { minutes } => {
+                if *minutes == 0 {
+                    bail!(
+                        "contract '{}': NoActivity minutes must be > 0",
+                        contract_label
+                    );
+                }
             AlertRule::EventEmitted { topic, topics } => {
                 *topic = topic.trim().to_owned();
                 if topic.is_empty() {
@@ -465,6 +478,7 @@ impl AlertRule {
                     format!("HighFee(>={} stroops)", threshold_stroops)
                 }
             }
+            AlertRule::NoActivity { minutes } => format!("NoActivity({}min)", minutes),
             AlertRule::EventEmitted { topic, topics } => event_emitted_label(topic, topics),
         }
     }
@@ -987,6 +1001,8 @@ impl WatchedContract {
         self.label = self.label.trim().to_owned();
         if self.label.is_empty() {
             errors.push("a contract has an empty label".to_owned());
+            // Cannot check further label constraints without a non-empty label.
+            return errors;
         }
         // Labels end up in log lines and CLI output; `{:?}` escapes the
         // offending characters so the error itself cannot inject them.
@@ -1375,6 +1391,7 @@ impl AppConfig {
     /// Validates the whole config and reports every error found, not just the first.
     pub fn validate(&mut self) -> Result<()> {
         let mut errors = Vec::new();
+        if let Err(e) = validate_poll_interval(self.poll_interval_seconds, "poll_interval_seconds") {
         if let Err(e) = validate_poll_interval(self.poll_interval_seconds, "poll_interval_seconds")
         {
             errors.push(e.to_string());
@@ -1419,11 +1436,11 @@ impl AppConfig {
         for contract in &mut self.contracts {
             errors.extend(contract.collect_errors());
         }
-        // Labels are already trimmed by `WatchedContract::validate`; compare
+        // Labels are already trimmed by `WatchedContract::collect_errors`; compare
         // case-insensitively so "Vault" and "vault" count as duplicates.
         let mut seen = std::collections::HashSet::new();
-        let mut reported = std::collections::HashSet::new();
         for contract in &self.contracts {
+            if !seen.insert(contract.label.to_lowercase()) {
             let key = contract.label.to_lowercase();
             if !seen.insert(key.clone()) && reported.insert(key) {
                 errors.push(format!("duplicate contract label '{}'", contract.label));
@@ -1916,6 +1933,21 @@ mod tests {
         .map(Into::into)
         .collect();
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn no_activity_zero_minutes_is_rejected() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::NoActivity { minutes: 0 }];
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("NoActivity minutes must be > 0"), "got: {}", err);
+    }
+
+    #[test]
+    fn no_activity_nonzero_minutes_is_valid() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::NoActivity { minutes: 30 }];
+        assert!(c.validate().is_ok());
     }
 
     #[test]

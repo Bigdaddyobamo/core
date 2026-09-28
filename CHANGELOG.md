@@ -9,7 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- HMAC-SHA256 webhook signatures: `X-TxWatch-Signature: sha256=<hex>` over the request body when `webhook_secret` is set
+- `NoActivity { minutes }` alert rule: fires once when a contract goes quiet longer than the configured threshold, and again (with `resolved = true`) when activity resumes. Evaluated per poll cycle, not per transaction. Null transaction hash and synthetic Horizon/Explorer links are used for the alert payload (#62).
+- `EvalContext` struct replaces the five positional `&str` parameters of `evaluate()`, preventing argument-order bugs at compile time; `EvalContext::from_contract` derives all fields from a `WatchedContract` (#59).
+- `WarningSuppressor`: repeated rule evaluation errors for the same rule are logged on the first occurrence and every 100th recurrence thereafter, preventing log flooding from structurally broken rules (#60).
+- Property-based tests for `LargeTransfer` and `HighFee` rule thresholds using `proptest`, covering the full u64 range and verifying `evaluate` never panics (#61).
+- `resolved` field added to `AlertPayload` JSON (`false` for incident alerts, `true` for recovery alerts); docs/configuration.md and README updated accordingly.
+
+### Changed
+
+- `evaluate()` now accepts `&EvalContext` and an optional `&WarningSuppressor` instead of five positional string arguments and no suppressor (#59, #60).
+- `WatchedContract::collect_errors` and `AppConfig::validate` now collect all validation errors before returning instead of stopping at the first failure (#60).
+- Rule evaluation errors are rate-limited: only the first occurrence and every 100th recurrence are logged (#60).
+
+
 - `X-TxWatch-Version` header on every webhook request
 - `${ENV_VAR}` interpolation for `webhook_secret`
 - Graceful shutdown on Ctrl-C: the in-flight poll cycle finishes before exit

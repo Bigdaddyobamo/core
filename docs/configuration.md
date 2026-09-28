@@ -352,6 +352,7 @@ topics = ["*", "GDESTINATION..."]   # optional: topic 1 = any, topic 2 = this ad
   "timestamp_iso":       "2024-01-15T12:00:00Z",
   "horizon_link":        "https://horizon-testnet.stellar.org/transactions/abc123...",
   "explorer_link":       "https://stellar.expert/explorer/testnet/tx/abc123...",
+  "resolved":            false
   "matched_events":      [],
   "suppressed_count":    0
 }
